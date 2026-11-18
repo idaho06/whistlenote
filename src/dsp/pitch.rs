@@ -7,7 +7,7 @@
 use pitch_detection::detector::mcleod::McLeodDetector;
 use pitch_detection::detector::PitchDetector;
 
-use super::filter::BandPass;
+use super::filter::{BandPass, BAND_HIGH_HZ};
 use crate::audio::rms;
 use crate::music::segment::PitchFrame;
 
@@ -17,11 +17,14 @@ pub const WINDOW: usize = 2048;
 pub const HOP: usize = 512;
 /// Lowest reported frequency in Hz.
 pub const MIN_FREQ_HZ: f32 = 400.0;
-/// Highest reported frequency in Hz.
-pub const MAX_FREQ_HZ: f32 = 4000.0;
+/// Highest reported frequency in Hz; the top of the band-pass.
+pub const MAX_FREQ_HZ: f32 = BAND_HIGH_HZ;
 
 /// Zero padding of the detector's autocorrelation buffer in samples.
 const PADDING: usize = WINDOW / 2;
+/// Samples from the last sample of a full window back to its centre, the
+/// sample at index `WINDOW / 2`.
+const CENTRE_OFFSET: usize = WINDOW - 1 - WINDOW / 2;
 /// Clarity a peak of the normalized square difference function needs to be
 /// considered by the detector.
 const CLARITY_THRESHOLD: f32 = 0.5;
@@ -84,9 +87,9 @@ impl PitchTracker {
             self.window.push(self.filter.run(sample));
             if self.window.len() == WINDOW {
                 // The window ends at this sample; its centre sample lies
-                // WINDOW - 1 - WINDOW / 2 samples earlier.
+                // CENTRE_OFFSET samples earlier.
                 let end_time_s = start_time_s + index as f64 / rate;
-                let time_s = end_time_s - (WINDOW - 1 - WINDOW / 2) as f64 / rate;
+                let time_s = end_time_s - CENTRE_OFFSET as f64 / rate;
                 out.push(self.analyse(time_s));
                 self.window.drain(..HOP);
             }
@@ -110,6 +113,8 @@ impl PitchTracker {
         if rms(&self.window) < silence {
             return unvoiced(0.0);
         }
+        // The detector compares this with the window's sum of squares, which
+        // is the silence level squared times WINDOW at exactly that RMS.
         let power_threshold = silence * silence * WINDOW as f32;
         match self.detector.get_pitch(
             &self.window,
@@ -127,8 +132,7 @@ impl PitchTracker {
                     confidence: pitch.clarity,
                 }
             }
-            Some(pitch) => unvoiced(pitch.clarity),
-            None => unvoiced(0.0),
+            other => unvoiced(other.map_or(0.0, |pitch| pitch.clarity)),
         }
     }
 }

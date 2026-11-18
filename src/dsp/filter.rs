@@ -11,6 +11,16 @@ pub const BAND_HIGH_HZ: f32 = 4000.0;
 /// lowered to it so that they stay below the Nyquist frequency.
 const MAX_CUTOFF_RATIO: f32 = 0.45;
 
+/// Coefficients that pass a sample through unchanged, used when no valid
+/// filter can be built.
+const PASS_THROUGH: Coefficients<f32> = Coefficients {
+    a1: 0.0,
+    a2: 0.0,
+    b0: 1.0,
+    b1: 0.0,
+    b2: 0.0,
+};
+
 /// The kind of a [`Butterworth`] section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterKind {
@@ -39,18 +49,7 @@ impl Butterworth {
             FilterKind::HighPass => Type::HighPass,
             FilterKind::LowPass => Type::LowPass,
         };
-        let coefficients = Hertz::from_hz(fs)
-            .and_then(|fs| Ok((fs, Hertz::from_hz(f0)?)))
-            .and_then(|(fs, f0)| {
-                Coefficients::<f32>::from_params(filter_type, fs, f0, Q_BUTTERWORTH_F32)
-            })
-            .unwrap_or(Coefficients {
-                a1: 0.0,
-                a2: 0.0,
-                b0: 1.0,
-                b1: 0.0,
-                b2: 0.0,
-            });
+        let coefficients = section_coefficients(filter_type, fs, f0).unwrap_or(PASS_THROUGH);
         Self {
             section: DirectForm2Transposed::new(coefficients),
         }
@@ -64,7 +63,7 @@ impl Butterworth {
     /// Filters `block` in place.
     pub fn process(&mut self, block: &mut [f32]) {
         for sample in block {
-            *sample = self.section.run(*sample);
+            *sample = self.run(*sample);
         }
     }
 
@@ -72,6 +71,18 @@ impl Butterworth {
     pub fn reset(&mut self) {
         self.section.reset_state();
     }
+}
+
+/// Returns the coefficients of a `filter_type` section at `sample_rate` Hz
+/// with cutoff `cutoff_hz` Hz, or `None` when a value yields no valid filter.
+fn section_coefficients(
+    filter_type: Type<f32>,
+    sample_rate: f32,
+    cutoff_hz: f32,
+) -> Option<Coefficients<f32>> {
+    let sample_rate = Hertz::from_hz(sample_rate).ok()?;
+    let cutoff = Hertz::from_hz(cutoff_hz).ok()?;
+    Coefficients::from_params(filter_type, sample_rate, cutoff, Q_BUTTERWORTH_F32).ok()
 }
 
 /// A band-pass from [`BAND_LOW_HZ`] to [`BAND_HIGH_HZ`]: a Butterworth
@@ -98,9 +109,8 @@ impl BandPass {
 
     /// Filters `block` in place.
     pub fn process(&mut self, block: &mut [f32]) {
-        for sample in block {
-            *sample = self.run(*sample);
-        }
+        self.high_pass.process(block);
+        self.low_pass.process(block);
     }
 
     /// Clears the filter state, as if no sample had been filtered.
