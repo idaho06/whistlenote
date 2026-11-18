@@ -565,7 +565,7 @@ mod tests {
         // First callback runs 2 ms late, second on time.
         clock.engine_time_s(1_000_000_000, 1_000_000_000, 1_002_000_000, 0.01);
         clock.engine_time_s(2_000_000_000, 2_000_000_000, 2_000_000_000, 0.01);
-        // Later callbacks no longer move the anchor.
+        // Later callbacks leave the anchor unchanged.
         for i in 3..20u128 {
             clock.engine_time_s(
                 i * 1_000_000_000,
