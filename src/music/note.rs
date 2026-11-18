@@ -9,18 +9,23 @@ pub struct NoteReading {
     pub cents: f32,
 }
 
+/// MIDI note number of A4, the reference pitch.
+const A4_MIDI: f32 = 69.0;
+/// Frequency in Hz of A4, the reference pitch.
+const A4_HZ: f32 = 440.0;
+
 /// Returns the frequency in Hz of a (possibly fractional) MIDI note number.
 ///
 /// MIDI note 69 (A4) is 440.0 Hz.
 pub fn midi_to_freq(midi: f32) -> f32 {
-    440.0 * 2.0_f32.powf((midi - 69.0) / 12.0)
+    A4_HZ * 2.0_f32.powf((midi - A4_MIDI) / 12.0)
 }
 
 /// Returns the fractional MIDI note number of a frequency in Hz.
 ///
 /// This is the inverse of [`midi_to_freq`].
 pub fn freq_to_midi_float(hz: f32) -> f32 {
-    69.0 + 12.0 * (hz / 440.0).log2()
+    A4_MIDI + 12.0 * (hz / A4_HZ).log2()
 }
 
 /// Returns the nearest note of a frequency in Hz.
