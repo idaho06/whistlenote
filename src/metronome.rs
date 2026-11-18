@@ -109,12 +109,8 @@ struct Click {
 
 /// A metronome that renders beat clicks into output blocks.
 ///
-/// The free-running sequence plays a click every `60 / bpm` seconds and
-/// accents the first beat of each bar. A recording starts with one
-/// count-in bar of [`BEATS_PER_BAR`] beats, accented on its first beat and
-/// always audible, and continues with recording beats that are audible
-/// only when clicks are requested; the first recording beat is the
-/// recording origin.
+/// The free-running and recording sequences it plays are described in the
+/// [module documentation](crate::metronome).
 pub struct Metronome {
     /// What the metronome plays.
     mode: Mode,
@@ -225,8 +221,8 @@ impl Metronome {
         let tau = CLICK_S / 100.0_f64.ln();
         for (i, sample) in out.iter_mut().enumerate() {
             let here = block_start + i as f64;
-            while self.mode != Mode::Idle {
-                let interval = 60.0 * rate / self.current_bpm();
+            while let Some(bpm) = self.current_bpm() {
+                let interval = 60.0 * rate / bpm;
                 let next = if self.start_pending {
                     block_start
                 } else {
@@ -268,11 +264,12 @@ impl Metronome {
         self.position += out.len() as u64;
     }
 
-    /// Tempo of the sequence that is running, in BPM.
-    fn current_bpm(&self) -> f64 {
+    /// Tempo of the sequence that is running in BPM, or `None` while idle.
+    fn current_bpm(&self) -> Option<f64> {
         match self.mode {
-            Mode::Idle | Mode::Free => self.free_bpm,
-            Mode::CountIn | Mode::Recording => self.record_bpm,
+            Mode::Idle => None,
+            Mode::Free => Some(self.free_bpm),
+            Mode::CountIn | Mode::Recording => Some(self.record_bpm),
         }
     }
 
@@ -290,7 +287,9 @@ impl Metronome {
                 index.is_multiple_of(BEATS_PER_BAR),
                 self.clicks,
             ),
-            Mode::Idle => unreachable!("no beat fires while idle"),
+            // The render loop fires beats only while a sequence runs, so
+            // this arm cannot be taken.
+            Mode::Idle => (BeatPhase::Free, false, false),
         };
         self.index = index + 1;
         if self.mode == Mode::CountIn && self.index >= BEATS_PER_BAR {
@@ -345,8 +344,8 @@ impl MetronomeControl {
 /// forwards every beat to the handle. A call never allocates, locks or
 /// blocks.
 pub fn metronome() -> (MetronomeControl, OutputSource) {
-    let (command_producer, command_consumer) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
-    let (beat_producer, beat_consumer) = rtrb::RingBuffer::new(BEAT_CAPACITY);
+    let (command_producer, mut commands) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+    let (mut beats, beat_consumer) = rtrb::RingBuffer::new(BEAT_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
     let control = MetronomeControl {
         commands: command_producer,
@@ -354,8 +353,6 @@ pub fn metronome() -> (MetronomeControl, OutputSource) {
         dropped: Arc::clone(&dropped),
     };
     let mut metronome = Metronome::new();
-    let mut commands = command_consumer;
-    let mut beats = beat_producer;
     let source: OutputSource = Box::new(move |out, info| {
         while let Ok(command) = commands.pop() {
             metronome.apply(command);
@@ -382,16 +379,8 @@ mod tests {
             bpm: 120.0,
             enabled: true,
         });
-        let mut output = vec![0.0_f32; 96_000];
         let mut beats = Vec::new();
-        for (block_index, block) in output.chunks_mut(256).enumerate() {
-            let start = block_index * 256;
-            let info = OutputBlockInfo {
-                time_s: start as f64 / f64::from(rate),
-                sample_rate: rate,
-            };
-            metronome.render(block, info, |beat| beats.push(beat));
-        }
+        let output = render_span(&mut metronome, 0, 96_000, rate, &mut beats);
         assert_eq!(beats.len(), 4);
         for (k, beat) in beats.iter().enumerate() {
             assert_close(beat.time_s, 0.5 * k as f64, 1e-9);
@@ -413,22 +402,7 @@ mod tests {
         rate: u32,
         beats: &mut Vec<Beat>,
     ) -> Vec<f32> {
-        let mut output = vec![0.0_f32; to - from];
-        let mut start = from;
-        while start < to {
-            let len = (to - start).min(256);
-            let info = OutputBlockInfo {
-                time_s: start as f64 / f64::from(rate),
-                sample_rate: rate,
-            };
-            metronome.render(
-                &mut output[start - from..start - from + len],
-                info,
-                |beat| beats.push(beat),
-            );
-            start += len;
-        }
-        output
+        render_span_in_blocks(metronome, from, to, rate, 256, beats)
     }
 
     /// Renders samples `from`..`to` in blocks of `block_size` and returns them.
