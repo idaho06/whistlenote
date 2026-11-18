@@ -2,6 +2,9 @@
 
 use super::segment::RawNote;
 
+/// Smallest length in beats that survives filtering.
+const MIN_LENGTH_B: f64 = 1e-9;
+
 /// Resolution of the quantization grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Grid {
@@ -54,24 +57,29 @@ pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<Q
     sorted.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
 
     let step = step_beats(grid);
+    let to_beats = |t_s: f64| (t_s - origin_s) * bpm / 60.0;
     let mut quant: Vec<QuantNote> = Vec::with_capacity(sorted.len());
     for note in &sorted {
-        let start_b = (note.start_s - origin_s) * bpm / 60.0;
-        let end_b = (note.end_s - origin_s) * bpm / 60.0;
+        let start_b = to_beats(note.start_s);
+        let end_b = to_beats(note.end_s);
         if end_b <= 0.0 {
             continue;
         }
         let start_b = if start_b < 0.0 { 0.0 } else { start_b };
-        let (start_b, end_b) = match step {
-            Some(step) => (snap(start_b, step), snap(end_b, step)),
-            None => (start_b, end_b),
+        let (start_b, length_b) = match step {
+            Some(step) => {
+                let start_b = snap(start_b, step);
+                let length_b = snap(end_b, step) - start_b;
+                (start_b, if length_b <= 0.0 { step } else { length_b })
+            }
+            None => {
+                let length_b = end_b - start_b;
+                if length_b <= MIN_LENGTH_B {
+                    continue;
+                }
+                (start_b, length_b)
+            }
         };
-        let mut length_b = end_b - start_b;
-        match step {
-            Some(step) if length_b <= 0.0 => length_b = step,
-            None if length_b <= 1e-9 => continue,
-            _ => {}
-        }
         quant.push(QuantNote {
             start_beats: start_b,
             length_beats: length_b,
@@ -84,7 +92,7 @@ pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<Q
         let end_b = (quant[i - 1].start_beats + quant[i - 1].length_beats).min(next_start);
         quant[i - 1].length_beats = end_b - quant[i - 1].start_beats;
     }
-    quant.retain(|note| note.length_beats > 1e-9);
+    quant.retain(|note| note.length_beats > MIN_LENGTH_B);
     quant
 }
 
@@ -94,11 +102,7 @@ mod tests {
 
     /// Builds a raw note from `start_s` to `end_s` at MIDI 69.
     fn raw(start_s: f64, end_s: f64) -> RawNote {
-        RawNote {
-            start_s,
-            end_s,
-            midi: 69,
-        }
+        raw_midi(start_s, end_s, 69)
     }
 
     /// Builds a raw note with an explicit MIDI number.
