@@ -5,6 +5,10 @@
 //! onsets, device lists and metronome beats on a reliable channel, and it
 //! takes commands from the GUI through another channel. The metronome
 //! renders its clicks on the output stream.
+//!
+//! A recording plays one count-in bar on the metronome and then collects
+//! the pitch frames of the input until it is stopped; the finished
+//! recording is reported with its origin on the reliable event channel.
 
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -18,7 +22,7 @@ use crate::audio::ring::{
 use crate::audio::rms;
 use crate::dsp::onset::{OnsetConfig, OnsetDetector};
 use crate::dsp::pitch::{PitchConfig, PitchTracker};
-use crate::metronome::{metronome, MetronomeCommand, MetronomeControl};
+use crate::metronome::{metronome, MetronomeCommand, MetronomeControl, CLICK_S};
 use crate::music::segment::PitchFrame;
 
 /// What a metronome beat belongs to, as reported in [`EngineEvent::Beat`].
@@ -26,6 +30,10 @@ pub use crate::metronome::BeatPhase;
 
 /// Capacity of the live frame channel; frames are dropped when it is full.
 pub const LIVE_CAPACITY: usize = 256;
+
+/// How far before the recording origin the frames of a recording are kept,
+/// in seconds.
+pub const PRE_ROLL_S: f64 = 0.1;
 
 /// One live pitch frame with the level of the input block that produced it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,6 +74,21 @@ pub enum EngineEvent {
         /// Engine-clock time at which the beat plays, in seconds.
         time_s: f64,
     },
+    /// The first recording beat of a recording plays; the recording starts
+    /// at `origin_s`.
+    RecordingStarted {
+        /// Engine-clock time of the recording origin in seconds, including
+        /// the latency offset.
+        origin_s: f64,
+    },
+    /// A recording finished and its pitch frames are reported.
+    RecordingFinished {
+        /// Pitch frames of the recording, from [`PRE_ROLL_S`] before the
+        /// origin; frames that overlap an audible click are unvoiced.
+        frames: Vec<PitchFrame>,
+        /// Engine-clock time of the recording origin in seconds.
+        origin_s: f64,
+    },
     /// A non-fatal error occurred.
     Error(
         /// Description of the error.
@@ -78,7 +101,8 @@ pub enum EngineEvent {
 pub enum EngineCommand {
     /// Starts listening: opens the input stream when none is open.
     StartListening,
-    /// Stops listening and closes the input stream.
+    /// Stops listening, closes the input stream, and cancels and discards a
+    /// running recording.
     StopListening,
     /// Selects the input device by name, or the default device for `None`;
     /// an open stream is reopened on the new device.
@@ -93,6 +117,26 @@ pub enum EngineCommand {
     /// Selects the output device by name, or the default device for `None`;
     /// an open output stream is reopened on the new device.
     SelectOutput(Option<String>),
+    /// Starts a recording: one count-in bar at `bpm`, then the recording;
+    /// `metronome` makes the recording beats audible. The input and output
+    /// streams open when none are open, so a recording works without
+    /// [`EngineCommand::StartListening`].
+    StartRecording {
+        /// Tempo in BPM.
+        bpm: f64,
+        /// Whether the recording beats are audible.
+        metronome: bool,
+    },
+    /// Ends the recording and reports its frames as a
+    /// [`EngineEvent::RecordingFinished`] event.
+    StopRecording,
+    /// Sets the latency offset in milliseconds that is added to the origin
+    /// of a recording, clamped to -200..=200; it applies to recordings
+    /// whose origin is not set yet.
+    SetLatencyMs(
+        /// Latency offset in milliseconds.
+        f64,
+    ),
     /// Reports the current device lists as an [`EngineEvent::Devices`] event.
     RefreshDevices,
     /// Stops the engine thread.
@@ -128,6 +172,8 @@ impl Engine {
                     free_bpm: 120.0,
                     free_enabled: false,
                     output: None,
+                    latency_s: 0.0,
+                    recording: None,
                 }
                 .run();
             })
@@ -184,6 +230,10 @@ struct Worker {
     free_bpm: f64,
     free_enabled: bool,
     output: Option<Output>,
+    /// Latency offset added to the origin of a recording, in seconds.
+    latency_s: f64,
+    /// The recording in progress, if any.
+    recording: Option<Recording>,
 }
 
 /// One open input stream with its processing state.
@@ -207,6 +257,44 @@ struct Output {
     control: MetronomeControl,
     /// Number of dropped beats already reported as an error event.
     reported_dropped_beats: u64,
+}
+
+/// A recording in progress on the engine thread.
+struct Recording {
+    /// The CountIn beat with index 0 of this recording arrived.
+    count_in_seen: bool,
+    /// Engine-clock time of the recording origin, set when the Recording
+    /// beat with index 0 arrives.
+    origin_s: Option<f64>,
+    /// Start times of the audible clicks of this recording.
+    clicks: Vec<f64>,
+    /// Every pitch frame since the recording started.
+    frames: Vec<PitchFrame>,
+}
+
+/// Keeps the frames from [`PRE_ROLL_S`] before `origin_s` and unvoices
+/// every kept frame whose analysis window overlaps a click of `clicks`.
+fn finish_frames(
+    frames: Vec<PitchFrame>,
+    origin_s: f64,
+    clicks: &[f64],
+    window_s: f64,
+) -> Vec<PitchFrame> {
+    frames
+        .into_iter()
+        .filter(|frame| frame.time_s >= origin_s - PRE_ROLL_S)
+        .map(|mut frame| {
+            let masked = clicks.iter().any(|&click| {
+                click - window_s / 2.0 <= frame.time_s
+                    && frame.time_s <= click + CLICK_S + window_s / 2.0
+            });
+            if masked {
+                frame.freq_hz = None;
+                frame.confidence = 0.0;
+            }
+            frame
+        })
+        .collect()
 }
 
 impl Worker {
@@ -242,12 +330,12 @@ impl Worker {
                 }
             }
             EngineCommand::StopListening => {
-                if self.listening {
-                    self.listening = false;
-                    self.input = None;
-                }
+                self.listening = false;
+                self.cancel_recording();
+                self.input = None;
             }
             EngineCommand::SelectInput(name) => {
+                self.cancel_recording();
                 self.input_name = name;
                 if self.input.is_some() {
                     self.input = None;
@@ -269,17 +357,98 @@ impl Worker {
                                 .send(EngineEvent::Error("metronome command queue full".into()));
                         }
                     } else if enabled {
-                        self.open_output();
+                        self.open_output(None);
                     }
                     // Once open, the output stream stays open; disabling
                     // only silences the metronome.
                 }
             }
             EngineCommand::SelectOutput(name) => {
+                self.cancel_recording();
                 self.output_name = name;
                 if self.output.is_some() {
                     self.output = None;
-                    self.open_output();
+                    self.open_output(None);
+                }
+            }
+            EngineCommand::StartRecording { bpm, metronome } => {
+                if !bpm.is_finite() {
+                    let _ = self.events.send(EngineEvent::Error("invalid tempo".into()));
+                    return false;
+                }
+                // A running recording is discarded without an event.
+                self.cancel_recording();
+                if self.input.is_none() {
+                    self.open_input();
+                }
+                let command = MetronomeCommand::StartRecording {
+                    bpm,
+                    clicks: metronome,
+                };
+                match &mut self.output {
+                    Some(output) => {
+                        if !output.control.send(command) {
+                            let _ = self
+                                .events
+                                .send(EngineEvent::Error("metronome command queue full".into()));
+                            return false;
+                        }
+                    }
+                    // A newly opened stream starts with the count-in.
+                    None => self.open_output(Some(command)),
+                }
+                // An open that failed already emitted an error event.
+                if self.input.is_none() || self.output.is_none() {
+                    return false;
+                }
+                self.recording = Some(Recording {
+                    count_in_seen: false,
+                    origin_s: None,
+                    clicks: Vec::new(),
+                    frames: Vec::new(),
+                });
+            }
+            EngineCommand::StopRecording => {
+                if self.recording.is_some() {
+                    // Every input block and beat delivered before this
+                    // command belongs to the recording.
+                    self.drain_input();
+                    self.drain_beats();
+                    let recording = self.recording.take().expect("a recording runs");
+                    if let Some(output) = &mut self.output {
+                        let _ = output.control.send(MetronomeCommand::StopRecording);
+                    }
+                    let window_s = self
+                        .input
+                        .as_ref()
+                        .map_or(2048.0 / 48_000.0, |input| input.pitch.window_s());
+                    if !self.listening {
+                        self.input = None;
+                    }
+                    match recording.origin_s {
+                        Some(origin_s) => {
+                            let frames = finish_frames(
+                                recording.frames,
+                                origin_s,
+                                &recording.clicks,
+                                window_s,
+                            );
+                            let _ = self
+                                .events
+                                .send(EngineEvent::RecordingFinished { frames, origin_s });
+                        }
+                        None => {
+                            let _ = self.events.send(EngineEvent::RecordingFinished {
+                                frames: Vec::new(),
+                                origin_s: 0.0,
+                            });
+                        }
+                    }
+                }
+            }
+            EngineCommand::SetLatencyMs(ms) => {
+                if ms.is_finite() {
+                    self.latency_s = ms.clamp(-200.0, 200.0) / 1000.0;
                 }
             }
             EngineCommand::RefreshDevices => self.emit_devices(),
@@ -336,16 +505,20 @@ impl Worker {
         }
     }
 
-    /// Opens the output stream with the metronome on the selected device;
-    /// an error becomes an event.
-    fn open_output(&mut self) {
+    /// Opens the output stream with the metronome on the selected device,
+    /// with `first` queued after the free-running setting; an error becomes
+    /// an event.
+    fn open_output(&mut self, first: Option<MetronomeCommand>) {
         let (mut control, source) = metronome();
-        // Queue the current free-running setting before the stream starts,
-        // so the metronome applies it with its first rendered block.
+        // Queue the commands before the stream starts, so the metronome
+        // applies them with its first rendered block.
         let _ = control.send(MetronomeCommand::SetFree {
             bpm: self.free_bpm,
             enabled: self.free_enabled,
         });
+        if let Some(command) = first {
+            let _ = control.send(command);
+        }
         let events = self.events.clone();
         let on_error: ErrorSink = Box::new(move |error| {
             let _ = events.send(EngineEvent::Error(error.to_string()));
@@ -363,6 +536,16 @@ impl Worker {
             }
             Err(error) => {
                 let _ = self.events.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+    }
+
+    /// Cancels a running recording: ends the metronome's count-in or
+    /// recording sequence and discards the recording without an event.
+    fn cancel_recording(&mut self) {
+        if self.recording.take().is_some() {
+            if let Some(output) = &mut self.output {
+                let _ = output.control.send(MetronomeCommand::StopRecording);
             }
         }
     }
@@ -387,6 +570,9 @@ impl Worker {
                 .pitch
                 .process(&input.block, header.time_s, &mut input.frames);
             for frame in input.frames.drain(..) {
+                if let Some(recording) = &mut self.recording {
+                    recording.frames.push(frame);
+                }
                 let live = LiveFrame {
                     time_s: frame.time_s,
                     freq_hz: frame.freq_hz,
@@ -427,6 +613,24 @@ impl Worker {
                 phase: beat.phase,
                 time_s: beat.time_s,
             });
+            if let Some(recording) = &mut self.recording {
+                if recording.count_in_seen {
+                    if beat.audible {
+                        recording.clicks.push(beat.time_s);
+                    }
+                    if beat.phase == BeatPhase::Recording
+                        && beat.index == 0
+                        && recording.origin_s.is_none()
+                    {
+                        let origin_s = beat.time_s + self.latency_s;
+                        recording.origin_s = Some(origin_s);
+                        let _ = self.events.send(EngineEvent::RecordingStarted { origin_s });
+                    }
+                } else if beat.phase == BeatPhase::CountIn && beat.index == 0 {
+                    // Beats before the count-in belong to an earlier sequence.
+                    recording.count_in_seen = true;
+                }
+            }
         }
         let dropped = output.control.dropped_beats();
         if dropped > output.reported_dropped_beats {
@@ -446,7 +650,7 @@ mod tests {
     use crossbeam_channel::Receiver;
 
     use super::*;
-    use crate::audio::fake::{fake_backend, FakeConfig};
+    use crate::audio::fake::{fake_backend, FakeConfig, FakeHandle};
     use crate::audio::AudioError;
     use crate::dsp::filter::tests::sine;
     use crate::music::assert_close;
@@ -496,6 +700,16 @@ mod tests {
             matches!(event, EngineEvent::Devices { .. })
         });
         assert!(devices.is_some(), "the engine answers RefreshDevices");
+    }
+
+    /// Waits until both the input and the output stream of `handle` are open.
+    fn wait_both_streams(handle: &FakeHandle) {
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                handle.input_device().is_some() && handle.output_device().is_some()
+            }),
+            "both streams open"
+        );
     }
 
     #[test]
@@ -816,5 +1030,266 @@ mod tests {
         });
         sync(&engine);
         assert_eq!(handle.output_device(), None);
+    }
+
+    #[test]
+    fn recording_reports_the_origin_and_masks_clicks() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+
+        handle.push_input(&vec![0.0_f32; 96_000]); // 2 s of silence
+        handle.push_input(&sine(1046.5, 0.3, 48_000, 96_000));
+        handle.step_n(750); // 4 s
+
+        let started = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        })
+        .expect("a RecordingStarted event");
+        match started {
+            EngineEvent::RecordingStarted { origin_s } => assert_close(origin_s, 2.0, 1e-9),
+            other => panic!("expected RecordingStarted, got {other:?}"),
+        }
+
+        engine.send(EngineCommand::StopRecording);
+        let finished = wait_for(engine.events(), Duration::from_secs(5), |event| {
+            matches!(event, EngineEvent::RecordingFinished { .. })
+        })
+        .expect("a RecordingFinished event");
+        match finished {
+            EngineEvent::RecordingFinished { frames, origin_s } => {
+                assert_close(origin_s, 2.0, 1e-9);
+                assert!(!frames.is_empty(), "the recording has frames");
+                assert!(
+                    frames.iter().all(|frame| frame.time_s >= 1.9 - 1e-9),
+                    "every frame is kept from the pre-roll on"
+                );
+                let clicks = [2.0, 2.5, 3.0, 3.5];
+                for frame in &frames {
+                    for &click in &clicks {
+                        if (click - 0.0214..=click + 0.0414).contains(&frame.time_s) {
+                            assert!(
+                                frame.freq_hz.is_none(),
+                                "frame at {} is voiced over the click at {click}",
+                                frame.time_s
+                            );
+                        }
+                    }
+                }
+                let voiced: Vec<&PitchFrame> = frames
+                    .iter()
+                    .filter(|frame| (2.1..2.4).contains(&frame.time_s))
+                    .collect();
+                assert!(
+                    voiced.len() >= 20,
+                    "only {} frames in 2.1..2.4",
+                    voiced.len()
+                );
+                for frame in voiced {
+                    let freq_hz = frame.freq_hz.expect("a frame in 2.1..2.4 is voiced");
+                    assert!(
+                        (freq_hz - 1046.5).abs() / 1046.5 < 0.01,
+                        "{freq_hz} Hz instead of 1046.5 Hz"
+                    );
+                }
+            }
+            other => panic!("expected RecordingFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_latency_offset_shifts_the_origin() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SetLatencyMs(50.0));
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: false,
+        });
+        wait_both_streams(&handle);
+        handle.step_n(400); // 2.133 s
+        let started = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        })
+        .expect("a RecordingStarted event");
+        match started {
+            EngineEvent::RecordingStarted { origin_s } => assert_close(origin_s, 2.05, 1e-9),
+            other => panic!("expected RecordingStarted, got {other:?}"),
+        }
+
+        engine.send(EngineCommand::StopRecording);
+        engine.send(EngineCommand::SetLatencyMs(1000.0)); // clamped to 200 ms
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: false,
+        });
+        sync(&engine);
+        handle.step_n(400);
+
+        // The first CountIn beat with index 0 after the second StartRecording.
+        let count_in_start = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(
+                event,
+                EngineEvent::Beat {
+                    index: 0,
+                    phase: BeatPhase::CountIn,
+                    ..
+                }
+            )
+        })
+        .expect("the second count-in starts");
+        let EngineEvent::Beat { time_s: start, .. } = count_in_start else {
+            unreachable!("a count-in beat")
+        };
+        let started = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        })
+        .expect("the second RecordingStarted event");
+        match started {
+            EngineEvent::RecordingStarted { origin_s } => {
+                assert_close(origin_s, start + 2.0 + 0.2, 1e-9)
+            }
+            other => panic!("expected RecordingStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopping_during_the_count_in_gives_an_empty_recording() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+        handle.step_n(94); // 0.501 s: inside the count-in
+        engine.send(EngineCommand::StopRecording);
+
+        let mut started_seen = false;
+        let finished = wait_for(engine.events(), Duration::from_secs(5), |event| {
+            started_seen |= matches!(event, EngineEvent::RecordingStarted { .. });
+            matches!(event, EngineEvent::RecordingFinished { .. })
+        })
+        .expect("a RecordingFinished event");
+        assert!(!started_seen, "no RecordingStarted before the finish");
+        assert_eq!(
+            finished,
+            EngineEvent::RecordingFinished {
+                frames: Vec::new(),
+                origin_s: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn stop_listening_discards_a_recording() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+        handle.step_n(470); // 2.507 s
+        let started = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        });
+        assert!(started.is_some(), "a RecordingStarted event");
+
+        engine.send(EngineCommand::StopListening);
+        engine.send(EngineCommand::RefreshDevices);
+        let mut finished_seen = false;
+        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            finished_seen |= matches!(event, EngineEvent::RecordingFinished { .. });
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(devices.is_some(), "the engine answers RefreshDevices");
+        assert!(
+            !finished_seen,
+            "a RecordingFinished arrived after StopListening"
+        );
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.input_device().is_none()
+        }));
+    }
+
+    #[test]
+    fn a_recording_without_listening_closes_the_input_afterwards() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: false,
+        });
+        wait_both_streams(&handle);
+        handle.step_n(400);
+        let started = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        });
+        assert!(started.is_some(), "a RecordingStarted event");
+        engine.send(EngineCommand::StopRecording);
+        let finished = wait_for(engine.events(), Duration::from_secs(5), |event| {
+            matches!(event, EngineEvent::RecordingFinished { .. })
+        });
+        assert!(finished.is_some(), "a RecordingFinished event");
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.input_device().is_none()
+        }));
+
+        // While listening, a recording keeps the input open.
+        engine.send(EngineCommand::StartListening);
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.input_device().is_some()
+        }));
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: false,
+        });
+        sync(&engine); // the recording command is queued before stepping
+        handle.step_n(400);
+        let started = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        });
+        assert!(started.is_some(), "a RecordingStarted event");
+        engine.send(EngineCommand::StopRecording);
+        let finished = wait_for(engine.events(), Duration::from_secs(5), |event| {
+            matches!(event, EngineEvent::RecordingFinished { .. })
+        });
+        assert!(finished.is_some(), "a RecordingFinished event");
+        sync(&engine);
+        assert!(handle.input_device().is_some());
+    }
+
+    #[test]
+    fn finish_frames_keeps_the_pre_roll_and_masks_clicks() {
+        let frames: Vec<PitchFrame> = (0..=300)
+            .map(|i| PitchFrame {
+                time_s: i as f64 * 0.01,
+                freq_hz: Some(1000.0),
+                confidence: 0.9,
+            })
+            .collect();
+        let finished = finish_frames(frames, 2.0, &[2.0, 2.5], 0.04);
+        assert_close(finished[0].time_s, 1.9, 1e-9);
+        let frame_at = |t: f64| {
+            finished
+                .iter()
+                .find(|frame| (frame.time_s - t).abs() < 1e-9)
+                .unwrap_or_else(|| panic!("a frame at {t}"))
+        };
+        for t in [1.99, 2.0, 2.03, 2.5] {
+            let frame = frame_at(t);
+            assert!(frame.freq_hz.is_none(), "the frame at {t} is unvoiced");
+            assert_eq!(frame.confidence, 0.0);
+        }
+        for t in [1.97, 2.05, 2.2, 2.45] {
+            let frame = frame_at(t);
+            assert_eq!(frame.freq_hz, Some(1000.0), "the frame at {t} is voiced");
+            assert_eq!(frame.confidence, 0.9);
+        }
     }
 }
