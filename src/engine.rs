@@ -2,8 +2,9 @@
 //!
 //! The engine thread owns the audio streams and the signal processing. It
 //! turns microphone input into live pitch frames on a lossy channel and
-//! onsets and device lists on a reliable channel, and it takes commands
-//! from the GUI through another channel.
+//! onsets, device lists and metronome beats on a reliable channel, and it
+//! takes commands from the GUI through another channel. The metronome
+//! renders its clicks on the output stream.
 
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -17,7 +18,11 @@ use crate::audio::ring::{
 use crate::audio::rms;
 use crate::dsp::onset::{OnsetConfig, OnsetDetector};
 use crate::dsp::pitch::{PitchConfig, PitchTracker};
+use crate::metronome::{metronome, MetronomeCommand, MetronomeControl};
 use crate::music::segment::PitchFrame;
+
+/// What a metronome beat belongs to, as reported in [`EngineEvent::Beat`].
+pub use crate::metronome::BeatPhase;
 
 /// Capacity of the live frame channel; frames are dropped when it is full.
 pub const LIVE_CAPACITY: usize = 256;
@@ -50,6 +55,17 @@ pub enum EngineEvent {
         /// Names of the output devices.
         outputs: Vec<String>,
     },
+    /// A metronome beat starts playing on the output stream at `time_s`.
+    Beat {
+        /// Index of the beat within its sequence, starting at 0.
+        index: u32,
+        /// Whether the beat is accented, which the first beat of a bar is.
+        accent: bool,
+        /// What the beat belongs to.
+        phase: BeatPhase,
+        /// Engine-clock time at which the beat plays, in seconds.
+        time_s: f64,
+    },
     /// A non-fatal error occurred.
     Error(
         /// Description of the error.
@@ -67,6 +83,16 @@ pub enum EngineCommand {
     /// Selects the input device by name, or the default device for `None`;
     /// an open stream is reopened on the new device.
     SelectInput(Option<String>),
+    /// Sets the tempo and the on/off state of the free-running metronome.
+    SetMetronome {
+        /// Tempo in BPM.
+        bpm: f64,
+        /// Whether the metronome runs.
+        enabled: bool,
+    },
+    /// Selects the output device by name, or the default device for `None`;
+    /// an open output stream is reopened on the new device.
+    SelectOutput(Option<String>),
     /// Reports the current device lists as an [`EngineEvent::Devices`] event.
     RefreshDevices,
     /// Stops the engine thread.
@@ -98,6 +124,10 @@ impl Engine {
                     input_name: None,
                     listening: false,
                     input: None,
+                    output_name: None,
+                    free_bpm: 120.0,
+                    free_enabled: false,
+                    output: None,
                 }
                 .run();
             })
@@ -140,7 +170,8 @@ impl Drop for Engine {
 /// waiting; each input block also unparks the thread through the input ring.
 const PARK_TIMEOUT: Duration = Duration::from_millis(5);
 
-/// The engine thread's state: the backend, the channels and the open input.
+/// The engine thread's state: the backend, the channels, the open input and
+/// the open output.
 struct Worker {
     backend: Box<dyn AudioBackend>,
     commands: Receiver<EngineCommand>,
@@ -149,6 +180,10 @@ struct Worker {
     input_name: Option<String>,
     listening: bool,
     input: Option<Input>,
+    output_name: Option<String>,
+    free_bpm: f64,
+    free_enabled: bool,
+    output: Option<Output>,
 }
 
 /// One open input stream with its processing state.
@@ -164,13 +199,24 @@ struct Input {
     reported_drops: u64,
 }
 
+/// One open output stream with the metronome that renders into it.
+struct Output {
+    /// The stream; dropping it stops the stream.
+    _stream: Box<dyn AudioStream>,
+    /// The handle that controls the metronome and receives its beats.
+    control: MetronomeControl,
+    /// Number of dropped beats already reported as an error event.
+    reported_dropped_beats: u64,
+}
+
 impl Worker {
-    /// Emits the device lists, then drains input and handles commands until
-    /// shutdown or a disconnected command channel.
+    /// Emits the device lists, then drains input and beats and handles
+    /// commands until shutdown or a disconnected command channel.
     fn run(mut self) {
         self.emit_devices();
         loop {
             self.drain_input();
+            self.drain_beats();
             loop {
                 match self.commands.try_recv() {
                     Ok(command) => {
@@ -206,6 +252,34 @@ impl Worker {
                 if self.input.is_some() {
                     self.input = None;
                     self.open_input();
+                }
+            }
+            EngineCommand::SetMetronome { bpm, enabled } => {
+                // A tempo that is not finite is ignored.
+                if bpm.is_finite() {
+                    self.free_bpm = bpm;
+                    self.free_enabled = enabled;
+                    if let Some(output) = &mut self.output {
+                        let sent = output
+                            .control
+                            .send(MetronomeCommand::SetFree { bpm, enabled });
+                        if !sent {
+                            let _ = self
+                                .events
+                                .send(EngineEvent::Error("metronome command queue full".into()));
+                        }
+                    } else if enabled {
+                        self.open_output();
+                    }
+                    // Once open, the output stream stays open; disabling
+                    // only silences the metronome.
+                }
+            }
+            EngineCommand::SelectOutput(name) => {
+                self.output_name = name;
+                if self.output.is_some() {
+                    self.output = None;
+                    self.open_output();
                 }
             }
             EngineCommand::RefreshDevices => self.emit_devices(),
@@ -262,6 +336,37 @@ impl Worker {
         }
     }
 
+    /// Opens the output stream with the metronome on the selected device;
+    /// an error becomes an event.
+    fn open_output(&mut self) {
+        let (mut control, source) = metronome();
+        // Queue the current free-running setting before the stream starts,
+        // so the metronome applies it with its first rendered block.
+        let _ = control.send(MetronomeCommand::SetFree {
+            bpm: self.free_bpm,
+            enabled: self.free_enabled,
+        });
+        let events = self.events.clone();
+        let on_error: ErrorSink = Box::new(move |error| {
+            let _ = events.send(EngineEvent::Error(error.to_string()));
+        });
+        let stream = self
+            .backend
+            .open_output(self.output_name.as_deref(), source, on_error);
+        match stream {
+            Ok(stream) => {
+                self.output = Some(Output {
+                    _stream: stream,
+                    control,
+                    reported_dropped_beats: 0,
+                });
+            }
+            Err(error) => {
+                let _ = self.events.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+    }
+
     /// Reads every waiting input block, turns it into live frames and onset
     /// events, and reports dropped samples once per increase.
     fn drain_input(&mut self) {
@@ -306,6 +411,30 @@ impl Worker {
                 dropped - input.reported_drops
             )));
             input.reported_drops = dropped;
+        }
+    }
+
+    /// Forwards every rendered metronome beat as a `Beat` event and reports
+    /// dropped beats once per increase.
+    fn drain_beats(&mut self) {
+        let Some(output) = &mut self.output else {
+            return;
+        };
+        while let Some(beat) = output.control.try_recv() {
+            let _ = self.events.send(EngineEvent::Beat {
+                index: beat.index,
+                accent: beat.accent,
+                phase: beat.phase,
+                time_s: beat.time_s,
+            });
+        }
+        let dropped = output.control.dropped_beats();
+        if dropped > output.reported_dropped_beats {
+            let _ = self.events.send(EngineEvent::Error(format!(
+                "metronome beats dropped: {}",
+                dropped - output.reported_dropped_beats
+            )));
+            output.reported_dropped_beats = dropped;
         }
     }
 }
@@ -356,6 +485,17 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Sends `RefreshDevices` and waits for the `Devices` event; commands
+    /// are handled in order, so every command sent before the call has been
+    /// handled when it returns.
+    fn sync(engine: &Engine) {
+        engine.send(EngineCommand::RefreshDevices);
+        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(devices.is_some(), "the engine answers RefreshDevices");
     }
 
     #[test]
@@ -502,5 +642,179 @@ mod tests {
 
         drop(engine);
         assert_eq!(handle.input_device(), None);
+    }
+
+    #[test]
+    fn metronome_beats_become_events() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.output_device().is_some()
+        }));
+
+        handle.step_n(375); // 96_000 samples, 2 s
+        let mut beats = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while beats.len() < 4 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match engine.events().recv_timeout(remaining) {
+                Ok(EngineEvent::Beat {
+                    index,
+                    accent,
+                    phase,
+                    time_s,
+                }) => beats.push((index, accent, phase, time_s)),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(beats.len(), 4, "four beat events, got {beats:?}");
+        for (k, &(index, accent, phase, time_s)) in beats.iter().enumerate() {
+            assert_eq!(index, k as u32);
+            assert_eq!(phase, BeatPhase::Free);
+            assert_eq!(accent, k == 0);
+            assert_close(time_s, 0.5 * k as f64, 1e-9);
+        }
+
+        let output = handle.take_output();
+        assert_eq!(output.len(), 96_000);
+        assert!(
+            output.iter().any(|&sample| sample != 0.0),
+            "the metronome rendered audible clicks"
+        );
+    }
+
+    #[test]
+    fn disabling_the_metronome_keeps_the_stream_and_stops_beats() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.output_device().is_some()
+        }));
+        handle.step_n(10);
+        // Beat 0 plays in the first block; once its event arrives, no beat
+        // is in flight.
+        let first = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Beat { .. })
+        });
+        assert!(first.is_some(), "the first beat event arrives");
+
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: false,
+        });
+        sync(&engine);
+
+        handle.step_n(375); // 2 s more of silence
+        engine.send(EngineCommand::RefreshDevices);
+        let mut beat_seen = false;
+        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            beat_seen |= matches!(event, EngineEvent::Beat { .. });
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(devices.is_some(), "the engine answers RefreshDevices");
+        assert!(
+            !beat_seen,
+            "a beat event arrived while the metronome is disabled"
+        );
+        assert_eq!(handle.output_device(), Some("Fake Speakers".to_string()));
+    }
+
+    #[test]
+    fn select_output_reopens_on_the_named_device() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        handle.set_devices(
+            vec!["Fake Microphone".to_string()],
+            vec!["Fake Speakers".to_string(), "Headphones".to_string()],
+        );
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.output_device().as_deref() == Some("Fake Speakers")
+        }));
+
+        engine.send(EngineCommand::SelectOutput(Some("Headphones".to_string())));
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.output_device().as_deref() == Some("Headphones")
+        }));
+
+        handle.step_n(10);
+        let beat = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Beat { .. })
+        })
+        .expect("a beat event after the reopen");
+        match beat {
+            EngineEvent::Beat { index, phase, .. } => {
+                assert_eq!(index, 0);
+                assert_eq!(phase, BeatPhase::Free);
+            }
+            other => panic!("expected a beat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_output_device_gives_an_error() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SelectOutput(Some("Nope".to_string())));
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let error = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Error(_))
+        })
+        .expect("an error event for the unknown output device");
+        match error {
+            EngineEvent::Error(message) => assert!(message.contains("Nope"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(handle.output_device(), None);
+    }
+
+    #[test]
+    fn output_errors_become_error_events() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.output_device().is_some()
+        }));
+
+        handle.fail_output(AudioError::Backend("crackle".to_string()));
+        let event = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Error(_))
+        })
+        .expect("an error event");
+        match event {
+            EngineEvent::Error(message) => assert!(message.contains("crackle"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_finite_tempo_is_ignored() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::SetMetronome {
+            bpm: f64::NAN,
+            enabled: true,
+        });
+        sync(&engine);
+        assert_eq!(handle.output_device(), None);
     }
 }
