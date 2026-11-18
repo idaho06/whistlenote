@@ -431,6 +431,38 @@ mod tests {
         output
     }
 
+    /// Renders samples `from`..`to` in blocks of `block_size` and returns them.
+    fn render_span_in_blocks(
+        metronome: &mut Metronome,
+        from: usize,
+        to: usize,
+        rate: u32,
+        block_size: usize,
+        beats: &mut Vec<Beat>,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0_f32; to - from];
+        let mut start = from;
+        while start < to {
+            let len = (to - start).min(block_size);
+            let info = OutputBlockInfo {
+                time_s: start as f64 / f64::from(rate),
+                sample_rate: rate,
+            };
+            metronome.render(
+                &mut output[start - from..start - from + len],
+                info,
+                |beat| beats.push(beat),
+            );
+            start += len;
+        }
+        output
+    }
+
+    /// Returns the absolute sample index at which `beat` plays.
+    fn sample_of(beat: &Beat, rate: u32) -> usize {
+        (beat.time_s * f64::from(rate)).round() as usize
+    }
+
     #[test]
     fn count_in_then_silent_recording_beats() {
         let rate = 48_000;
@@ -577,5 +609,269 @@ mod tests {
             assert!(control.send(MetronomeCommand::StopRecording));
         }
         assert!(!control.send(MetronomeCommand::StopRecording));
+    }
+
+    #[test]
+    fn free_mode_at_44_1_khz_fires_every_22050_samples() {
+        let rate = 44_100;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 88_200, rate, &mut beats);
+        assert_eq!(beats.len(), 4);
+        let samples = [0, 22_050, 44_100, 66_150];
+        let times = [0.0, 0.5, 1.0, 1.5];
+        for (k, beat) in beats.iter().enumerate() {
+            assert_eq!(sample_of(beat, rate), samples[k]);
+            assert_close(beat.time_s, times[k], 1e-9);
+        }
+    }
+
+    #[test]
+    fn output_does_not_depend_on_the_block_size() {
+        let rate = 44_100;
+        let total = 286_650; // 6.5 s
+        let render = |block_size: usize| {
+            let mut metronome = Metronome::new();
+            metronome.apply(MetronomeCommand::StartRecording {
+                bpm: 130.0,
+                clicks: true,
+            });
+            let mut beats = Vec::new();
+            let output =
+                render_span_in_blocks(&mut metronome, 0, total, rate, block_size, &mut beats);
+            (beats, output)
+        };
+        let (beats_256, output_256) = render(256);
+        let (beats_300, output_300) = render(300);
+        let (beats_single, output_single) = render(total);
+        // Beat times are the block time plus the offset in the block, so
+        // they can differ in the last bit between block sizes.
+        for other in [&beats_300, &beats_single] {
+            assert_eq!(beats_256.len(), other.len());
+            for (a, b) in beats_256.iter().zip(other.iter()) {
+                assert_eq!(
+                    (a.index, a.accent, a.phase, a.audible),
+                    (b.index, b.accent, b.phase, b.audible)
+                );
+                assert_close(a.time_s, b.time_s, 1e-12);
+            }
+        }
+        assert_eq!(output_256, output_300);
+        assert_eq!(output_300, output_single);
+        // One beat fires for every k whose rounded-up position lands inside the span.
+        let expected = (0..)
+            .take_while(|&k| ((k as f64 * 2_646_000.0 / 130.0) - 1e-6).ceil() < total as f64)
+            .count();
+        assert_eq!(expected, 15); // 4 count-in beats and 11 recording beats
+        assert_eq!(beats_256.len(), expected);
+        for (k, beat) in beats_256.iter().enumerate() {
+            let position = ((k as f64 * 2_646_000.0 / 130.0) - 1e-6).ceil() as usize;
+            assert_eq!(sample_of(beat, rate), position);
+            if k < BEATS_PER_BAR as usize {
+                assert_eq!(beat.phase, BeatPhase::CountIn);
+                assert_eq!(beat.index, k as u32);
+            } else {
+                assert_eq!(beat.phase, BeatPhase::Recording);
+                assert_eq!(beat.index, (k - BEATS_PER_BAR as usize) as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_integer_interval_does_not_drift() {
+        let rate = 44_100;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 130.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let output = render_span(&mut metronome, 0, 269_010, rate, &mut beats);
+        assert_eq!(beats.len(), 14);
+        for (k, beat) in beats.iter().enumerate() {
+            // The interval is 2_646_000 / 130 samples, which is not an integer.
+            let expected = ((k as f64 * 2_646_000.0 / 130.0) - 1e-6).ceil() as usize;
+            assert_eq!(sample_of(beat, rate), expected);
+            assert_close(beat.time_s, expected as f64 / 44_100.0, 1e-9);
+            if k >= 1 {
+                // A click lasts 882 samples, far shorter than the interval.
+                assert_eq!(output[expected - 1], 0.0);
+                assert!(output[expected + 1] != 0.0);
+            }
+        }
+        assert_eq!(sample_of(&beats[1], rate), 20_354);
+        assert_eq!(sample_of(&beats[2], rate), 40_708);
+        assert_eq!(sample_of(&beats[3], rate), 61_062);
+        assert_eq!(sample_of(&beats[13], rate), 264_600);
+    }
+
+    #[test]
+    fn a_bpm_change_applies_from_the_last_beat() {
+        let rate = 48_000;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 30_000, rate, &mut beats);
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 60.0,
+            enabled: true,
+        });
+        let _ = render_span(&mut metronome, 30_000, 130_000, rate, &mut beats);
+        assert_eq!(beats.len(), 4);
+        let samples = [0, 24_000, 72_000, 120_000];
+        for (k, beat) in beats.iter().enumerate() {
+            assert_eq!(sample_of(beat, rate), samples[k]);
+            assert_eq!(beat.index, k as u32);
+        }
+        assert_close(beats[2].time_s, 1.5, 1e-9);
+        assert_close(beats[3].time_s, 2.5, 1e-9);
+        assert!(!beats[2].accent);
+        assert!(!beats[3].accent);
+    }
+
+    #[test]
+    fn a_late_bpm_change_starts_at_the_block() {
+        let rate = 48_000;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 40_000, rate, &mut beats);
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 240.0,
+            enabled: true,
+        });
+        let _ = render_span(&mut metronome, 40_000, 70_000, rate, &mut beats);
+        assert_eq!(beats.len(), 5);
+        let samples = [0, 24_000, 40_000, 52_000, 64_000];
+        for (k, beat) in beats.iter().enumerate() {
+            assert_eq!(sample_of(beat, rate), samples[k]);
+            assert_close(beat.time_s, samples[k] as f64 / f64::from(rate), 1e-9);
+            assert_eq!(beat.index, k as u32);
+        }
+        assert!(!beats[2].accent);
+        assert!(!beats[3].accent);
+        assert!(beats[4].accent);
+    }
+
+    #[test]
+    fn repeating_the_same_free_setting_does_not_restart() {
+        let rate = 48_000;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 30_000, rate, &mut beats);
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let _ = render_span(&mut metronome, 30_000, 100_000, rate, &mut beats);
+        assert_eq!(beats.len(), 5);
+        let samples = [0, 24_000, 48_000, 72_000, 96_000];
+        let accents = [true, false, false, false, true];
+        for (k, beat) in beats.iter().enumerate() {
+            assert_eq!(sample_of(beat, rate), samples[k]);
+            assert_eq!(beat.index, k as u32);
+            assert_eq!(beat.accent, accents[k]);
+        }
+    }
+
+    #[test]
+    fn non_finite_tempos_are_ignored_and_others_clamped() {
+        let rate = 48_000;
+        // Non-finite tempos change nothing, so the metronome stays idle.
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: f64::NAN,
+            enabled: true,
+        });
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: f64::INFINITY,
+            enabled: true,
+        });
+        metronome.apply(MetronomeCommand::StartRecording {
+            bpm: f64::NAN,
+            clicks: true,
+        });
+        let mut beats = Vec::new();
+        let output = render_span(&mut metronome, 0, 48_000, rate, &mut beats);
+        assert!(beats.is_empty());
+        assert!(output.iter().all(|&sample| sample == 0.0));
+
+        // 1000 BPM is clamped to 300 BPM, one beat every 9_600 samples.
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 1000.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 48_000, rate, &mut beats);
+        assert_eq!(beats.len(), 5);
+        let samples = [0, 9_600, 19_200, 28_800, 38_400];
+        for (beat, &sample) in beats.iter().zip(samples.iter()) {
+            assert_eq!(sample_of(beat, rate), sample);
+        }
+
+        // 1 BPM is clamped to 20 BPM, one beat every 144_000 samples.
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 1.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 150_000, rate, &mut beats);
+        assert_eq!(beats.len(), 2);
+        assert_eq!(sample_of(&beats[0], rate), 0);
+        assert_eq!(sample_of(&beats[1], rate), 144_000);
+    }
+
+    #[test]
+    fn starting_a_recording_again_restarts_the_count_in() {
+        let rate = 48_000;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::StartRecording {
+            bpm: 120.0,
+            clicks: true,
+        });
+        let mut beats = Vec::new();
+        let _ = render_span(&mut metronome, 0, 60_000, rate, &mut beats);
+        assert_eq!(beats.len(), 3);
+        assert_eq!(sample_of(&beats[0], rate), 0);
+        assert_eq!(sample_of(&beats[1], rate), 24_000);
+        assert_eq!(sample_of(&beats[2], rate), 48_000);
+        metronome.apply(MetronomeCommand::StartRecording {
+            bpm: 60.0,
+            clicks: false,
+        });
+        let _ = render_span(&mut metronome, 60_000, 300_000, rate, &mut beats);
+        assert_eq!(beats.len(), 8);
+        let expected = [
+            (60_000, 0, BeatPhase::CountIn, true, true),
+            (108_000, 1, BeatPhase::CountIn, false, true),
+            (156_000, 2, BeatPhase::CountIn, false, true),
+            (204_000, 3, BeatPhase::CountIn, false, true),
+            (252_000, 0, BeatPhase::Recording, true, false),
+        ];
+        for (beat, &(sample, index, phase, accent, audible)) in
+            beats[3..].iter().zip(expected.iter())
+        {
+            assert_eq!(sample_of(beat, rate), sample);
+            assert_eq!(beat.index, index);
+            assert_eq!(beat.phase, phase);
+            assert_eq!(beat.accent, accent);
+            assert_eq!(beat.audible, audible);
+        }
     }
 }
