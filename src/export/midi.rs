@@ -2,7 +2,9 @@
 
 use crate::music::quantize::QuantNote;
 use midly::num::{u15, u24, u28, u4, u7};
-use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+use midly::{
+    Format, Header, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
+};
 
 /// Ticks per quarter note in exported files.
 const TICKS_PER_BEAT: u16 = 480;
@@ -25,6 +27,25 @@ fn beats_to_ticks(beats: f64) -> u32 {
     }
 }
 
+/// Builds a meta event at delta time 0.
+fn meta(kind: MetaMessage<'static>) -> TrackEvent<'static> {
+    TrackEvent {
+        delta: u28::from(0),
+        kind: TrackEventKind::Meta(kind),
+    }
+}
+
+/// Builds a MIDI event on the export channel with the given delta time in ticks.
+fn midi_event(delta: u32, message: MidiMessage) -> TrackEvent<'static> {
+    TrackEvent {
+        delta: u28::from(delta),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(CHANNEL),
+            message,
+        },
+    }
+}
+
 /// Serializes notes to a format 0 Standard MIDI File and returns its bytes.
 ///
 /// A `bpm` that is not finite or not positive is treated as 120.
@@ -36,29 +57,17 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
     };
     let tempo_us = (60_000_000.0 / bpm).round().clamp(1.0, MAX_TEMPO_US) as u32;
 
-    let mut track: Vec<TrackEvent<'static>> = Vec::new();
-    track.push(TrackEvent {
-        delta: u28::from(0),
-        kind: TrackEventKind::Meta(MetaMessage::TrackName(b"whistlenote")),
-    });
-    track.push(TrackEvent {
-        delta: u28::from(0),
-        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(tempo_us))),
-    });
-    track.push(TrackEvent {
-        delta: u28::from(0),
-        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8)),
-    });
+    let mut track: Track<'static> = Vec::with_capacity(notes.len() * 2 + 5);
+    track.push(meta(MetaMessage::TrackName(b"whistlenote")));
+    track.push(meta(MetaMessage::Tempo(u24::from(tempo_us))));
+    track.push(meta(MetaMessage::TimeSignature(4, 2, 24, 8)));
     if !notes.is_empty() {
-        track.push(TrackEvent {
-            delta: u28::from(0),
-            kind: TrackEventKind::Midi {
-                channel: u4::from(CHANNEL),
-                message: MidiMessage::ProgramChange {
-                    program: u7::from(0),
-                },
+        track.push(midi_event(
+            0,
+            MidiMessage::ProgramChange {
+                program: u7::from(0),
             },
-        });
+        ));
     }
 
     let mut note_events: Vec<(u32, bool, u7)> = Vec::with_capacity(notes.len() * 2);
@@ -69,41 +78,30 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
         note_events.push((start, true, key));
         note_events.push((start.saturating_add(length), false, key));
     }
+    // A note off (false) sorts before a note on (true) at an equal tick.
     note_events.sort_by_key(|&(tick, is_on, _)| (tick, is_on));
 
+    let vel = u7::from(VELOCITY);
     let mut prev_tick = 0;
     for (tick, is_on, key) in note_events {
         let message = if is_on {
-            MidiMessage::NoteOn {
-                key,
-                vel: u7::from(VELOCITY),
-            }
+            MidiMessage::NoteOn { key, vel }
         } else {
-            MidiMessage::NoteOff {
-                key,
-                vel: u7::from(VELOCITY),
-            }
+            MidiMessage::NoteOff { key, vel }
         };
-        track.push(TrackEvent {
-            delta: u28::from(tick - prev_tick),
-            kind: TrackEventKind::Midi {
-                channel: u4::from(CHANNEL),
-                message,
-            },
-        });
+        track.push(midi_event(tick - prev_tick, message));
         prev_tick = tick;
     }
-    track.push(TrackEvent {
-        delta: u28::from(0),
-        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
-    });
+    track.push(meta(MetaMessage::EndOfTrack));
 
-    let mut smf = Smf::new(Header::new(
-        Format::SingleTrack,
-        Timing::Metrical(u15::from(TICKS_PER_BEAT)),
-    ));
-    smf.tracks.push(track);
-    let mut bytes = Vec::new();
+    let smf = Smf {
+        header: Header::new(
+            Format::SingleTrack,
+            Timing::Metrical(u15::from(TICKS_PER_BEAT)),
+        ),
+        tracks: vec![track],
+    };
+    let mut bytes = Vec::with_capacity(22 + smf.tracks[0].len() * 8);
     smf.write_std(&mut bytes)
         .expect("writing to an in-memory buffer is infallible");
     bytes

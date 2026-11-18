@@ -4,9 +4,13 @@ use crate::music::note::{midi_to_freq, midi_to_name};
 use crate::music::quantize::QuantNote;
 use std::fmt::Write;
 
+/// Header line of the exported CSV.
+const HEADER: &str = "start_beat,length_beats,note,midi,freq_hz\n";
+
 /// Formats notes as CSV text with a header line and one row per note.
 pub fn to_csv(notes: &[QuantNote]) -> String {
-    let mut csv = String::from("start_beat,length_beats,note,midi,freq_hz\n");
+    let mut csv = String::with_capacity(HEADER.len() + notes.len() * 32);
+    csv.push_str(HEADER);
     for note in notes {
         writeln!(
             csv,
