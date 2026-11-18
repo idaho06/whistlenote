@@ -1,0 +1,271 @@
+//! Pitch tracking of band-passed input with the McLeod pitch method.
+//!
+//! [`PitchTracker`] band-passes the input, analyses windows of [`WINDOW`]
+//! samples every [`HOP`] samples, and stamps each [`PitchFrame`] with the
+//! engine-clock time of the window's centre sample (index `WINDOW / 2`).
+
+use pitch_detection::detector::mcleod::McLeodDetector;
+use pitch_detection::detector::PitchDetector;
+
+use super::filter::BandPass;
+use crate::audio::rms;
+use crate::music::segment::PitchFrame;
+
+/// Analysis window length in samples.
+pub const WINDOW: usize = 2048;
+/// Distance in samples between the starts of consecutive windows.
+pub const HOP: usize = 512;
+/// Lowest reported frequency in Hz.
+pub const MIN_FREQ_HZ: f32 = 400.0;
+/// Highest reported frequency in Hz.
+pub const MAX_FREQ_HZ: f32 = 4000.0;
+
+/// Zero padding of the detector's autocorrelation buffer in samples.
+const PADDING: usize = WINDOW / 2;
+/// Clarity a peak of the normalized square difference function needs to be
+/// considered by the detector.
+const CLARITY_THRESHOLD: f32 = 0.5;
+
+/// Settings of a [`PitchTracker`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PitchConfig {
+    /// Window RMS, after band-passing, below which a window is silent.
+    pub silence_rms: f32,
+}
+
+impl Default for PitchConfig {
+    /// A silence level of 0.002 RMS.
+    fn default() -> Self {
+        Self { silence_rms: 0.002 }
+    }
+}
+
+/// Turns blocks of mono samples into timed pitch frames.
+///
+/// The tracker is not `Send`; it lives on the thread that creates it.
+pub struct PitchTracker {
+    config: PitchConfig,
+    sample_rate: u32,
+    filter: BandPass,
+    detector: McLeodDetector<f32>,
+    window: Vec<f32>,
+}
+
+impl PitchTracker {
+    /// Creates a tracker for input at `sample_rate` Hz.
+    pub fn new(sample_rate: u32, config: PitchConfig) -> Self {
+        Self {
+            config,
+            sample_rate,
+            filter: BandPass::new(sample_rate),
+            detector: McLeodDetector::new(WINDOW, PADDING),
+            window: Vec::with_capacity(WINDOW),
+        }
+    }
+
+    /// Returns the sample rate in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Returns the duration of one analysis window in seconds.
+    pub fn window_s(&self) -> f64 {
+        WINDOW as f64 / f64::from(self.sample_rate)
+    }
+
+    /// Analyses `block`, whose first sample has engine-clock time
+    /// `start_time_s`, and appends one frame per completed window to `out`.
+    ///
+    /// The samples continue those of earlier blocks without a gap; after a
+    /// gap, call [`reset`](Self::reset) first.
+    pub fn process(&mut self, block: &[f32], start_time_s: f64, out: &mut Vec<PitchFrame>) {
+        let rate = f64::from(self.sample_rate);
+        for (index, &sample) in block.iter().enumerate() {
+            self.window.push(self.filter.run(sample));
+            if self.window.len() == WINDOW {
+                // The window ends at this sample; its centre sample lies
+                // WINDOW - 1 - WINDOW / 2 samples earlier.
+                let end_time_s = start_time_s + index as f64 / rate;
+                let time_s = end_time_s - (WINDOW - 1 - WINDOW / 2) as f64 / rate;
+                out.push(self.analyse(time_s));
+                self.window.drain(..HOP);
+            }
+        }
+    }
+
+    /// Discards the partial window and the filter state.
+    pub fn reset(&mut self) {
+        self.window.clear();
+        self.filter.reset();
+    }
+
+    /// Analyses the full window as the frame at `time_s`.
+    fn analyse(&mut self, time_s: f64) -> PitchFrame {
+        let unvoiced = |confidence| PitchFrame {
+            time_s,
+            freq_hz: None,
+            confidence,
+        };
+        let silence = self.config.silence_rms;
+        if rms(&self.window) < silence {
+            return unvoiced(0.0);
+        }
+        let power_threshold = silence * silence * WINDOW as f32;
+        match self.detector.get_pitch(
+            &self.window,
+            self.sample_rate as usize,
+            power_threshold,
+            CLARITY_THRESHOLD,
+        ) {
+            Some(pitch)
+                if pitch.frequency.is_finite()
+                    && (MIN_FREQ_HZ..=MAX_FREQ_HZ).contains(&pitch.frequency) =>
+            {
+                PitchFrame {
+                    time_s,
+                    freq_hz: Some(pitch.frequency),
+                    confidence: pitch.clarity,
+                }
+            }
+            Some(pitch) => unvoiced(pitch.clarity),
+            None => unvoiced(0.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsp::filter::tests::sine;
+    use crate::music::assert_close;
+
+    /// Tracks `signal` in blocks of 300 samples starting at `start_time_s`.
+    fn track(signal: &[f32], sample_rate: u32, start_time_s: f64) -> Vec<PitchFrame> {
+        let mut tracker = PitchTracker::new(sample_rate, PitchConfig::default());
+        let mut frames = Vec::new();
+        for (index, block) in signal.chunks(300).enumerate() {
+            let time_s = start_time_s + (index * 300) as f64 / f64::from(sample_rate);
+            tracker.process(block, time_s, &mut frames);
+        }
+        frames
+    }
+
+    /// A seeded xorshift generator of uniform noise in -1..1.
+    struct Noise(u32);
+
+    impl Noise {
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0 as f32 / u32::MAX as f32 * 2.0 - 1.0
+        }
+    }
+
+    fn assert_all_near(frames: &[PitchFrame], freq_hz: f32) {
+        assert!(!frames.is_empty());
+        for frame in frames {
+            let detected = frame
+                .freq_hz
+                .unwrap_or_else(|| panic!("unvoiced {frame:?}"));
+            let error = (detected - freq_hz).abs() / freq_hz;
+            assert!(error < 0.01, "{detected} Hz for {freq_hz} Hz");
+        }
+    }
+
+    #[test]
+    fn sines_are_detected_within_one_percent() {
+        for rate in [44_100, 48_000] {
+            for freq in [523.25, 1046.5, 2093.0] {
+                let frames = track(&sine(freq, 0.5, rate, rate as usize / 2), rate, 0.0);
+                assert_all_near(&frames, freq);
+                assert!(frames.iter().all(|f| f.confidence > 0.9));
+            }
+        }
+    }
+
+    #[test]
+    fn silence_and_quiet_noise_are_unvoiced() {
+        let silent = track(&vec![0.0; 24_000], 48_000, 0.0);
+        assert!(!silent.is_empty());
+        assert!(silent.iter().all(|f| f.freq_hz.is_none()));
+
+        let mut noise = Noise(7);
+        let quiet: Vec<f32> = (0..24_000).map(|_| 0.001 * noise.next()).collect();
+        assert!(track(&quiet, 48_000, 0.0)
+            .iter()
+            .all(|f| f.freq_hz.is_none()));
+    }
+
+    #[test]
+    fn a_sine_in_noise_at_20_db_snr_is_detected() {
+        // Uniform noise in -a..a has RMS a / sqrt(3); a sine of amplitude A
+        // has RMS A / sqrt(2). 20 dB SNR is an RMS ratio of 10.
+        let amplitude = 0.5;
+        let noise_peak = amplitude / std::f32::consts::SQRT_2 / 10.0 * 3f32.sqrt();
+        let mut noise = Noise(12345);
+        let signal: Vec<f32> = sine(1046.5, amplitude, 48_000, 24_000)
+            .into_iter()
+            .map(|s| s + noise_peak * noise.next())
+            .collect();
+        assert_all_near(&track(&signal, 48_000, 0.0), 1046.5);
+    }
+
+    #[test]
+    fn frequencies_outside_the_range_are_unvoiced() {
+        for freq in [250.0, 4500.0] {
+            let frames = track(&sine(freq, 0.5, 48_000, 24_000), 48_000, 0.0);
+            assert!(
+                frames.iter().all(|f| f.freq_hz.is_none()),
+                "{freq} Hz is reported"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_burst_gives_a_short_voiced_run() {
+        // 20 ms of 1 kHz between 0.5 s of silence on each side.
+        let rate = 48_000;
+        let mut signal = vec![0.0; rate as usize / 2];
+        signal.extend(sine(1000.0, 0.5, rate, rate as usize / 50));
+        signal.extend(vec![0.0; rate as usize / 2]);
+
+        let frames = track(&signal, rate, 0.0);
+        let voiced: Vec<&PitchFrame> = frames.iter().filter(|f| f.freq_hz.is_some()).collect();
+        let hop_s = HOP as f64 / f64::from(rate);
+        let voiced_s = voiced.len() as f64 * hop_s;
+        assert!(!voiced.is_empty());
+        assert!(voiced_s < 0.08, "voiced for {voiced_s} s");
+        // The voiced frames form one run around the burst.
+        for pair in voiced.windows(2) {
+            assert_close(pair[1].time_s - pair[0].time_s, hop_s, 1e-9);
+        }
+    }
+
+    #[test]
+    fn frames_are_stamped_at_the_window_centre() {
+        let rate = 48_000;
+        let frames = track(&sine(1000.0, 0.5, rate, 4096), rate, 10.0);
+        let r = f64::from(rate);
+        // Windows start at samples 0, 512, ..., 2048: five full windows.
+        assert_eq!(frames.len(), 5);
+        assert_close(frames[0].time_s, 10.0 + 1024.0 / r, 1e-9);
+        assert_close(frames[4].time_s, 10.0 + (4.0 * 512.0 + 1024.0) / r, 1e-9);
+    }
+
+    #[test]
+    fn reset_restarts_the_window() {
+        let rate = 48_000;
+        let mut tracker = PitchTracker::new(rate, PitchConfig::default());
+        let mut frames = Vec::new();
+        tracker.process(&sine(1000.0, 0.5, rate, 2000), 0.0, &mut frames);
+        tracker.reset();
+        tracker.process(&sine(1000.0, 0.5, rate, 2047), 1.0, &mut frames);
+        assert!(frames.is_empty());
+        tracker.process(&[0.0], 1.0 + 2047.0 / f64::from(rate), &mut frames);
+        assert_eq!(frames.len(), 1);
+        assert_close(frames[0].time_s, 1.0 + 1024.0 / f64::from(rate), 1e-9);
+        assert_eq!(tracker.window_s(), 2048.0 / 48_000.0);
+        assert_eq!(tracker.sample_rate(), rate);
+    }
+}
