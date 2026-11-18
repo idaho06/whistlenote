@@ -27,17 +27,17 @@ fn fold_interval(interval_s: f64) -> f64 {
 /// Returns the median of `values`, or `None` when `values` is empty.
 ///
 /// An even count averages the two middle values of the sorted values.
-fn median(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    let len = values.len();
+    if len == 0 {
         return None;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let mid = sorted.len() / 2;
-    Some(if sorted.len() % 2 == 1 {
-        sorted[mid]
+    values.sort_by(f64::total_cmp);
+    let mid = len / 2;
+    Some(if len % 2 == 1 {
+        values[mid]
     } else {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+        (values[mid - 1] + values[mid]) / 2.0
     })
 }
 
@@ -63,7 +63,7 @@ pub fn estimate_bpm(onsets_s: &[f64]) -> Option<f64> {
         .filter(|interval| interval.is_finite() && *interval > 0.0 && *interval <= MAX_INTERVAL_S)
         .map(fold_interval)
         .collect();
-    let median_s = median(&intervals)?;
+    let median_s = median(intervals)?;
     Some(normalize_bpm(60.0 / median_s))
 }
 
@@ -83,12 +83,15 @@ impl TapTempo {
     ///
     /// A gap of more than 2.5 seconds from the latest stored tap clears the
     /// stored taps, and at most the last 8 taps are kept. Returns `None` when
-    /// the tap is the only one stored or the mean interval is not positive.
+    /// the tap is the only one stored or the mean interval is not a positive
+    /// finite number.
     pub fn tap(&mut self, now_s: f64) -> Option<f64> {
-        if let Some(&last_s) = self.taps.last() {
-            if now_s - last_s > MAX_TAP_GAP_S {
-                self.taps.clear();
-            }
+        if self
+            .taps
+            .last()
+            .is_some_and(|&last_s| now_s - last_s > MAX_TAP_GAP_S)
+        {
+            self.taps.clear();
         }
         self.taps.push(now_s);
         if self.taps.len() > MAX_TAPS {
