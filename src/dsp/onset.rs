@@ -3,7 +3,8 @@
 //! [`OnsetDetector`] high-passes the input, analyses windows of [`WINDOW`]
 //! samples every [`HOP`] samples, and reports an onset when the positive
 //! change of the window's log energy rises above a threshold derived from
-//! the recent flux history and the window is loud enough.
+//! the recent flux history, the window is loud enough and the refractory
+//! period since the last onset has elapsed.
 
 use std::collections::VecDeque;
 
@@ -83,8 +84,6 @@ impl OnsetDetector {
         for (index, &sample) in block.iter().enumerate() {
             self.window.push(self.filter.run(sample));
             if self.window.len() == WINDOW {
-                // The window ends at this sample; its centre sample lies
-                // CENTRE_OFFSET samples earlier.
                 let end_time_s = start_time_s + index as f64 / rate;
                 let time_s = end_time_s - CENTRE_OFFSET as f64 / rate;
                 self.analyse(time_s, out);
@@ -94,7 +93,7 @@ impl OnsetDetector {
     }
 
     /// Discards the partial window, the filter state, the flux history, the
-    /// previous log energy and the last onset time.
+    /// stored log energy and the last onset time.
     pub fn reset(&mut self) {
         self.window.clear();
         self.filter.reset();
@@ -208,12 +207,7 @@ mod tests {
         signal.extend(sine(3000.0, 0.5, rate, rate as usize / 200));
         signal.extend(vec![0.0; rate as usize / 2]);
 
-        let mut detector = OnsetDetector::new(rate, OnsetConfig::default());
-        let mut onsets = Vec::new();
-        for (index, block) in signal.chunks(300).enumerate() {
-            let time_s = (index * 300) as f64 / f64::from(rate);
-            detector.process(block, time_s, &mut onsets);
-        }
+        let onsets = detect(&signal, rate);
         assert_eq!(onsets.len(), 1);
         assert_close(onsets[0], 0.5, 0.015);
     }
