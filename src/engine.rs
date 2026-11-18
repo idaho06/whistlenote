@@ -10,6 +10,7 @@
 //! the pitch frames of the input until it is stopped; the finished
 //! recording is reported with its origin on the reliable event channel.
 
+use std::fmt::Display;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crate::audio::ring::{
 };
 use crate::audio::rms;
 use crate::dsp::onset::{OnsetConfig, OnsetDetector};
-use crate::dsp::pitch::{PitchConfig, PitchTracker};
+use crate::dsp::pitch::{PitchConfig, PitchTracker, WINDOW};
 use crate::metronome::{metronome, MetronomeCommand, MetronomeControl, CLICK_S};
 use crate::music::segment::PitchFrame;
 
@@ -216,6 +217,15 @@ impl Drop for Engine {
 /// waiting; each input block also unparks the thread through the input ring.
 const PARK_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// Sample rate assumed for the analysis window while no input stream is
+/// open, in Hz.
+const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+
+/// Duration of one pitch analysis window in seconds while no input stream
+/// is open: [`WINDOW`](crate::dsp::pitch::WINDOW) samples at
+/// [`DEFAULT_SAMPLE_RATE`].
+const DEFAULT_WINDOW_S: f64 = WINDOW as f64 / DEFAULT_SAMPLE_RATE as f64;
+
 /// The engine thread's state: the backend, the channels, the open input and
 /// the open output.
 struct Worker {
@@ -297,6 +307,18 @@ fn finish_frames(
         .collect()
 }
 
+/// Sends an [`EngineEvent::Error`] with `message` on `events`; a send error
+/// is ignored because the receiver is gone.
+fn send_error(events: &Sender<EngineEvent>, message: impl Display) {
+    let _ = events.send(EngineEvent::Error(message.to_string()));
+}
+
+/// Returns an [`ErrorSink`] that reports every stream error as an
+/// [`EngineEvent::Error`] event on `events`.
+fn error_sink(events: Sender<EngineEvent>) -> ErrorSink {
+    Box::new(move |error| send_error(&events, error))
+}
+
 impl Worker {
     /// Emits the device lists, then drains input and beats and handles
     /// commands until shutdown or a disconnected command channel.
@@ -352,9 +374,7 @@ impl Worker {
                             .control
                             .send(MetronomeCommand::SetFree { bpm, enabled });
                         if !sent {
-                            let _ = self
-                                .events
-                                .send(EngineEvent::Error("metronome command queue full".into()));
+                            send_error(&self.events, "metronome command queue full");
                         }
                     } else if enabled {
                         self.open_output(None);
@@ -373,7 +393,7 @@ impl Worker {
             }
             EngineCommand::StartRecording { bpm, metronome } => {
                 if !bpm.is_finite() {
-                    let _ = self.events.send(EngineEvent::Error("invalid tempo".into()));
+                    send_error(&self.events, "invalid tempo");
                     return false;
                 }
                 // A running recording is discarded without an event.
@@ -388,9 +408,7 @@ impl Worker {
                 match &mut self.output {
                     Some(output) => {
                         if !output.control.send(command) {
-                            let _ = self
-                                .events
-                                .send(EngineEvent::Error("metronome command queue full".into()));
+                            send_error(&self.events, "metronome command queue full");
                             return false;
                         }
                     }
@@ -409,41 +427,40 @@ impl Worker {
                 });
             }
             EngineCommand::StopRecording => {
+                // Every input block and beat delivered before this command
+                // belongs to the recording, so they are drained before the
+                // recording is taken.
                 if self.recording.is_some() {
-                    // Every input block and beat delivered before this
-                    // command belongs to the recording.
                     self.drain_input();
                     self.drain_beats();
-                    let recording = self.recording.take().expect("a recording runs");
+                }
+                if let Some(recording) = self.recording.take() {
                     if let Some(output) = &mut self.output {
                         let _ = output.control.send(MetronomeCommand::StopRecording);
                     }
                     let window_s = self
                         .input
                         .as_ref()
-                        .map_or(2048.0 / 48_000.0, |input| input.pitch.window_s());
+                        .map_or(DEFAULT_WINDOW_S, |input| input.pitch.window_s());
                     if !self.listening {
                         self.input = None;
                     }
-                    match recording.origin_s {
-                        Some(origin_s) => {
-                            let frames = finish_frames(
+                    let event = match recording.origin_s {
+                        Some(origin_s) => EngineEvent::RecordingFinished {
+                            frames: finish_frames(
                                 recording.frames,
                                 origin_s,
                                 &recording.clicks,
                                 window_s,
-                            );
-                            let _ = self
-                                .events
-                                .send(EngineEvent::RecordingFinished { frames, origin_s });
-                        }
-                        None => {
-                            let _ = self.events.send(EngineEvent::RecordingFinished {
-                                frames: Vec::new(),
-                                origin_s: 0.0,
-                            });
-                        }
-                    }
+                            ),
+                            origin_s,
+                        },
+                        None => EngineEvent::RecordingFinished {
+                            frames: Vec::new(),
+                            origin_s: 0.0,
+                        },
+                    };
+                    let _ = self.events.send(event);
                 }
             }
             EngineCommand::SetLatencyMs(ms) => {
@@ -464,9 +481,7 @@ impl Worker {
             (Ok(inputs), Ok(outputs)) => {
                 let _ = self.events.send(EngineEvent::Devices { inputs, outputs });
             }
-            (Err(error), _) | (_, Err(error)) => {
-                let _ = self.events.send(EngineEvent::Error(error.to_string()));
-            }
+            (Err(error), _) | (_, Err(error)) => send_error(&self.events, error),
         }
     }
 
@@ -478,10 +493,7 @@ impl Worker {
             DEFAULT_HEADER_CAPACITY,
             std::thread::current(),
         );
-        let events = self.events.clone();
-        let on_error: ErrorSink = Box::new(move |error| {
-            let _ = events.send(EngineEvent::Error(error.to_string()));
-        });
+        let on_error = error_sink(self.events.clone());
         let stream =
             self.backend
                 .open_input(self.input_name.as_deref(), writer.into_sink(), on_error);
@@ -499,9 +511,7 @@ impl Worker {
                     reported_drops: 0,
                 });
             }
-            Err(error) => {
-                let _ = self.events.send(EngineEvent::Error(error.to_string()));
-            }
+            Err(error) => send_error(&self.events, error),
         }
     }
 
@@ -519,10 +529,7 @@ impl Worker {
         if let Some(command) = first {
             let _ = control.send(command);
         }
-        let events = self.events.clone();
-        let on_error: ErrorSink = Box::new(move |error| {
-            let _ = events.send(EngineEvent::Error(error.to_string()));
-        });
+        let on_error = error_sink(self.events.clone());
         let stream = self
             .backend
             .open_output(self.output_name.as_deref(), source, on_error);
@@ -534,9 +541,7 @@ impl Worker {
                     reported_dropped_beats: 0,
                 });
             }
-            Err(error) => {
-                let _ = self.events.send(EngineEvent::Error(error.to_string()));
-            }
+            Err(error) => send_error(&self.events, error),
         }
     }
 
@@ -592,10 +597,13 @@ impl Worker {
         }
         let dropped = input.reader.dropped_samples();
         if dropped > input.reported_drops {
-            let _ = self.events.send(EngineEvent::Error(format!(
-                "input overflow: {} samples dropped",
-                dropped - input.reported_drops
-            )));
+            send_error(
+                &self.events,
+                format!(
+                    "input overflow: {} samples dropped",
+                    dropped - input.reported_drops
+                ),
+            );
             input.reported_drops = dropped;
         }
     }
@@ -634,10 +642,13 @@ impl Worker {
         }
         let dropped = output.control.dropped_beats();
         if dropped > output.reported_dropped_beats {
-            let _ = self.events.send(EngineEvent::Error(format!(
-                "metronome beats dropped: {}",
-                dropped - output.reported_dropped_beats
-            )));
+            send_error(
+                &self.events,
+                format!(
+                    "metronome beats dropped: {}",
+                    dropped - output.reported_dropped_beats
+                ),
+            );
             output.reported_dropped_beats = dropped;
         }
     }
@@ -693,15 +704,34 @@ mod tests {
         }
     }
 
-    /// Sends `RefreshDevices` and waits for the `Devices` event; commands
-    /// are handled in order, so every command sent before the call has been
-    /// handled when it returns.
-    fn sync(engine: &Engine) {
-        engine.send(EngineCommand::RefreshDevices);
-        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
+    /// Spawns an engine on a fake backend and consumes the startup `Devices`
+    /// event, so that later waits see only later events; returns the engine
+    /// and the fake handle.
+    fn spawn_engine() -> (Engine, FakeHandle) {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
             matches!(event, EngineEvent::Devices { .. })
         });
+        assert!(startup.is_some(), "the startup Devices event");
+        (engine, handle)
+    }
+
+    /// Sends `RefreshDevices` and waits for the `Devices` answer, returning
+    /// every event that arrived before it; commands are handled in order, so
+    /// every command sent before the call has been handled when it returns.
+    fn sync(engine: &Engine) -> Vec<EngineEvent> {
+        engine.send(EngineCommand::RefreshDevices);
+        let mut seen = Vec::new();
+        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            let is_devices = matches!(event, EngineEvent::Devices { .. });
+            if !is_devices {
+                seen.push(event.clone());
+            }
+            is_devices
+        });
         assert!(devices.is_some(), "the engine answers RefreshDevices");
+        seen
     }
 
     /// Waits until both the input and the output stream of `handle` are open.
@@ -750,8 +780,7 @@ mod tests {
 
     #[test]
     fn a_440_hz_tone_gives_live_frames_near_440_hz() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartListening);
         assert!(wait_until(Duration::from_secs(2), || {
             handle.input_device().is_some()
@@ -777,8 +806,7 @@ mod tests {
 
     #[test]
     fn a_tap_gives_one_onset() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartListening);
         assert!(wait_until(Duration::from_secs(2), || {
             handle.input_device().is_some()
@@ -803,8 +831,7 @@ mod tests {
 
     #[test]
     fn listening_commands_are_idempotent() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartListening);
         engine.send(EngineCommand::StartListening);
         assert!(wait_until(Duration::from_secs(2), || {
@@ -820,17 +847,12 @@ mod tests {
             handle.input_device().is_none()
         }));
         engine.send(EngineCommand::StopListening);
-        engine.send(EngineCommand::RefreshDevices);
-        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(devices.is_some(), "the engine still answers commands");
+        sync(&engine);
     }
 
     #[test]
     fn stream_errors_become_error_events() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartListening);
         assert!(wait_until(Duration::from_secs(2), || {
             handle.input_device().is_some()
@@ -849,8 +871,7 @@ mod tests {
 
     #[test]
     fn dropping_the_engine_stops_the_thread_and_the_stream() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartListening);
         assert!(wait_until(Duration::from_secs(2), || {
             handle.input_device().is_some()
@@ -862,8 +883,7 @@ mod tests {
 
     #[test]
     fn metronome_beats_become_events() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SetMetronome {
             bpm: 120.0,
             enabled: true,
@@ -906,8 +926,7 @@ mod tests {
 
     #[test]
     fn disabling_the_metronome_keeps_the_stream_and_stops_beats() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SetMetronome {
             bpm: 120.0,
             enabled: true,
@@ -930,15 +949,11 @@ mod tests {
         sync(&engine);
 
         handle.step_n(375); // 2 s more of silence
-        engine.send(EngineCommand::RefreshDevices);
-        let mut beat_seen = false;
-        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            beat_seen |= matches!(event, EngineEvent::Beat { .. });
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(devices.is_some(), "the engine answers RefreshDevices");
+        let seen = sync(&engine);
         assert!(
-            !beat_seen,
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Beat { .. })),
             "a beat event arrived while the metronome is disabled"
         );
         assert_eq!(handle.output_device(), Some("Fake Speakers".to_string()));
@@ -946,12 +961,11 @@ mod tests {
 
     #[test]
     fn select_output_reopens_on_the_named_device() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
+        let (engine, handle) = spawn_engine();
         handle.set_devices(
             vec!["Fake Microphone".to_string()],
             vec!["Fake Speakers".to_string(), "Headphones".to_string()],
         );
-        let engine = Engine::spawn(backend);
         engine.send(EngineCommand::SetMetronome {
             bpm: 120.0,
             enabled: true,
@@ -981,8 +995,7 @@ mod tests {
 
     #[test]
     fn an_unknown_output_device_gives_an_error() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SelectOutput(Some("Nope".to_string())));
         engine.send(EngineCommand::SetMetronome {
             bpm: 120.0,
@@ -1001,8 +1014,7 @@ mod tests {
 
     #[test]
     fn output_errors_become_error_events() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SetMetronome {
             bpm: 120.0,
             enabled: true,
@@ -1024,8 +1036,7 @@ mod tests {
 
     #[test]
     fn a_non_finite_tempo_is_ignored() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SetMetronome {
             bpm: f64::NAN,
             enabled: true,
@@ -1036,8 +1047,7 @@ mod tests {
 
     #[test]
     fn recording_reports_the_origin_and_masks_clicks() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: true,
@@ -1105,8 +1115,7 @@ mod tests {
 
     #[test]
     fn the_latency_offset_shifts_the_origin() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SetLatencyMs(50.0));
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
@@ -1161,8 +1170,7 @@ mod tests {
 
     #[test]
     fn stopping_during_the_count_in_gives_an_empty_recording() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: true,
@@ -1189,8 +1197,7 @@ mod tests {
 
     #[test]
     fn stop_listening_discards_a_recording() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: true,
@@ -1203,15 +1210,11 @@ mod tests {
         assert!(started.is_some(), "a RecordingStarted event");
 
         engine.send(EngineCommand::StopListening);
-        engine.send(EngineCommand::RefreshDevices);
-        let mut finished_seen = false;
-        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            finished_seen |= matches!(event, EngineEvent::RecordingFinished { .. });
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(devices.is_some(), "the engine answers RefreshDevices");
+        let seen = sync(&engine);
         assert!(
-            !finished_seen,
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
             "a RecordingFinished arrived after StopListening"
         );
         assert!(wait_until(Duration::from_secs(2), || {
@@ -1221,8 +1224,7 @@ mod tests {
 
     #[test]
     fn a_recording_without_listening_closes_the_input_afterwards() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: false,
@@ -1297,8 +1299,7 @@ mod tests {
 
     #[test]
     fn a_scripted_recording_becomes_three_quantized_notes() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: false,
@@ -1360,14 +1361,7 @@ mod tests {
 
     #[test]
     fn a_full_live_channel_never_blocks_the_engine() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
-        // Consume the startup Devices event so sync matches a later refresh.
-        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(startup.is_some(), "the startup Devices event");
-
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartListening);
         assert!(wait_until(Duration::from_secs(2), || {
             handle.input_device().is_some()
@@ -1403,44 +1397,28 @@ mod tests {
 
     #[test]
     fn stop_recording_without_a_recording_does_nothing() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
-        // Consume the startup Devices event so the next Devices event is
-        // the answer to the refresh below.
-        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(startup.is_some(), "the startup Devices event");
-
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StopRecording);
-        engine.send(EngineCommand::RefreshDevices);
-        let mut finished_seen = false;
-        let mut error_seen = false;
-        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            finished_seen |= matches!(event, EngineEvent::RecordingFinished { .. });
-            error_seen |= matches!(event, EngineEvent::Error(_));
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(devices.is_some(), "the engine answers RefreshDevices");
+        let seen = sync(&engine);
         assert!(
-            !finished_seen,
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
             "a RecordingFinished arrived without a recording"
         );
-        assert!(!error_seen, "an Error arrived without a recording");
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Error(_))),
+            "an Error arrived without a recording"
+        );
         assert_eq!(handle.input_device(), None);
         assert_eq!(handle.output_device(), None);
     }
 
     #[test]
     fn an_invalid_tempo_for_a_recording_is_an_error() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
-        // Consume the startup Devices event so sync matches a later refresh.
-        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(startup.is_some(), "the startup Devices event");
-
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: f64::NAN,
             metronome: true,
@@ -1461,14 +1439,7 @@ mod tests {
 
     #[test]
     fn starting_a_recording_again_restarts_the_count_in() {
-        let (backend, handle) = fake_backend(FakeConfig::default());
-        let engine = Engine::spawn(backend);
-        // Consume the startup Devices event so sync matches a later refresh.
-        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(startup.is_some(), "the startup Devices event");
-
+        let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: true,
