@@ -99,6 +99,7 @@ pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<Q
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::music::assert_close;
 
     /// Builds a raw note from `start_s` to `end_s` at MIDI 69.
     fn raw(start_s: f64, end_s: f64) -> RawNote {
@@ -112,14 +113,6 @@ mod tests {
             end_s,
             midi,
         }
-    }
-
-    /// Asserts that `a` and `b` differ by at most `tol`.
-    fn assert_close(a: f64, b: f64, tol: f64) {
-        assert!(
-            (a - b).abs() <= tol,
-            "{a} and {b} differ by more than {tol}"
-        );
     }
 
     /// Asserts that `note` starts at `start_beats` and lasts `length_beats`.

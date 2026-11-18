@@ -1,5 +1,7 @@
 //! Tempo estimation from onsets and taps.
 
+use super::median;
+
 /// Lowest tempo in BPM that is reported.
 const MIN_BPM: f64 = 40.0;
 /// Highest tempo in BPM that is reported.
@@ -13,6 +15,8 @@ const MAX_TAP_GAP_S: f64 = 2.5;
 
 /// Folds `interval_s` into `[60.0 / MAX_BPM, 60.0 / MIN_BPM]` seconds by
 /// doubling while it is too short and halving while it is too long.
+///
+/// `interval_s` is positive and finite; any other value does not terminate.
 fn fold_interval(interval_s: f64) -> f64 {
     let mut folded = interval_s;
     while folded < 60.0 / MAX_BPM {
@@ -22,23 +26,6 @@ fn fold_interval(interval_s: f64) -> f64 {
         folded /= 2.0;
     }
     folded
-}
-
-/// Returns the median of `values`, or `None` when `values` is empty.
-///
-/// An even count averages the two middle values of the sorted values.
-fn median(mut values: Vec<f64>) -> Option<f64> {
-    let len = values.len();
-    if len == 0 {
-        return None;
-    }
-    values.sort_by(f64::total_cmp);
-    let mid = len / 2;
-    Some(if len % 2 == 1 {
-        values[mid]
-    } else {
-        (values[mid - 1] + values[mid]) / 2.0
-    })
 }
 
 /// Rounds `bpm` to one decimal place and clamps it into `MIN_BPM..=MAX_BPM`.
@@ -123,14 +110,7 @@ impl Default for TapTempo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Asserts that `a` and `b` differ by at most `tol`.
-    fn assert_close(a: f64, b: f64, tol: f64) {
-        assert!(
-            (a - b).abs() <= tol,
-            "{a} and {b} differ by more than {tol}"
-        );
-    }
+    use crate::music::assert_close;
 
     /// Asserts that `estimate_bpm` returns a tempo within `tol` of `expected`.
     fn assert_bpm(onsets_s: &[f64], expected: f64, tol: f64) {

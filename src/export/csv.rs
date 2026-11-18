@@ -9,8 +9,7 @@ const HEADER: &str = "start_beat,length_beats,note,midi,freq_hz\n";
 
 /// Formats notes as CSV text with a header line and one row per note.
 pub fn to_csv(notes: &[QuantNote]) -> String {
-    let mut csv = String::with_capacity(HEADER.len() + notes.len() * 32);
-    csv.push_str(HEADER);
+    let mut csv = String::from(HEADER);
     for note in notes {
         writeln!(
             csv,
@@ -29,15 +28,7 @@ pub fn to_csv(notes: &[QuantNote]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Builds a note at `start_beats` lasting `length_beats` with the given MIDI number.
-    fn note(start_beats: f64, length_beats: f64, midi: u8) -> QuantNote {
-        QuantNote {
-            start_beats,
-            length_beats,
-            midi,
-        }
-    }
+    use crate::export::note;
 
     #[test]
     fn two_notes_format_as_the_expected_csv() {

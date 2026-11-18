@@ -19,12 +19,8 @@ const MAX_TEMPO_US: f64 = 16_777_215.0;
 
 /// Rounds a beat count to MIDI ticks; negative and NaN values become 0.
 fn beats_to_ticks(beats: f64) -> u32 {
-    let ticks = beats * f64::from(TICKS_PER_BEAT);
-    if ticks.is_nan() || ticks < 0.0 {
-        0
-    } else {
-        ticks.round() as u32
-    }
+    // A float-to-integer `as` cast maps negative values and NaN to 0.
+    (beats * f64::from(TICKS_PER_BEAT)).round() as u32
 }
 
 /// Builds a meta event at delta time 0.
@@ -57,7 +53,7 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
     };
     let tempo_us = (60_000_000.0 / bpm).round().clamp(1.0, MAX_TEMPO_US) as u32;
 
-    let mut track: Track<'static> = Vec::with_capacity(notes.len() * 2 + 5);
+    let mut track: Track<'static> = Vec::new();
     track.push(meta(MetaMessage::TrackName(b"whistlenote")));
     track.push(meta(MetaMessage::Tempo(u24::from(tempo_us))));
     track.push(meta(MetaMessage::TimeSignature(4, 2, 24, 8)));
@@ -101,7 +97,7 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
         ),
         tracks: vec![track],
     };
-    let mut bytes = Vec::with_capacity(22 + smf.tracks[0].len() * 8);
+    let mut bytes = Vec::new();
     smf.write_std(&mut bytes)
         .expect("writing to an in-memory buffer is infallible");
     bytes
@@ -110,15 +106,7 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Builds a note at `start_beats` lasting `length_beats` with the given MIDI number.
-    fn note(start_beats: f64, length_beats: f64, midi: u8) -> QuantNote {
-        QuantNote {
-            start_beats,
-            length_beats,
-            midi,
-        }
-    }
+    use crate::export::note;
 
     /// Parses `bytes` as a Standard MIDI File.
     fn parse(bytes: &[u8]) -> Smf<'_> {
@@ -156,6 +144,22 @@ mod tests {
         }
     }
 
+    /// Builds the event kind of a note-on for `key` at velocity 100.
+    fn on(key: u8) -> TrackEventKind<'static> {
+        midi(MidiMessage::NoteOn {
+            key: u7::from(key),
+            vel: u7::from(100),
+        })
+    }
+
+    /// Builds the event kind of a note-off for `key` at velocity 100.
+    fn off(key: u8) -> TrackEventKind<'static> {
+        midi(MidiMessage::NoteOff {
+            key: u7::from(key),
+            vel: u7::from(100),
+        })
+    }
+
     #[test]
     fn header_is_single_track_with_480_ticks_per_beat() {
         let bytes = to_midi_bytes(&[note(0.0, 1.0, 60)], 120.0);
@@ -190,34 +194,10 @@ mod tests {
                         program: u7::from(0)
                     })
                 ),
-                (
-                    0,
-                    midi(MidiMessage::NoteOn {
-                        key: u7::from(60),
-                        vel: u7::from(100)
-                    })
-                ),
-                (
-                    480,
-                    midi(MidiMessage::NoteOff {
-                        key: u7::from(60),
-                        vel: u7::from(100)
-                    })
-                ),
-                (
-                    480,
-                    midi(MidiMessage::NoteOn {
-                        key: u7::from(69),
-                        vel: u7::from(100)
-                    })
-                ),
-                (
-                    720,
-                    midi(MidiMessage::NoteOff {
-                        key: u7::from(69),
-                        vel: u7::from(100)
-                    })
-                ),
+                (0, on(60)),
+                (480, off(60)),
+                (480, on(69)),
+                (720, off(69)),
                 (720, TrackEventKind::Meta(MetaMessage::EndOfTrack)),
             ]
         );
@@ -232,19 +212,7 @@ mod tests {
             .filter(|(tick, _)| *tick == 480)
             .map(|(_, kind)| kind)
             .collect();
-        assert_eq!(
-            at_480,
-            vec![
-                midi(MidiMessage::NoteOff {
-                    key: u7::from(60),
-                    vel: u7::from(100)
-                }),
-                midi(MidiMessage::NoteOn {
-                    key: u7::from(69),
-                    vel: u7::from(100)
-                }),
-            ]
-        );
+        assert_eq!(at_480, vec![off(60), on(69)]);
     }
 
     #[test]
@@ -287,17 +255,6 @@ mod tests {
         assert!(events
             .iter()
             .all(|(_, kind)| matches!(kind, TrackEventKind::Meta(_))));
-        assert_eq!(
-            events.last().map(|(_, kind)| *kind),
-            Some(TrackEventKind::Meta(MetaMessage::EndOfTrack))
-        );
-    }
-
-    #[test]
-    fn last_event_of_a_non_empty_file_is_end_of_track() {
-        let bytes = to_midi_bytes(&[note(0.0, 1.0, 60)], 120.0);
-        let smf = parse(&bytes);
-        let events = track_events(&smf);
         assert_eq!(
             events.last().map(|(_, kind)| *kind),
             Some(TrackEventKind::Meta(MetaMessage::EndOfTrack))

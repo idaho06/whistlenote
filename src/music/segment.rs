@@ -1,5 +1,7 @@
 //! Segmentation of a pitch frame sequence into notes.
 
+use super::median;
+
 /// One pitch analysis result at a point in time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PitchFrame {
@@ -46,6 +48,9 @@ pub struct RawNote {
     pub midi: i32,
 }
 
+/// Tolerance in seconds for comparing sums and differences of frame times.
+const TIME_EPS_S: f64 = 1e-9;
+
 /// A frame that counts as voiced, with its MIDI note number.
 struct VoicedFrame {
     /// Index of the frame in the input slice.
@@ -61,20 +66,11 @@ struct VoicedFrame {
 /// Returns 0.01 s when there are fewer than two frames. For an even number of
 /// spacings the mean of the two middle values is returned.
 fn frame_period(frames: &[PitchFrame]) -> f64 {
-    if frames.len() < 2 {
-        return 0.01;
-    }
-    let mut gaps: Vec<f64> = frames
+    let gaps: Vec<f64> = frames
         .windows(2)
         .map(|pair| pair[1].time_s - pair[0].time_s)
         .collect();
-    gaps.sort_by(f64::total_cmp);
-    let count = gaps.len();
-    if count % 2 == 1 {
-        gaps[count / 2]
-    } else {
-        (gaps[count / 2 - 1] + gaps[count / 2]) / 2.0
-    }
+    median(gaps).unwrap_or(0.01)
 }
 
 /// Replaces each MIDI number by the median of its centred window in `values`.
@@ -141,7 +137,7 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
             let curr = &voiced[k];
             let gap = curr.time_s - prev.time_s - period;
             filtered[k] == filtered[k - 1]
-                && (curr.index == prev.index + 1 || gap <= cfg.max_gap_s + 1e-9)
+                && (curr.index == prev.index + 1 || gap <= cfg.max_gap_s + TIME_EPS_S)
         };
         if !joins {
             notes.push(RawNote {
@@ -153,7 +149,7 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
         }
     }
 
-    notes.retain(|note| note.end_s - note.start_s >= cfg.min_note_s - 1e-9);
+    notes.retain(|note| note.end_s - note.start_s >= cfg.min_note_s - TIME_EPS_S);
     notes.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
     for i in 1..notes.len() {
         if notes[i - 1].end_s > notes[i].start_s {
@@ -166,6 +162,7 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::music::assert_close;
 
     /// Builds one frame at time `i * 0.01` with the given frequency and confidence.
     fn frame_at(i: usize, freq_hz: Option<f32>, confidence: f32) -> PitchFrame {
@@ -182,14 +179,6 @@ mod tests {
         (start..start + n)
             .map(|i| frame_at(i, freq_hz, 0.95))
             .collect()
-    }
-
-    /// Asserts that `a` and `b` differ by at most `tol`.
-    fn assert_close(a: f64, b: f64, tol: f64) {
-        assert!(
-            (a - b).abs() <= tol,
-            "{a} and {b} differ by more than {tol}"
-        );
     }
 
     #[test]
