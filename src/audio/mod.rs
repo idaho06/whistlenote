@@ -1,12 +1,13 @@
 //! Audio input and output behind a backend abstraction.
 //!
 //! [`backend`] defines the traits the engine uses, [`ring`] carries input
-//! blocks from the audio callback to the engine thread, and [`fake`] is a
-//! deterministic backend for tests.
+//! blocks from the audio callback to the engine thread, [`cpal_backend`]
+//! drives real devices, and [`fake`] is a deterministic backend for tests.
 
 use std::fmt;
 
 pub mod backend;
+pub mod cpal_backend;
 pub mod fake;
 pub mod ring;
 
