@@ -68,7 +68,7 @@ fn frame_period(frames: &[PitchFrame]) -> f64 {
         .windows(2)
         .map(|pair| pair[1].time_s - pair[0].time_s)
         .collect();
-    gaps.sort_by(|a, b| a.total_cmp(b));
+    gaps.sort_by(f64::total_cmp);
     let count = gaps.len();
     if count % 2 == 1 {
         gaps[count / 2]
@@ -89,17 +89,18 @@ fn median_filter(values: &[i32], window: usize) -> Vec<i32> {
     }
     let half = window / 2;
     let count = values.len();
+    let mut buf = vec![0; (2 * half + 1).min(count)];
     (0..count)
         .map(|i| {
             let lo = i.saturating_sub(half);
             let hi = (i + half).min(count - 1);
-            let mut window_values: Vec<i32> = values[lo..=hi].to_vec();
-            window_values.sort_unstable();
-            let len = window_values.len();
+            let len = hi - lo + 1;
+            buf[..len].copy_from_slice(&values[lo..=hi]);
+            buf[..len].sort_unstable();
             if len % 2 == 1 {
-                window_values[len / 2]
+                buf[len / 2]
             } else {
-                window_values[len / 2 - 1]
+                buf[len / 2 - 1]
             }
         })
         .collect()
@@ -133,27 +134,24 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
 
     let mut notes: Vec<RawNote> = Vec::new();
     let mut group_start = 0;
-    for k in 1..voiced.len() {
-        let prev = &voiced[k - 1];
-        let curr = &voiced[k];
-        let same_midi = filtered[k] == filtered[k - 1];
-        let gap = curr.time_s - prev.time_s - period;
-        let joins = same_midi && (curr.index == prev.index + 1 || gap <= cfg.max_gap_s + 1e-9);
+    // The extra iteration at k == voiced.len() closes the final group.
+    for k in 1..=voiced.len() {
+        let joins = k < voiced.len() && {
+            let prev = &voiced[k - 1];
+            let curr = &voiced[k];
+            let gap = curr.time_s - prev.time_s - period;
+            filtered[k] == filtered[k - 1]
+                && (curr.index == prev.index + 1 || gap <= cfg.max_gap_s + 1e-9)
+        };
         if !joins {
             notes.push(RawNote {
                 start_s: voiced[group_start].time_s,
-                end_s: prev.time_s + period,
+                end_s: voiced[k - 1].time_s + period,
                 midi: filtered[group_start],
             });
             group_start = k;
         }
     }
-    let last = &voiced[voiced.len() - 1];
-    notes.push(RawNote {
-        start_s: voiced[group_start].time_s,
-        end_s: last.time_s + period,
-        midi: filtered[group_start],
-    });
 
     notes.retain(|note| note.end_s - note.start_s >= cfg.min_note_s - 1e-9);
     notes.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
