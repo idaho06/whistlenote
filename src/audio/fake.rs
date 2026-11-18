@@ -58,6 +58,13 @@ struct State {
     output_stream: Option<Slot<OutputSource>>,
 }
 
+impl State {
+    /// Returns the engine-clock time of the next block in seconds.
+    fn clock_s(&self) -> f64 {
+        self.frames as f64 / f64::from(self.config.sample_rate)
+    }
+}
+
 type Shared = Arc<Mutex<State>>;
 
 fn lock(state: &Shared) -> MutexGuard<'_, State> {
@@ -95,6 +102,34 @@ fn resolve(devices: &[String], name: Option<&str>) -> Result<String, AudioError>
     }
 }
 
+/// Resolves the device, takes the next stream id and installs the slot.
+fn open_slot<F>(
+    next_id: &mut u64,
+    devices: &[String],
+    slot: &mut Option<Slot<F>>,
+    name: Option<&str>,
+    callback: F,
+    on_error: ErrorSink,
+) -> Result<u64, AudioError> {
+    let device = resolve(devices, name)?;
+    let id = *next_id;
+    *next_id += 1;
+    *slot = Some(Slot {
+        id,
+        device,
+        callback,
+        on_error,
+    });
+    Ok(id)
+}
+
+/// Clears `slot` when it holds the stream with `id`.
+fn clear_slot<F>(slot: &mut Option<Slot<F>>, id: u64) {
+    if slot.as_ref().is_some_and(|slot| slot.id == id) {
+        *slot = None;
+    }
+}
+
 /// The backend side of a fake audio system.
 pub struct FakeBackend {
     state: Shared,
@@ -116,20 +151,17 @@ impl AudioBackend for FakeBackend {
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
         let mut state = lock(&self.state);
-        let device = resolve(&state.config.inputs, name)?;
-        let id = state.next_id;
-        state.next_id += 1;
-        state.input = Some(Slot {
-            id,
-            device,
-            callback: sink,
-            on_error,
-        });
+        let State {
+            config,
+            next_id,
+            input,
+            ..
+        } = &mut *state;
+        let id = open_slot(next_id, &config.inputs, input, name, sink, on_error)?;
         Ok(Box::new(FakeStream {
             state: Arc::clone(&self.state),
             id,
-            direction: Direction::Input,
-            sample_rate: state.config.sample_rate,
+            sample_rate: config.sample_rate,
         }))
     }
 
@@ -140,35 +172,32 @@ impl AudioBackend for FakeBackend {
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
         let mut state = lock(&self.state);
-        let device = resolve(&state.config.outputs, name)?;
-        let id = state.next_id;
-        state.next_id += 1;
-        state.output_stream = Some(Slot {
-            id,
-            device,
-            callback: source,
+        let State {
+            config,
+            next_id,
+            output_stream,
+            ..
+        } = &mut *state;
+        let id = open_slot(
+            next_id,
+            &config.outputs,
+            output_stream,
+            name,
+            source,
             on_error,
-        });
+        )?;
         Ok(Box::new(FakeStream {
             state: Arc::clone(&self.state),
             id,
-            direction: Direction::Output,
-            sample_rate: state.config.sample_rate,
+            sample_rate: config.sample_rate,
         }))
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Input,
-    Output,
 }
 
 /// An open fake stream; dropping it closes its slot.
 struct FakeStream {
     state: Shared,
     id: u64,
-    direction: Direction,
     sample_rate: u32,
 }
 
@@ -181,22 +210,8 @@ impl AudioStream for FakeStream {
 impl Drop for FakeStream {
     fn drop(&mut self) {
         let mut state = lock(&self.state);
-        match self.direction {
-            Direction::Input => {
-                if state.input.as_ref().is_some_and(|slot| slot.id == self.id) {
-                    state.input = None;
-                }
-            }
-            Direction::Output => {
-                if state
-                    .output_stream
-                    .as_ref()
-                    .is_some_and(|slot| slot.id == self.id)
-                {
-                    state.output_stream = None;
-                }
-            }
-        }
+        clear_slot(&mut state.input, self.id);
+        clear_slot(&mut state.output_stream, self.id);
     }
 }
 
@@ -207,6 +222,16 @@ pub struct FakeHandle {
 }
 
 impl FakeHandle {
+    /// Runs `f` with the open input slot, if there is one.
+    fn with_input<R>(&self, f: impl FnOnce(&mut Slot<InputSink>) -> R) -> Option<R> {
+        Some(f(lock(&self.state).input.as_mut()?))
+    }
+
+    /// Runs `f` with the open output slot, if there is one.
+    fn with_output<R>(&self, f: impl FnOnce(&mut Slot<OutputSource>) -> R) -> Option<R> {
+        Some(f(lock(&self.state).output_stream.as_mut()?))
+    }
+
     /// Queues `samples` as microphone input, after any input already queued.
     pub fn push_input(&self, samples: &[f32]) {
         lock(&self.state).queued_input.extend(samples);
@@ -227,10 +252,11 @@ impl FakeHandle {
         let mut state = lock(&self.state);
         let block_size = state.config.block_size;
         let sample_rate = state.config.sample_rate;
-        let time_s = state.frames as f64 / f64::from(sample_rate);
+        let time_s = state.clock_s();
 
         let available = block_size.min(state.queued_input.len());
-        let mut block: Vec<f32> = state.queued_input.drain(..available).collect();
+        let mut block = Vec::with_capacity(block_size);
+        block.extend(state.queued_input.drain(..available));
         block.resize(block_size, 0.0);
         if let Some(slot) = state.input.as_mut() {
             (slot.callback)(
@@ -266,8 +292,7 @@ impl FakeHandle {
 
     /// Returns the engine-clock time of the next block in seconds.
     pub fn time_s(&self) -> f64 {
-        let state = lock(&self.state);
-        state.frames as f64 / f64::from(state.config.sample_rate)
+        lock(&self.state).clock_s()
     }
 
     /// Returns and clears the captured output samples.
@@ -277,15 +302,12 @@ impl FakeHandle {
 
     /// Returns the device name of the open input stream.
     pub fn input_device(&self) -> Option<String> {
-        lock(&self.state).input.as_ref().map(|s| s.device.clone())
+        self.with_input(|slot| slot.device.clone())
     }
 
     /// Returns the device name of the open output stream.
     pub fn output_device(&self) -> Option<String> {
-        lock(&self.state)
-            .output_stream
-            .as_ref()
-            .map(|s| s.device.clone())
+        self.with_output(|slot| slot.device.clone())
     }
 
     /// Replaces the device lists.
@@ -297,16 +319,12 @@ impl FakeHandle {
 
     /// Reports `error` through the open input stream's error sink.
     pub fn fail_input(&self, error: AudioError) {
-        if let Some(slot) = lock(&self.state).input.as_mut() {
-            (slot.on_error)(error);
-        }
+        let _ = self.with_input(|slot| (slot.on_error)(error));
     }
 
     /// Reports `error` through the open output stream's error sink.
     pub fn fail_output(&self, error: AudioError) {
-        if let Some(slot) = lock(&self.state).output_stream.as_mut() {
-            (slot.on_error)(error);
-        }
+        let _ = self.with_output(|slot| (slot.on_error)(error));
     }
 }
 

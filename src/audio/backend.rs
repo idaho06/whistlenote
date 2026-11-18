@@ -26,13 +26,14 @@ pub struct OutputBlockInfo {
 
 /// Receives each block of mono input samples.
 ///
-/// It runs on the audio callback thread, so it neither blocks nor allocates.
+/// It runs on the audio callback thread, so it must neither block nor
+/// allocate.
 pub type InputSink = Box<dyn FnMut(&[f32], InputBlockInfo) + Send>;
 
 /// Fills each block of mono output samples.
 ///
 /// The slice arrives filled with zeros. It runs on the audio callback thread,
-/// so it neither blocks nor allocates.
+/// so it must neither block nor allocate.
 pub type OutputSource = Box<dyn FnMut(&mut [f32], OutputBlockInfo) + Send>;
 
 /// Receives errors that a running stream reports.
