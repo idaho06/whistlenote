@@ -62,6 +62,50 @@ impl CpalBackend {
     pub fn epoch(&self) -> Instant {
         self.epoch
     }
+
+    /// Opens and starts a stream in `direction` on the device `name`, with
+    /// the data callback `callback`.
+    fn open(
+        &self,
+        direction: Direction,
+        name: Option<&str>,
+        callback: StreamCallback,
+        on_error: ErrorSink,
+    ) -> Result<Box<dyn AudioStream>, AudioError> {
+        let device = find_device(direction, name)?;
+        let supported = match direction {
+            Direction::Input => device.default_input_config()?,
+            Direction::Output => device.default_output_config()?,
+        };
+        let config = supported.config();
+        let sample_rate = config.sample_rate;
+        let epoch = self.epoch;
+        macro_rules! build {
+            ($t:ty) => {
+                build_stream::<$t>(&device, config, callback, on_error, epoch)
+            };
+        }
+        let stream = match supported.sample_format() {
+            SampleFormat::I8 => build!(i8),
+            SampleFormat::I16 => build!(i16),
+            SampleFormat::I24 => build!(I24),
+            SampleFormat::I32 => build!(i32),
+            SampleFormat::I64 => build!(i64),
+            SampleFormat::U8 => build!(u8),
+            SampleFormat::U16 => build!(u16),
+            SampleFormat::U24 => build!(U24),
+            SampleFormat::U32 => build!(u32),
+            SampleFormat::U64 => build!(u64),
+            SampleFormat::F32 => build!(f32),
+            SampleFormat::F64 => build!(f64),
+            other => return Err(AudioError::UnsupportedFormat(other.to_string())),
+        }?;
+        stream.play()?;
+        Ok(Box::new(CpalStream {
+            _stream: stream,
+            sample_rate,
+        }))
+    }
 }
 
 impl Default for CpalBackend {
@@ -74,6 +118,14 @@ impl Default for CpalBackend {
 enum Direction {
     Input,
     Output,
+}
+
+/// The data callback of the stream being opened.
+enum StreamCallback {
+    /// Receives mono input blocks.
+    Input(InputSink),
+    /// Fills mono output blocks.
+    Output(OutputSource),
 }
 
 /// Returns the devices of `direction` with their unique names.
@@ -191,36 +243,12 @@ impl AudioBackend for CpalBackend {
         sink: InputSink,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        let device = find_device(Direction::Input, name)?;
-        let supported = device.default_input_config()?;
-        let config = supported.config();
-        let sample_rate = config.sample_rate;
-        let epoch = self.epoch;
-        macro_rules! build {
-            ($t:ty) => {
-                build_input::<$t>(&device, config, sink, on_error, epoch)
-            };
-        }
-        let stream = match supported.sample_format() {
-            SampleFormat::I8 => build!(i8),
-            SampleFormat::I16 => build!(i16),
-            SampleFormat::I24 => build!(I24),
-            SampleFormat::I32 => build!(i32),
-            SampleFormat::I64 => build!(i64),
-            SampleFormat::U8 => build!(u8),
-            SampleFormat::U16 => build!(u16),
-            SampleFormat::U24 => build!(U24),
-            SampleFormat::U32 => build!(u32),
-            SampleFormat::U64 => build!(u64),
-            SampleFormat::F32 => build!(f32),
-            SampleFormat::F64 => build!(f64),
-            other => return Err(AudioError::UnsupportedFormat(other.to_string())),
-        }?;
-        stream.play()?;
-        Ok(Box::new(CpalStream {
-            _stream: stream,
-            sample_rate,
-        }))
+        self.open(
+            Direction::Input,
+            name,
+            StreamCallback::Input(sink),
+            on_error,
+        )
     }
 
     fn open_output(
@@ -229,36 +257,12 @@ impl AudioBackend for CpalBackend {
         source: OutputSource,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        let device = find_device(Direction::Output, name)?;
-        let supported = device.default_output_config()?;
-        let config = supported.config();
-        let sample_rate = config.sample_rate;
-        let epoch = self.epoch;
-        macro_rules! build {
-            ($t:ty) => {
-                build_output::<$t>(&device, config, source, on_error, epoch)
-            };
-        }
-        let stream = match supported.sample_format() {
-            SampleFormat::I8 => build!(i8),
-            SampleFormat::I16 => build!(i16),
-            SampleFormat::I24 => build!(I24),
-            SampleFormat::I32 => build!(i32),
-            SampleFormat::I64 => build!(i64),
-            SampleFormat::U8 => build!(u8),
-            SampleFormat::U16 => build!(u16),
-            SampleFormat::U24 => build!(U24),
-            SampleFormat::U32 => build!(u32),
-            SampleFormat::U64 => build!(u64),
-            SampleFormat::F32 => build!(f32),
-            SampleFormat::F64 => build!(f64),
-            other => return Err(AudioError::UnsupportedFormat(other.to_string())),
-        }?;
-        stream.play()?;
-        Ok(Box::new(CpalStream {
-            _stream: stream,
-            sample_rate,
-        }))
+        self.open(
+            Direction::Output,
+            name,
+            StreamCallback::Output(source),
+            on_error,
+        )
     }
 }
 
@@ -279,94 +283,92 @@ fn engine_now_ns(epoch: Instant) -> i128 {
     epoch.elapsed().as_nanos() as i128
 }
 
-fn build_input<T>(
-    device: &Device,
-    config: StreamConfig,
-    mut sink: InputSink,
-    on_error: ErrorSink,
-    epoch: Instant,
-) -> Result<cpal::Stream, cpal::Error>
-where
-    T: SizedSample,
-    f32: FromSample<T>,
-{
-    let channels = usize::from(config.channels);
-    let sample_rate = config.sample_rate;
-    let mut mono = vec![0.0f32; MAX_BLOCK_FRAMES];
-    let mut clock = StreamClock::new(Direction::Input);
-    device.build_input_stream(
-        config,
-        move |data: &[T], info: &cpal::InputCallbackInfo| {
-            let now_ns = engine_now_ns(epoch);
-            let timestamp = info.timestamp();
-            let frames = data.len() / channels;
-            let start_s = clock.engine_time_s(
-                timestamp.callback.as_nanos(),
-                timestamp.capture.as_nanos(),
-                now_ns,
-                frames as f64 / f64::from(sample_rate),
-            );
-            for (index, chunk) in data.chunks(channels * MAX_BLOCK_FRAMES).enumerate() {
-                let written = downmix(chunk, channels, &mut mono);
-                let offset = (index * MAX_BLOCK_FRAMES) as f64 / f64::from(sample_rate);
-                sink(
-                    &mono[..written],
-                    InputBlockInfo {
-                        time_s: start_s + offset,
-                        sample_rate,
-                    },
-                );
-            }
-        },
-        error_callback(on_error),
-        None,
-    )
+/// Returns the seconds from the start of a host block to the start of its
+/// chunk `index`; a chunk holds at most MAX_BLOCK_FRAMES frames.
+fn chunk_offset_s(index: usize, sample_rate: u32) -> f64 {
+    (index * MAX_BLOCK_FRAMES) as f64 / f64::from(sample_rate)
 }
 
-fn build_output<T>(
+/// Builds the stream that runs `callback`, converting between the device's
+/// sample format `T` and mono `f32` blocks.
+fn build_stream<T>(
     device: &Device,
     config: StreamConfig,
-    mut source: OutputSource,
+    callback: StreamCallback,
     on_error: ErrorSink,
     epoch: Instant,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: SizedSample + FromSample<f32>,
+    f32: FromSample<T>,
 {
     let channels = usize::from(config.channels);
     let sample_rate = config.sample_rate;
     let mut mono = vec![0.0f32; MAX_BLOCK_FRAMES];
-    let mut clock = StreamClock::new(Direction::Output);
-    device.build_output_stream(
-        config,
-        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
-            data.fill(T::EQUILIBRIUM);
-            let now_ns = engine_now_ns(epoch);
-            let timestamp = info.timestamp();
-            let frames = data.len() / channels;
-            let start_s = clock.engine_time_s(
-                timestamp.callback.as_nanos(),
-                timestamp.playback.as_nanos(),
-                now_ns,
-                frames as f64 / f64::from(sample_rate),
-            );
-            for (index, chunk) in data.chunks_mut(channels * MAX_BLOCK_FRAMES).enumerate() {
-                let block = &mut mono[..chunk.len() / channels];
-                block.fill(0.0);
-                let offset = (index * MAX_BLOCK_FRAMES) as f64 / f64::from(sample_rate);
-                source(
-                    block,
-                    OutputBlockInfo {
-                        time_s: start_s + offset,
-                        sample_rate,
-                    },
-                );
-                upmix(block, channels, chunk);
-            }
-        },
-        error_callback(on_error),
-        None,
-    )
+    let on_error = error_callback(on_error);
+    match callback {
+        StreamCallback::Input(mut sink) => {
+            let mut clock = StreamClock::new(Direction::Input);
+            device.build_input_stream(
+                config,
+                move |data: &[T], info: &cpal::InputCallbackInfo| {
+                    let now_ns = engine_now_ns(epoch);
+                    let timestamp = info.timestamp();
+                    let frames = data.len() / channels;
+                    let start_s = clock.engine_time_s(
+                        timestamp.callback.as_nanos(),
+                        timestamp.capture.as_nanos(),
+                        now_ns,
+                        frames as f64 / f64::from(sample_rate),
+                    );
+                    for (index, chunk) in data.chunks(channels * MAX_BLOCK_FRAMES).enumerate() {
+                        let written = downmix(chunk, channels, &mut mono);
+                        sink(
+                            &mono[..written],
+                            InputBlockInfo {
+                                time_s: start_s + chunk_offset_s(index, sample_rate),
+                                sample_rate,
+                            },
+                        );
+                    }
+                },
+                on_error,
+                None,
+            )
+        }
+        StreamCallback::Output(mut source) => {
+            let mut clock = StreamClock::new(Direction::Output);
+            device.build_output_stream(
+                config,
+                move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+                    data.fill(T::EQUILIBRIUM);
+                    let now_ns = engine_now_ns(epoch);
+                    let timestamp = info.timestamp();
+                    let frames = data.len() / channels;
+                    let start_s = clock.engine_time_s(
+                        timestamp.callback.as_nanos(),
+                        timestamp.playback.as_nanos(),
+                        now_ns,
+                        frames as f64 / f64::from(sample_rate),
+                    );
+                    for (index, chunk) in data.chunks_mut(channels * MAX_BLOCK_FRAMES).enumerate() {
+                        let block = &mut mono[..chunk.len() / channels];
+                        block.fill(0.0);
+                        source(
+                            block,
+                            OutputBlockInfo {
+                                time_s: start_s + chunk_offset_s(index, sample_rate),
+                                sample_rate,
+                            },
+                        );
+                        upmix(block, channels, chunk);
+                    }
+                },
+                on_error,
+                None,
+            )
+        }
+    }
 }
 
 /// Maps one stream's host instants onto the engine clock.
