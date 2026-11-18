@@ -654,6 +654,8 @@ mod tests {
     use crate::audio::AudioError;
     use crate::dsp::filter::tests::sine;
     use crate::music::assert_close;
+    use crate::music::quantize::{quantize, Grid};
+    use crate::music::segment::{segment, SegmentConfig};
 
     /// Receives items from `rx` with `recv_timeout` until one matches `pred`
     /// or `timeout` passes; returns the matching item.
@@ -1291,5 +1293,230 @@ mod tests {
             assert_eq!(frame.freq_hz, Some(1000.0), "the frame at {t} is voiced");
             assert_eq!(frame.confidence, 0.9);
         }
+    }
+
+    #[test]
+    fn a_scripted_recording_becomes_three_quantized_notes() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: false,
+        });
+        wait_both_streams(&handle);
+
+        // 2 s of count-in silence, then three 0.45 s tones separated by
+        // 0.05 s of silence, then 0.5 s of silence: 192_000 samples.
+        let mut signal = vec![0.0_f32; 96_000];
+        for freq in [523.25_f32, 659.26, 783.99] {
+            signal.extend(sine(freq, 0.3, 48_000, 21_600));
+            signal.extend(vec![0.0_f32; 2_400]);
+        }
+        signal.extend(vec![0.0_f32; 24_000]);
+        assert_eq!(signal.len(), 192_000);
+        handle.push_input(&signal);
+        handle.step_n(750);
+
+        let started = wait_for(engine.events(), Duration::from_secs(5), |event| {
+            matches!(event, EngineEvent::RecordingStarted { .. })
+        })
+        .expect("a RecordingStarted event");
+        let origin_s = match started {
+            EngineEvent::RecordingStarted { origin_s } => origin_s,
+            other => panic!("expected RecordingStarted, got {other:?}"),
+        };
+        assert_close(origin_s, 2.0, 1e-9);
+
+        engine.send(EngineCommand::StopRecording);
+        let finished = wait_for(engine.events(), Duration::from_secs(5), |event| {
+            matches!(event, EngineEvent::RecordingFinished { .. })
+        })
+        .expect("a RecordingFinished event");
+        let EngineEvent::RecordingFinished { frames, origin_s } = finished else {
+            unreachable!("a RecordingFinished event")
+        };
+        assert_close(origin_s, 2.0, 1e-9);
+
+        let notes = quantize(
+            &segment(&frames, &SegmentConfig::default()),
+            120.0,
+            Grid::Sixteenth,
+            origin_s,
+        );
+        assert_eq!(notes.len(), 3, "three quantized notes, got {notes:?}");
+        let midis: Vec<u8> = notes.iter().map(|note| note.midi).collect();
+        assert_eq!(midis, [72, 76, 79]);
+        for (note, expected) in notes.iter().zip([0.0, 1.0, 2.0]) {
+            assert_close(note.start_beats, expected, 1e-9);
+        }
+        for note in &notes {
+            assert!(
+                (0.75..=1.0).contains(&note.length_beats),
+                "length {} beats outside 0.75..=1.0",
+                note.length_beats
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_live_channel_never_blocks_the_engine() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        // Consume the startup Devices event so sync matches a later refresh.
+        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(startup.is_some(), "the startup Devices event");
+
+        engine.send(EngineCommand::StartListening);
+        assert!(wait_until(Duration::from_secs(2), || {
+            handle.input_device().is_some()
+        }));
+
+        // 8 rounds of 0.5 s of tone fill the live channel; the input ring
+        // holds about 8 s, so nothing overflows while the engine drains it.
+        for _ in 0..8 {
+            handle.push_input(&sine(1000.0, 0.3, 48_000, 24_000));
+            handle.step_n(94);
+        }
+        assert!(
+            wait_until(Duration::from_secs(5), || engine.live().len()
+                == LIVE_CAPACITY),
+            "the live channel holds {LIVE_CAPACITY} frames"
+        );
+
+        // The engine still handles commands while the live channel is full.
+        sync(&engine);
+
+        // Reading one frame and running one more round refills the channel
+        // up to its capacity, never past it.
+        let frame = engine.live().try_recv();
+        assert!(
+            frame.is_ok(),
+            "a live frame is queued while the channel is full"
+        );
+        handle.push_input(&sine(1000.0, 0.3, 48_000, 24_000));
+        handle.step_n(94);
+        sync(&engine);
+        assert!(engine.live().len() <= LIVE_CAPACITY);
+    }
+
+    #[test]
+    fn stop_recording_without_a_recording_does_nothing() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        // Consume the startup Devices event so the next Devices event is
+        // the answer to the refresh below.
+        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(startup.is_some(), "the startup Devices event");
+
+        engine.send(EngineCommand::StopRecording);
+        engine.send(EngineCommand::RefreshDevices);
+        let mut finished_seen = false;
+        let mut error_seen = false;
+        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            finished_seen |= matches!(event, EngineEvent::RecordingFinished { .. });
+            error_seen |= matches!(event, EngineEvent::Error(_));
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(devices.is_some(), "the engine answers RefreshDevices");
+        assert!(
+            !finished_seen,
+            "a RecordingFinished arrived without a recording"
+        );
+        assert!(!error_seen, "an Error arrived without a recording");
+        assert_eq!(handle.input_device(), None);
+        assert_eq!(handle.output_device(), None);
+    }
+
+    #[test]
+    fn an_invalid_tempo_for_a_recording_is_an_error() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        // Consume the startup Devices event so sync matches a later refresh.
+        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(startup.is_some(), "the startup Devices event");
+
+        engine.send(EngineCommand::StartRecording {
+            bpm: f64::NAN,
+            metronome: true,
+        });
+        let error = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Error(_))
+        })
+        .expect("an error event for the invalid tempo");
+        match error {
+            EngineEvent::Error(message) => assert!(message.contains("tempo"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+
+        sync(&engine);
+        assert_eq!(handle.input_device(), None);
+        assert_eq!(handle.output_device(), None);
+    }
+
+    #[test]
+    fn starting_a_recording_again_restarts_the_count_in() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let engine = Engine::spawn(backend);
+        // Consume the startup Devices event so sync matches a later refresh.
+        let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Devices { .. })
+        });
+        assert!(startup.is_some(), "the startup Devices event");
+
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+        handle.step_n(200); // 1.07 s: inside the first count-in
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        sync(&engine); // the second StartRecording is handled before the refresh
+        handle.step_n(700);
+
+        // Collect events until the engine stays idle for 2 s.
+        let mut started: Vec<f64> = Vec::new();
+        let mut last_count_in_start: Option<f64> = None;
+        let mut idle = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = idle.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match engine.events().recv_timeout(remaining) {
+                Ok(event) => {
+                    idle = Instant::now() + Duration::from_secs(2);
+                    match event {
+                        EngineEvent::RecordingStarted { origin_s } => started.push(origin_s),
+                        EngineEvent::Beat {
+                            index: 0,
+                            phase: BeatPhase::CountIn,
+                            time_s,
+                            ..
+                        } => last_count_in_start = Some(time_s),
+                        _ => {}
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            started.len(),
+            1,
+            "exactly one RecordingStarted, got {started:?}"
+        );
+        let origin_s = started[0];
+        let count_in_start = last_count_in_start.expect("a count-in beat with index 0");
+        assert_close(origin_s, count_in_start + 2.0, 1e-9);
+        assert!(origin_s > 2.0, "the origin {origin_s} is not past 2.0 s");
     }
 }
