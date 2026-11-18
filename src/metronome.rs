@@ -11,8 +11,15 @@
 //! audible, and continues with recording beats that are audible only when
 //! clicks are requested; the first recording beat is the recording
 //! origin.
+//!
+//! [`metronome`] returns the metronome as an output source together with a
+//! [`MetronomeControl`] that sends commands to it and receives its beats
+//! without locks.
 
-use crate::audio::backend::OutputBlockInfo;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::audio::backend::{OutputBlockInfo, OutputSource};
 
 /// Beats per bar; the first beat of each bar is accented.
 pub const BEATS_PER_BAR: u32 = 4;
@@ -294,6 +301,74 @@ impl Metronome {
     }
 }
 
+/// Capacity of the command ring.
+const COMMAND_CAPACITY: usize = 64;
+
+/// Capacity of the beat ring.
+const BEAT_CAPACITY: usize = 256;
+
+/// A lock-free handle that controls a metronome running as an output source.
+///
+/// The handle is `Send` and lives on the thread that drives the engine. It
+/// sends commands to the render callback on the audio thread and receives
+/// the beats that the metronome plays, without locks, allocation or
+/// blocking.
+pub struct MetronomeControl {
+    commands: rtrb::Producer<MetronomeCommand>,
+    beats: rtrb::Consumer<Beat>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl MetronomeControl {
+    /// Queues `command` for the next rendered block; returns false when the
+    /// queue is full and the command is lost.
+    pub fn send(&mut self, command: MetronomeCommand) -> bool {
+        self.commands.push(command).is_ok()
+    }
+
+    /// Returns the next rendered beat, if any, in the order they play.
+    pub fn try_recv(&mut self) -> Option<Beat> {
+        self.beats.pop().ok()
+    }
+
+    /// Returns the number of beats lost because they were not received in
+    /// time.
+    pub fn dropped_beats(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Creates a metronome as an output source and the handle that controls it.
+///
+/// The source owns the metronome and runs on the audio thread: each call
+/// applies every queued command, then renders one block of clicks and
+/// forwards every beat to the handle. A call never allocates, locks or
+/// blocks.
+pub fn metronome() -> (MetronomeControl, OutputSource) {
+    let (command_producer, command_consumer) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+    let (beat_producer, beat_consumer) = rtrb::RingBuffer::new(BEAT_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let control = MetronomeControl {
+        commands: command_producer,
+        beats: beat_consumer,
+        dropped: Arc::clone(&dropped),
+    };
+    let mut metronome = Metronome::new();
+    let mut commands = command_consumer;
+    let mut beats = beat_producer;
+    let source: OutputSource = Box::new(move |out, info| {
+        while let Ok(command) = commands.pop() {
+            metronome.apply(command);
+        }
+        metronome.render(out, info, |beat| {
+            if beats.push(beat).is_err() {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    });
+    (control, source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +515,67 @@ mod tests {
         metronome.apply(MetronomeCommand::StopRecording);
         let _ = render_span(&mut metronome, 30_000, 96_000, rate, &mut beats);
         assert_eq!(beats.len(), 2);
+    }
+
+    #[test]
+    fn control_drives_the_source_through_the_fake_backend() {
+        use crate::audio::backend::AudioBackend;
+        use crate::audio::fake::{fake_backend, FakeConfig};
+
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let (mut control, source) = metronome();
+        let _stream = backend.open_output(None, source, Box::new(|_| {})).unwrap();
+        assert!(control.send(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        }));
+        handle.step_n(375); // 96_000 samples, 2 s
+        let mut beats = Vec::new();
+        while let Some(beat) = control.try_recv() {
+            beats.push(beat);
+        }
+        assert_eq!(beats.len(), 4);
+        for (k, beat) in beats.iter().enumerate() {
+            assert_close(beat.time_s, 0.5 * k as f64, 1e-9);
+            assert_eq!(beat.phase, BeatPhase::Free);
+        }
+        let output = handle.take_output();
+        assert_eq!(output.len(), 96_000);
+        assert!(output[1] != 0.0);
+        assert_eq!(output[23_999], 0.0);
+        assert_eq!(control.dropped_beats(), 0);
+    }
+
+    #[test]
+    fn beats_beyond_the_ring_capacity_are_counted_as_dropped() {
+        let (mut control, mut source) = metronome();
+        assert!(control.send(MetronomeCommand::SetFree {
+            bpm: 300.0,
+            enabled: true,
+        }));
+        let mut block = vec![0.0_f32; 48_000 * 60]; // 60 s
+        source(
+            &mut block,
+            OutputBlockInfo {
+                time_s: 0.0,
+                sample_rate: 48_000,
+            },
+        );
+        assert_eq!(control.dropped_beats(), 44);
+        let mut beats = Vec::new();
+        while let Some(beat) = control.try_recv() {
+            beats.push(beat);
+        }
+        assert_eq!(beats.len(), 256);
+        assert_eq!(beats[0].index, 0);
+    }
+
+    #[test]
+    fn a_full_command_queue_rejects_commands() {
+        let (mut control, _source) = metronome();
+        for _ in 0..64 {
+            assert!(control.send(MetronomeCommand::StopRecording));
+        }
+        assert!(!control.send(MetronomeCommand::StopRecording));
     }
 }
