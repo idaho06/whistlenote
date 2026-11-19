@@ -7,6 +7,7 @@
 use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
 use crate::ui::bpm_mode::BpmState;
 use crate::ui::live::{NoteSmoother, ShownNote};
+use crate::ui::record_mode::RecordState;
 
 /// The largest absolute latency offset in milliseconds.
 pub(crate) const MAX_LATENCY_MS: f64 = 200.0;
@@ -59,23 +60,24 @@ pub struct AppState {
     live: NoteSmoother,
     /// The tempo state of the BPM tab, including the tempo used for recordings.
     pub bpm: BpmState,
+    /// The recording state of the Record tab.
+    pub record: RecordState,
 }
 
 impl AppState {
-    /// Applies `event`: a device list replaces the stored list and keeps the
-    /// selections, an onset feeds the tempo state of the BPM tab, a repeated
-    /// error raises its count, other events change nothing.
+    /// Applies `event`: the recording state of the Record tab folds it first,
+    /// a device list replaces the stored list and keeps the selections, an
+    /// onset feeds the tempo state of the BPM tab, a repeated error raises
+    /// its count, other events change nothing.
     pub fn apply_event(&mut self, event: EngineEvent) {
+        self.record.apply_event(&event);
         match event {
             EngineEvent::Onset { time_s } => self.bpm.push_onset(time_s),
             EngineEvent::Devices { inputs, outputs } => {
                 self.inputs = inputs;
                 self.outputs = outputs;
             }
-            EngineEvent::Error(text) => match &mut self.error {
-                Some((current, count)) if *current == text => *count += 1,
-                slot => *slot = Some((text, 1)),
-            },
+            EngineEvent::Error(text) => count_error(&mut self.error, text),
             _ => {}
         }
     }
@@ -86,14 +88,22 @@ impl AppState {
         self.latest_live = Some(frame);
     }
 
-    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged.
+    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running recording, since the engine discards it without an event.
     pub fn select_input(&mut self, name: Option<String>) -> Option<EngineCommand> {
-        set_selection(&mut self.input, name).map(EngineCommand::SelectInput)
+        let command = set_selection(&mut self.input, name).map(EngineCommand::SelectInput);
+        if command.is_some() {
+            self.record.cancel();
+        }
+        command
     }
 
-    /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged.
+    /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running recording, since the engine discards it without an event.
     pub fn select_output(&mut self, name: Option<String>) -> Option<EngineCommand> {
-        set_selection(&mut self.output, name).map(EngineCommand::SelectOutput)
+        let command = set_selection(&mut self.output, name).map(EngineCommand::SelectOutput);
+        if command.is_some() {
+            self.record.cancel();
+        }
+        command
     }
 
     /// Clamps `ms` to the allowed range, stores it and returns the command for the engine; returns `None` when `ms` is not finite or unchanged.
@@ -109,7 +119,7 @@ impl AppState {
         Some(EngineCommand::SetLatencyMs(clamped))
     }
 
-    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother, since frames stop arriving and its time-based clearing does not run.
+    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother, since frames stop arriving and its time-based clearing does not run, and cancels a running recording, since the engine discards it without an event.
     pub fn set_listening(&mut self, on: bool) -> Option<EngineCommand> {
         if self.listening == on {
             return None;
@@ -117,12 +127,18 @@ impl AppState {
         self.listening = on;
         if !on {
             self.live.reset();
+            self.record.cancel();
         }
         Some(if on {
             EngineCommand::StartListening
         } else {
             EngineCommand::StopListening
         })
+    }
+
+    /// Records an error of the application itself, for example a failed file export, the same way as an engine error.
+    pub fn report_error(&mut self, text: String) {
+        count_error(&mut self.error, text);
     }
 
     /// Clears the stored error.
@@ -185,6 +201,14 @@ impl AppState {
     /// Returns whether the selected output is not in the reported output list; `None` is never missing.
     pub fn output_missing(&self) -> bool {
         missing(&self.output, &self.outputs)
+    }
+}
+
+/// Counts `text` in `slot`: the same text as the stored one raises its count, any other text starts at one.
+fn count_error(slot: &mut Option<(String, u32)>, text: String) {
+    match slot {
+        Some((current, count)) if *current == text => *count += 1,
+        slot => *slot = Some((text, 1)),
     }
 }
 
@@ -356,6 +380,76 @@ mod tests {
         assert_eq!(state.error(), Some(("y", 1)));
         state.dismiss_error();
         assert_eq!(state.error(), None);
+    }
+
+    #[test]
+    fn recording_events_reach_the_record_state() {
+        let mut state = AppState::default();
+        state.record.start(120.0);
+        state.apply_event(EngineEvent::Beat {
+            index: 0,
+            accent: true,
+            phase: BeatPhase::CountIn,
+            time_s: 0.0,
+        });
+        assert_eq!(state.record.last_beat(), Some((0, BeatPhase::CountIn)));
+        state.apply_event(EngineEvent::RecordingStarted { origin_s: 1.0 });
+        state.record.stop();
+        state.apply_event(EngineEvent::RecordingFinished {
+            frames: vec![],
+            origin_s: 1.0,
+        });
+        assert!(state.record.is_idle());
+        assert!(state.record.take().is_some());
+    }
+
+    #[test]
+    fn stopping_listening_cancels_a_recording() {
+        let mut state = AppState::default();
+        state.set_listening(true);
+        state.record.start(120.0);
+        assert!(!state.record.is_idle());
+        state.set_listening(false);
+        assert!(state.record.is_idle());
+        assert!(state.record.take().is_none());
+    }
+
+    #[test]
+    fn changing_the_input_cancels_a_recording() {
+        let mut state = AppState::default();
+        state.select_input(Some("a".to_string()));
+        state.record.start(120.0);
+        assert_eq!(state.select_input(Some("a".to_string())), None);
+        assert!(!state.record.is_idle());
+        assert_eq!(
+            state.select_input(Some("b".to_string())),
+            Some(EngineCommand::SelectInput(Some("b".to_string())))
+        );
+        assert!(state.record.is_idle());
+        assert!(state.record.take().is_none());
+    }
+
+    #[test]
+    fn changing_the_output_cancels_a_recording() {
+        let mut state = AppState::default();
+        state.select_output(Some("c".to_string()));
+        state.record.start(120.0);
+        assert_eq!(state.select_output(Some("c".to_string())), None);
+        assert!(!state.record.is_idle());
+        assert_eq!(
+            state.select_output(Some("d".to_string())),
+            Some(EngineCommand::SelectOutput(Some("d".to_string())))
+        );
+        assert!(state.record.is_idle());
+        assert!(state.record.take().is_none());
+    }
+
+    #[test]
+    fn report_error_counts_repeated_texts() {
+        let mut state = AppState::default();
+        state.report_error("export failed".to_string());
+        state.report_error("export failed".to_string());
+        assert_eq!(state.error(), Some(("export failed", 2)));
     }
 
     #[test]

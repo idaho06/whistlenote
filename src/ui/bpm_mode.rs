@@ -109,12 +109,20 @@ impl BpmState {
         if !bpm.is_finite() {
             return;
         }
-        self.candidate_bpm = ((bpm * 10.0).round() / 10.0).clamp(MIN_BPM, MAX_BPM);
+        self.candidate_bpm = round_bpm(bpm);
     }
 
     /// Copies the candidate into the tempo used for recordings.
     pub fn use_candidate(&mut self) {
         self.record_bpm = self.candidate_bpm;
+    }
+
+    /// Stores `bpm` as the tempo used for recordings, rounded to one decimal and clamped to [`MIN_BPM`]..=[`MAX_BPM`]; a non-finite `bpm` is ignored.
+    pub fn set_record_bpm(&mut self, bpm: f64) {
+        if !bpm.is_finite() {
+            return;
+        }
+        self.record_bpm = round_bpm(bpm);
     }
 
     /// Returns the tempo used for recordings.
@@ -128,6 +136,11 @@ impl BpmState {
         self.last_onset_s = None;
         self.taps.reset();
     }
+}
+
+/// Returns `bpm` rounded to one decimal and clamped to [`MIN_BPM`]..=[`MAX_BPM`].
+fn round_bpm(bpm: f64) -> f64 {
+    ((bpm * 10.0).round() / 10.0).clamp(MIN_BPM, MAX_BPM)
 }
 
 /// Returns the detected-tempo line: the estimate with the onset count when there is one, otherwise a prompt to clap a steady beat.
@@ -296,6 +309,28 @@ mod tests {
         assert_eq!(state.candidate_bpm(), 97.3);
         state.set_candidate(f64::NAN);
         assert_eq!(state.candidate_bpm(), 97.3);
+    }
+
+    #[test]
+    fn set_record_bpm_rounds_and_clamps_the_record_tempo() {
+        let mut state = BpmState::default();
+        state.set_record_bpm(97.26);
+        assert_eq!(state.record_bpm(), 97.3);
+        state.set_record_bpm(500.0);
+        assert_eq!(state.record_bpm(), MAX_BPM);
+        state.set_record_bpm(f64::NAN);
+        assert_eq!(state.record_bpm(), MAX_BPM, "a non-finite bpm is ignored");
+        state.set_record_bpm(10.0);
+        assert_eq!(state.record_bpm(), MIN_BPM);
+    }
+
+    #[test]
+    fn set_record_bpm_keeps_the_candidate() {
+        let mut state = BpmState::default();
+        state.set_candidate(90.0);
+        state.set_record_bpm(97.26);
+        assert_eq!(state.record_bpm(), 97.3);
+        assert_eq!(state.candidate_bpm(), 90.0);
     }
 
     #[test]
