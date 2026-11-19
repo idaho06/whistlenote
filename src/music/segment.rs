@@ -24,6 +24,8 @@ pub struct SegmentConfig {
     pub median_window: usize,
     /// Longest unvoiced gap in seconds that still joins two equal notes.
     pub max_gap_s: f64,
+    /// Duration in seconds below which a note that touches a neighbouring note merges into it.
+    pub merge_note_s: f64,
 }
 
 impl Default for SegmentConfig {
@@ -33,6 +35,7 @@ impl Default for SegmentConfig {
             min_note_s: 0.06,
             median_window: 5,
             max_gap_s: 0.04,
+            merge_note_s: 0.1,
         }
     }
 }
@@ -104,7 +107,10 @@ fn median_filter(values: &[i32], window: usize) -> Vec<i32> {
 
 /// Groups pitch frames into notes.
 ///
-/// The frames must be ordered by `time_s`. The result is sorted by start time
+/// The frames must be ordered by `time_s`. Notes shorter than
+/// `merge_note_s` that touch a neighbouring note merge into the longer
+/// neighbour, so a short pitch slide at the edge of a note extends that note
+/// instead of forming a note of its own. The result is sorted by start time
 /// and its notes do not overlap.
 pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
     let period = frame_period(frames);
@@ -149,6 +155,7 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
         }
     }
 
+    merge_short_notes(&mut notes, cfg);
     notes.retain(|note| note.end_s - note.start_s >= cfg.min_note_s - TIME_EPS_S);
     notes.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
     for i in 1..notes.len() {
@@ -157,6 +164,57 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
         }
     }
     notes
+}
+
+/// Merges each note shorter than `cfg.merge_note_s` that touches a neighbouring note into that neighbour.
+///
+/// `notes` must be ordered by start time. A note touches its previous note
+/// when their start and end differ by at most `cfg.max_gap_s`, and likewise
+/// for its next note. The shortest touching short note is merged first, ties
+/// going to the earliest note, into the longer of its touching neighbours,
+/// ties going to the previous one; the neighbour keeps its own MIDI number.
+/// Isolated short notes are left in place.
+fn merge_short_notes(notes: &mut Vec<RawNote>, cfg: &SegmentConfig) {
+    loop {
+        let mut shortest: Option<usize> = None;
+        for i in 0..notes.len() {
+            if notes[i].end_s - notes[i].start_s >= cfg.merge_note_s - TIME_EPS_S {
+                continue;
+            }
+            if !touches_prev(notes, i, cfg) && !touches_next(notes, i, cfg) {
+                continue;
+            }
+            let shorter = shortest.is_none_or(|j| {
+                notes[i].end_s - notes[i].start_s < notes[j].end_s - notes[j].start_s
+            });
+            if shorter {
+                shortest = Some(i);
+            }
+        }
+        let Some(i) = shortest else { break };
+        let prev = touches_prev(notes, i, cfg);
+        let next = touches_next(notes, i, cfg);
+        if prev
+            && (!next
+                || notes[i - 1].end_s - notes[i - 1].start_s
+                    >= notes[i + 1].end_s - notes[i + 1].start_s)
+        {
+            notes[i - 1].end_s = notes[i].end_s;
+        } else {
+            notes[i + 1].start_s = notes[i].start_s;
+        }
+        notes.remove(i);
+    }
+}
+
+/// Returns whether the note at index `i` touches the note before it.
+fn touches_prev(notes: &[RawNote], i: usize, cfg: &SegmentConfig) -> bool {
+    i > 0 && notes[i].start_s - notes[i - 1].end_s <= cfg.max_gap_s + TIME_EPS_S
+}
+
+/// Returns whether the note at index `i` touches the note after it.
+fn touches_next(notes: &[RawNote], i: usize, cfg: &SegmentConfig) -> bool {
+    i + 1 < notes.len() && notes[i + 1].start_s - notes[i].end_s <= cfg.max_gap_s + TIME_EPS_S
 }
 
 #[cfg(test)]
@@ -262,5 +320,94 @@ mod tests {
         let cfg = SegmentConfig::default();
         assert!(segment(&[], &cfg).is_empty());
         assert!(segment(&[frame_at(0, Some(440.0), 0.95)], &cfg).is_empty());
+    }
+
+    #[test]
+    fn onset_slide_merges_into_following_note() {
+        let mut frames = run(0, 8, Some(466.16));
+        frames.extend(run(8, 50, Some(440.0)));
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.58, 1e-9);
+    }
+
+    #[test]
+    fn ending_slide_merges_into_previous_note() {
+        let mut frames = run(0, 50, Some(440.0));
+        frames.extend(run(50, 8, Some(466.16)));
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.58, 1e-9);
+    }
+
+    #[test]
+    fn short_note_between_two_notes_merges_into_the_longer_one() {
+        let mut frames = run(0, 30, Some(440.0));
+        frames.extend(run(30, 8, Some(466.16)));
+        frames.extend(run(38, 50, Some(493.88)));
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.30, 1e-9);
+        assert_eq!(notes[1].midi, 71);
+        assert_close(notes[1].start_s, 0.30, 1e-9);
+        assert_close(notes[1].end_s, 0.88, 1e-9);
+    }
+
+    #[test]
+    fn isolated_short_note_at_least_min_note_s_is_kept() {
+        let mut frames = run(0, 8, Some(466.16));
+        frames.extend(run(8, 20, None));
+        frames.extend(run(28, 50, Some(440.0)));
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].midi, 70);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.08, 1e-9);
+        assert_eq!(notes[1].midi, 69);
+        assert_close(notes[1].start_s, 0.28, 1e-9);
+        assert_close(notes[1].end_s, 0.78, 1e-9);
+    }
+
+    #[test]
+    fn note_of_at_least_merge_note_s_does_not_merge() {
+        let mut frames = run(0, 15, Some(466.16));
+        frames.extend(run(15, 50, Some(440.0)));
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].midi, 70);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.15, 1e-9);
+        assert_eq!(notes[1].midi, 69);
+        assert_close(notes[1].start_s, 0.15, 1e-9);
+        assert_close(notes[1].end_s, 0.65, 1e-9);
+    }
+
+    #[test]
+    fn zero_merge_note_s_disables_merging() {
+        let mut frames = run(0, 8, Some(466.16));
+        frames.extend(run(8, 50, Some(440.0)));
+        let cfg = SegmentConfig {
+            merge_note_s: 0.0,
+            ..SegmentConfig::default()
+        };
+        let notes = segment(&frames, &cfg);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].midi, 70);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.08, 1e-9);
+        assert_eq!(notes[1].midi, 69);
+        assert_close(notes[1].start_s, 0.08, 1e-9);
+        assert_close(notes[1].end_s, 0.58, 1e-9);
+    }
+
+    #[test]
+    fn default_merge_note_s_is_point_one() {
+        assert_eq!(SegmentConfig::default().merge_note_s, 0.1);
     }
 }
