@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use self::state::{AppState, Tab};
+use self::state::{AppState, MAX_LATENCY_MS, Tab};
 use crate::audio::cpal_backend::CpalBackend;
 use crate::engine::{Engine, EngineCommand};
 
@@ -104,7 +104,7 @@ impl WhistlenoteApp {
             let mut ms = self.state.latency_ms();
             ui.add(
                 egui::DragValue::new(&mut ms)
-                    .range(-200.0..=200.0)
+                    .range(-MAX_LATENCY_MS..=MAX_LATENCY_MS)
                     .suffix(" ms"),
             );
             let command = self.state.set_latency_ms(ms);
@@ -117,9 +117,9 @@ impl WhistlenoteApp {
             self.send(command);
 
             ui.separator();
-            ui.selectable_value(&mut self.state.tab, Tab::Live, "Live");
-            ui.selectable_value(&mut self.state.tab, Tab::Bpm, "BPM");
-            ui.selectable_value(&mut self.state.tab, Tab::Record, "Record");
+            for tab in [Tab::Live, Tab::Bpm, Tab::Record] {
+                ui.selectable_value(&mut self.state.tab, tab, tab.label());
+            }
         });
     }
 
@@ -166,11 +166,7 @@ impl eframe::App for WhistlenoteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
-        let heading = match self.state.tab {
-            Tab::Live => "Live",
-            Tab::Bpm => "BPM",
-            Tab::Record => "Record",
-        };
+        let heading = self.state.tab.label();
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(heading);
         });
@@ -178,8 +174,9 @@ impl eframe::App for WhistlenoteApp {
 }
 
 /// Shows a combo box with "Default" and every name in `names` and returns
-/// the chosen device, `None` for the default. The selected text is
-/// [`selected_label`]; the combo shows the full selected name on hover.
+/// the chosen device, `None` for the default. The combo shows
+/// [`selected_label`] as its text and as its hover text, which holds the
+/// full name when the text is truncated.
 fn device_combo(
     ui: &mut egui::Ui,
     id: &str,
@@ -188,8 +185,9 @@ fn device_combo(
     missing: bool,
 ) -> Option<String> {
     let mut choice = selected.map(str::to_string);
+    let label = selected_label(selected, missing);
     let response = egui::ComboBox::from_id_salt(id)
-        .selected_text(selected_label(selected, missing))
+        .selected_text(label.as_str())
         .width(DEVICE_COMBO_WIDTH)
         .truncate()
         .show_ui(ui, |ui| {
@@ -200,7 +198,7 @@ fn device_combo(
             }
         })
         .response;
-    response.on_hover_text(selected_label(choice.as_deref(), false));
+    response.on_hover_text(label);
     choice
 }
 

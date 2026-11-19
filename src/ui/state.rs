@@ -7,7 +7,7 @@
 use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
 
 /// The largest absolute latency offset in milliseconds.
-const MAX_LATENCY_MS: f64 = 200.0;
+pub(crate) const MAX_LATENCY_MS: f64 = 200.0;
 
 /// Tab shown in the main window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,6 +19,17 @@ pub enum Tab {
     Bpm,
     /// The recording view.
     Record,
+}
+
+impl Tab {
+    /// Returns the label of the tab in the tab buttons and the heading.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Live => "Live",
+            Tab::Bpm => "BPM",
+            Tab::Record => "Record",
+        }
+    }
 }
 
 /// State shared by the views of the application.
@@ -68,20 +79,12 @@ impl AppState {
 
     /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged.
     pub fn select_input(&mut self, name: Option<String>) -> Option<EngineCommand> {
-        if self.input == name {
-            return None;
-        }
-        self.input = name.clone();
-        Some(EngineCommand::SelectInput(name))
+        set_selection(&mut self.input, name).map(EngineCommand::SelectInput)
     }
 
     /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged.
     pub fn select_output(&mut self, name: Option<String>) -> Option<EngineCommand> {
-        if self.output == name {
-            return None;
-        }
-        self.output = name.clone();
-        Some(EngineCommand::SelectOutput(name))
+        set_selection(&mut self.output, name).map(EngineCommand::SelectOutput)
     }
 
     /// Clamps `ms` to the allowed range, stores it and returns the command for the engine; returns `None` when `ms` is not finite or unchanged.
@@ -159,17 +162,27 @@ impl AppState {
 
     /// Returns whether the selected input is not in the reported input list; `None` is never missing.
     pub fn input_missing(&self) -> bool {
-        self.input
-            .as_ref()
-            .is_some_and(|name| !self.inputs.contains(name))
+        missing(&self.input, &self.inputs)
     }
 
     /// Returns whether the selected output is not in the reported output list; `None` is never missing.
     pub fn output_missing(&self) -> bool {
-        self.output
-            .as_ref()
-            .is_some_and(|name| !self.outputs.contains(name))
+        missing(&self.output, &self.outputs)
     }
+}
+
+/// Stores `name` in `slot` and returns it when the selection changed.
+fn set_selection(slot: &mut Option<String>, name: Option<String>) -> Option<Option<String>> {
+    if *slot == name {
+        return None;
+    }
+    *slot = name.clone();
+    Some(name)
+}
+
+/// Returns whether `selection` names a device that is missing from `names`.
+fn missing(selection: &Option<String>, names: &[String]) -> bool {
+    selection.as_ref().is_some_and(|name| !names.contains(name))
 }
 
 #[cfg(test)]
@@ -342,11 +355,6 @@ mod tests {
         state.apply_event(EngineEvent::Error("x".to_string()));
         let before = state.clone();
 
-        let frames = vec![PitchFrame {
-            time_s: 1.0,
-            freq_hz: Some(440.0),
-            confidence: 0.9,
-        }];
         for event in [
             EngineEvent::Onset { time_s: 1.0 },
             EngineEvent::Beat {
@@ -357,7 +365,11 @@ mod tests {
             },
             EngineEvent::RecordingStarted { origin_s: 1.0 },
             EngineEvent::RecordingFinished {
-                frames: frames.clone(),
+                frames: vec![PitchFrame {
+                    time_s: 1.0,
+                    freq_hz: Some(440.0),
+                    confidence: 0.9,
+                }],
                 origin_s: 1.0,
             },
         ] {
