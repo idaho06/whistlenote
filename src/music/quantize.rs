@@ -45,21 +45,27 @@ fn snap(x: f64, step: f64) -> f64 {
     (x / step + 0.5).floor() * step
 }
 
-/// Converts notes in seconds to notes in beats snapped to `grid`.
+/// Converts notes in seconds to notes in beats snapped to `grid`, keeping the index of each note in `notes`.
 ///
-/// `origin_s` is the time of beat 0. Returns an empty vector when `bpm` is not
-/// finite or not positive.
-pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<QuantNote> {
+/// Like [`quantize`], and each returned pair carries the index of the note in
+/// `notes` it comes from. `origin_s` is the time of beat 0. Returns an empty
+/// vector when `bpm` is not finite or not positive.
+pub fn quantize_indexed(
+    notes: &[RawNote],
+    bpm: f64,
+    grid: Grid,
+    origin_s: f64,
+) -> Vec<(usize, QuantNote)> {
     if !bpm.is_finite() || bpm <= 0.0 {
         return Vec::new();
     }
-    let mut sorted: Vec<RawNote> = notes.to_vec();
-    sorted.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+    let mut sorted: Vec<(usize, RawNote)> = notes.iter().copied().enumerate().collect();
+    sorted.sort_by(|a, b| a.1.start_s.total_cmp(&b.1.start_s));
 
     let step = step_beats(grid);
     let to_beats = |t_s: f64| (t_s - origin_s) * bpm / 60.0;
-    let mut quant: Vec<QuantNote> = Vec::with_capacity(sorted.len());
-    for note in &sorted {
+    let mut quant: Vec<(usize, QuantNote)> = Vec::with_capacity(sorted.len());
+    for (index, note) in &sorted {
         let start_b = to_beats(note.start_s);
         let end_b = to_beats(note.end_s);
         if end_b <= 0.0 {
@@ -80,20 +86,34 @@ pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<Q
                 (start_b, length_b)
             }
         };
-        quant.push(QuantNote {
-            start_beats: start_b,
-            length_beats: length_b,
-            midi: note.midi.clamp(0, 127) as u8,
-        });
+        quant.push((
+            *index,
+            QuantNote {
+                start_beats: start_b,
+                length_beats: length_b,
+                midi: note.midi.clamp(0, 127) as u8,
+            },
+        ));
     }
 
     for i in 1..quant.len() {
-        let next_start = quant[i].start_beats;
-        let end_b = (quant[i - 1].start_beats + quant[i - 1].length_beats).min(next_start);
-        quant[i - 1].length_beats = end_b - quant[i - 1].start_beats;
+        let next_start = quant[i].1.start_beats;
+        let end_b = (quant[i - 1].1.start_beats + quant[i - 1].1.length_beats).min(next_start);
+        quant[i - 1].1.length_beats = end_b - quant[i - 1].1.start_beats;
     }
-    quant.retain(|note| note.length_beats > MIN_LENGTH_B);
+    quant.retain(|(_, note)| note.length_beats > MIN_LENGTH_B);
     quant
+}
+
+/// Converts notes in seconds to notes in beats snapped to `grid`.
+///
+/// `origin_s` is the time of beat 0. Returns an empty vector when `bpm` is not
+/// finite or not positive.
+pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<QuantNote> {
+    quantize_indexed(notes, bpm, grid, origin_s)
+        .into_iter()
+        .map(|(_, note)| note)
+        .collect()
 }
 
 #[cfg(test)]
@@ -197,5 +217,42 @@ mod tests {
         let notes = quantize(&[raw(2.5, 3.0)], 120.0, Grid::Quarter, 2.0);
         assert_eq!(notes.len(), 1);
         assert_note(&notes[0], 1.0, 1.0);
+    }
+
+    #[test]
+    fn indexed_quantize_keeps_the_input_indices_of_unsorted_notes() {
+        let notes = [raw_midi(2.0, 2.5, 72), raw_midi(1.0, 1.5, 69)];
+        let rows = quantize_indexed(&notes, 120.0, Grid::Sixteenth, 1.0);
+        let indices: Vec<usize> = rows.iter().map(|(index, _)| *index).collect();
+        assert_eq!(indices, [1, 0]);
+        assert_eq!(rows[0].1.midi, 69);
+        assert_eq!(rows[1].1.midi, 72);
+    }
+
+    #[test]
+    fn indexed_quantize_skips_notes_ending_before_the_origin_but_keeps_indices() {
+        let notes = [raw(0.0, 0.5), raw(2.0, 2.5)];
+        let rows = quantize_indexed(&notes, 120.0, Grid::Sixteenth, 1.0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1);
+        assert_note(&rows[0].1, 2.0, 1.0);
+    }
+
+    #[test]
+    fn quantize_matches_the_notes_of_quantize_indexed() {
+        let notes = [
+            raw(0.0, 0.8),
+            raw_midi(0.6, 1.0, 72),
+            raw(2.5, 3.0),
+            raw(-1.0, -0.5),
+        ];
+        for grid in [Grid::Off, Grid::Quarter, Grid::Eighth, Grid::Sixteenth] {
+            let plain = quantize(&notes, 120.0, grid, 0.5);
+            let indexed: Vec<QuantNote> = quantize_indexed(&notes, 120.0, grid, 0.5)
+                .into_iter()
+                .map(|(_, note)| note)
+                .collect();
+            assert_eq!(plain, indexed, "grid {grid:?}");
+        }
     }
 }
