@@ -1,11 +1,17 @@
-//! The recording state of the Record tab: the phase of a recording, the grid and metronome settings, the latest beat and the finished take.
+//! The Record tab: the recording state — the phase of a recording, the grid and metronome settings, the latest beat and the finished take — and the view that draws it: the tempo, grid and metronome controls, the Record and Stop buttons, the beat indicator with the beat line, and the notes table and the MIDI and CSV export of the finished take.
+
+use eframe::egui;
 
 use crate::engine::{BeatPhase, EngineCommand, EngineEvent};
 use crate::export::csv::to_csv;
 use crate::export::midi::to_midi_bytes;
 use crate::metronome::BEATS_PER_BAR;
+use crate::music::note::midi_to_name;
 use crate::music::quantize::{Grid, QuantNote, quantize};
 use crate::music::segment::{PitchFrame, RawNote, SegmentConfig, segment};
+use crate::ui::bpm_mode::{MAX_BPM, MIN_BPM};
+use crate::ui::state::AppState;
+use crate::ui::{GOOD_COLOR, centered_row};
 
 /// Phase of a recording as the Record tab sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -247,6 +253,234 @@ impl RecordState {
                 Some((_, BeatPhase::Free)) | None => "Count-in".to_string(),
             },
         }
+    }
+}
+
+/// Returns the label of `grid` in the grid combo box.
+fn grid_label(grid: Grid) -> &'static str {
+    match grid {
+        Grid::Off => "Off",
+        Grid::Quarter => "1/4",
+        Grid::Eighth => "1/8",
+        Grid::Sixteenth => "1/16",
+    }
+}
+
+/// Returns the summary line of `take`: empty without a take, "No notes in this take" for a take without notes, and the note count and tempo otherwise.
+fn take_summary(take: Option<&Take>) -> String {
+    match take {
+        None => String::new(),
+        Some(take) => {
+            let count = take.notes().len();
+            if count == 0 {
+                "No notes in this take".to_string()
+            } else if count == 1 {
+                format!("1 note at {:.1} BPM", take.bpm())
+            } else {
+                format!("{count} notes at {:.1} BPM", take.bpm())
+            }
+        }
+    }
+}
+
+/// Returns the table row of `note`: the start beat, the length in beats, the note name and the MIDI number.
+fn note_row(note: &QuantNote) -> [String; 4] {
+    [
+        format!("{:.2}", note.start_beats),
+        format!("{:.2}", note.length_beats),
+        midi_to_name(i32::from(note.midi)),
+        note.midi.to_string(),
+    ]
+}
+
+/// Returns the position in the bar and the phase of the latest beat, or `None` without a beat.
+fn lit_beat(last_beat: Option<(u32, BeatPhase)>) -> Option<(u32, BeatPhase)> {
+    last_beat.map(|(index, phase)| (index % BEATS_PER_BAR, phase))
+}
+
+/// Spacing of the beat light centres in points; also the height of the beat lights row.
+const BEAT_LIGHT_SPACING: f32 = 32.0;
+
+/// Side of the square the four beat lights are drawn in, in points.
+const BEAT_LIGHTS_SIZE: f32 = 4.0 * BEAT_LIGHT_SPACING;
+
+/// Radius of one beat light in points.
+const BEAT_LIGHT_RADIUS: f32 = 10.0;
+
+/// Draws the four beat lights in a row: the circle at the lit position is filled with the warn color for a count-in beat and the good color for a recording beat, the others are faint with a weak stroke.
+fn beat_lights(ui: &mut egui::Ui, beat: Option<(u32, BeatPhase)>) {
+    let (rect, _response) = ui.allocate_exact_size(
+        egui::vec2(BEAT_LIGHTS_SIZE, BEAT_LIGHT_SPACING),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    for i in 0..BEATS_PER_BAR {
+        let center = egui::pos2(
+            rect.left() + (i as f32 + 0.5) * BEAT_LIGHT_SPACING,
+            rect.center().y,
+        );
+        match beat {
+            Some((lit, phase)) if lit == i => {
+                let color = match phase {
+                    BeatPhase::CountIn => ui.visuals().warn_fg_color,
+                    BeatPhase::Recording | BeatPhase::Free => GOOD_COLOR,
+                };
+                painter.circle_filled(center, BEAT_LIGHT_RADIUS, color);
+            }
+            _ => {
+                painter.circle_filled(center, BEAT_LIGHT_RADIUS, ui.visuals().faint_bg_color);
+                painter.circle_stroke(
+                    center,
+                    BEAT_LIGHT_RADIUS,
+                    egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+                );
+            }
+        }
+    }
+}
+
+/// Shows the Record tab: the headphone hint, the tempo, grid and metronome settings, the Record and Stop buttons, the beat indicator with the beat line, and the summary, notes table and MIDI and CSV export of the finished take; returns the command the user's action sends to the engine.
+pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
+    let mut command: Option<EngineCommand> = None;
+    ui.vertical_centered(|ui| {
+        ui.weak("Use headphones, so the metronome does not reach the microphone.");
+        ui.add_space(8.0);
+        centered_row(ui, "record_settings", |ui| {
+            ui.label("Tempo");
+            if state.record.is_idle() {
+                let mut bpm = state.bpm.record_bpm();
+                let response = ui.add(
+                    egui::DragValue::new(&mut bpm)
+                        .range(MIN_BPM..=MAX_BPM)
+                        .speed(0.5)
+                        .fixed_decimals(1)
+                        .suffix(" BPM"),
+                );
+                if response.changed() {
+                    state.bpm.set_record_bpm(bpm);
+                }
+            } else if let Some(bpm) = state.record.recording_bpm() {
+                ui.label(format!("{bpm:.1} BPM"));
+            }
+            ui.add_space(16.0);
+            ui.label("Grid");
+            let mut grid = state.record.grid();
+            egui::ComboBox::from_id_salt("grid")
+                .selected_text(grid_label(grid))
+                .show_ui(ui, |ui| {
+                    for candidate in [Grid::Off, Grid::Quarter, Grid::Eighth, Grid::Sixteenth] {
+                        ui.selectable_value(&mut grid, candidate, grid_label(candidate));
+                    }
+                });
+            if grid != state.record.grid() {
+                state.record.set_grid(grid);
+            }
+            ui.add_space(16.0);
+            let mut metronome = state.record.metronome();
+            ui.add_enabled_ui(state.record.is_idle(), |ui| {
+                if ui.checkbox(&mut metronome, "Metronome").changed() {
+                    state.record.set_metronome(metronome);
+                }
+            });
+        });
+        ui.add_space(8.0);
+        centered_row(ui, "record_transport", |ui| {
+            if ui
+                .add_enabled(
+                    state.record.is_idle(),
+                    egui::Button::new("Record").min_size(egui::vec2(100.0, 36.0)),
+                )
+                .clicked()
+            {
+                command = state.record.start(state.bpm.record_bpm());
+            }
+            if ui
+                .add_enabled(
+                    matches!(
+                        state.record.phase(),
+                        RecordPhase::CountIn | RecordPhase::Recording
+                    ),
+                    egui::Button::new("Stop").min_size(egui::vec2(100.0, 36.0)),
+                )
+                .clicked()
+            {
+                command = state.record.stop();
+            }
+        });
+        ui.add_space(8.0);
+        let beat = if state.record.is_idle() {
+            None
+        } else {
+            lit_beat(state.record.last_beat())
+        };
+        beat_lights(ui, beat);
+        let beat_text = state.record.beat_text();
+        if !beat_text.is_empty() {
+            ui.add_space(4.0);
+            ui.strong(beat_text);
+        }
+        let mut export: Option<(&'static str, &'static str, &'static str, Vec<u8>)> = None;
+        if let Some(take) = state.record.take() {
+            ui.add_space(8.0);
+            ui.label(take_summary(Some(take)));
+            let notes = take.notes();
+            if !notes.is_empty() {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("notes")
+                            .striped(true)
+                            .num_columns(4)
+                            .show(ui, |ui| {
+                                for header in ["Start beat", "Length", "Note", "MIDI"] {
+                                    ui.strong(header);
+                                }
+                                ui.end_row();
+                                for note in notes {
+                                    for cell in note_row(note) {
+                                        ui.label(cell);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.add_space(8.0);
+                centered_row(ui, "record_export", |ui| {
+                    if ui.button("Save MIDI").clicked() {
+                        export = Some(("melody.mid", "MIDI", "mid", take.midi_bytes()));
+                    }
+                    if ui.button("Save CSV").clicked() {
+                        export = Some(("melody.csv", "CSV", "csv", take.csv().into_bytes()));
+                    }
+                });
+            }
+        }
+        if let Some((default_name, filter_name, extension, bytes)) = export {
+            save(state, default_name, filter_name, extension, bytes);
+        }
+    });
+    command
+}
+
+/// Opens a save dialog for `default_name` with the `filter_name` and `extension` filter and writes `bytes` to the chosen path; a cancelled dialog does nothing, a failed write is reported as an error in the status bar.
+fn save(
+    state: &mut AppState,
+    default_name: &str,
+    filter_name: &str,
+    extension: &str,
+    bytes: Vec<u8>,
+) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name(default_name)
+        .add_filter(filter_name, &[extension])
+        .save_file()
+    else {
+        return;
+    };
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => log::info!("saved {}", path.display()),
+        Err(err) => state.report_error(format!("could not save {}: {err}", path.display())),
     }
 }
 
@@ -523,5 +757,63 @@ mod tests {
         assert!(state.is_idle());
         assert!(state.take().is_none());
         assert_eq!(state.beat_text(), "");
+    }
+
+    #[test]
+    fn grid_labels_name_the_grids() {
+        assert_eq!(grid_label(Grid::Off), "Off");
+        assert_eq!(grid_label(Grid::Quarter), "1/4");
+        assert_eq!(grid_label(Grid::Eighth), "1/8");
+        assert_eq!(grid_label(Grid::Sixteenth), "1/16");
+    }
+
+    #[test]
+    fn take_summary_is_empty_without_a_take() {
+        assert_eq!(take_summary(None), "");
+    }
+
+    #[test]
+    fn take_summary_of_an_empty_take_says_so() {
+        let take = Take::new(Vec::new(), 0.0, 120.0, Grid::Sixteenth);
+        assert_eq!(take_summary(Some(&take)), "No notes in this take");
+    }
+
+    #[test]
+    fn take_summary_singles_out_one_note() {
+        let (state, _) = recorded_state(tone_frames(1.0, 0.6, 440.0));
+        let take = state.take().expect("a take");
+        assert_eq!(take_summary(Some(take)), "1 note at 120.0 BPM");
+    }
+
+    #[test]
+    fn take_summary_counts_several_notes() {
+        let mut frames = tone_frames(1.0, 0.5, 440.0);
+        frames.extend(tone_frames(2.0, 0.5, 523.25));
+        let take = Take::new(frames, 1.0, 120.0, Grid::Sixteenth);
+        let summary = take_summary(Some(&take));
+        assert!(summary.starts_with("2 notes at 120.0 BPM"), "{summary}");
+    }
+
+    #[test]
+    fn note_row_formats_start_length_name_and_midi() {
+        let note = QuantNote {
+            start_beats: 1.5,
+            length_beats: 0.25,
+            midi: 69,
+        };
+        assert_eq!(note_row(&note), ["1.50", "0.25", "A4", "69"]);
+    }
+
+    #[test]
+    fn lit_beat_keeps_the_position_in_the_bar() {
+        assert_eq!(lit_beat(None), None);
+        assert_eq!(
+            lit_beat(Some((5, BeatPhase::Recording))),
+            Some((1, BeatPhase::Recording))
+        );
+        assert_eq!(
+            lit_beat(Some((3, BeatPhase::CountIn))),
+            Some((3, BeatPhase::CountIn))
+        );
     }
 }

@@ -73,7 +73,7 @@ impl WhistlenoteApp {
 
     /// Shows the top bar in two rows: the device combos, the refresh button
     /// and the latency offset, which wrap in a narrow window; then the listen
-    /// toggle and the tab buttons.
+    /// toggle, disabled while a recording runs, and the tab buttons.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Input");
@@ -117,10 +117,12 @@ impl WhistlenoteApp {
             self.send(command);
         });
         ui.horizontal(|ui| {
-            let mut listening = self.state.listening();
-            ui.toggle_value(&mut listening, "Listen");
-            let command = self.state.set_listening(listening);
-            self.send(command);
+            ui.add_enabled_ui(self.state.record.is_idle(), |ui| {
+                let mut listening = self.state.listening();
+                ui.toggle_value(&mut listening, "Listen");
+                let command = self.state.set_listening(listening);
+                self.send(command);
+            });
 
             ui.separator();
             for tab in [Tab::Live, Tab::Bpm, Tab::Record] {
@@ -162,7 +164,7 @@ impl eframe::App for WhistlenoteApp {
             log::trace!("event: {event:?}");
             self.state.apply_event(event);
         }
-        ctx.request_repaint_after(if self.state.listening() {
+        ctx.request_repaint_after(if self.state.listening() || !self.state.record.is_idle() {
             REPAINT_LISTENING
         } else {
             REPAINT_IDLE
@@ -176,7 +178,8 @@ impl eframe::App for WhistlenoteApp {
             Tab::Live => live::show(ui, &self.state),
             Tab::Bpm => bpm_mode::show(ui, &mut self.state),
             Tab::Record => {
-                ui.heading(Tab::Record.label());
+                let command = record_mode::show(ui, &mut self.state);
+                self.send(command);
             }
         });
     }
