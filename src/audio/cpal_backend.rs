@@ -11,6 +11,8 @@
 //! do not increase falls back to the engine-clock time of the callback, minus
 //! the block duration for input and plus it for output.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -88,6 +90,8 @@ impl CpalBackend {
         );
         let sample_rate = config.sample_rate;
         let epoch = self.epoch;
+        let failed = Arc::new(AtomicBool::new(false));
+        let on_error = error_callback(on_error, Arc::clone(&failed));
         macro_rules! build {
             ($t:ty) => {
                 build_stream::<$t>(&device, config, callback, on_error, epoch)
@@ -112,6 +116,7 @@ impl CpalBackend {
         Ok(Box::new(CpalStream {
             _stream: stream,
             sample_rate,
+            failed,
         }))
     }
 }
@@ -231,9 +236,26 @@ fn is_reportable(error: &cpal::Error) -> bool {
     )
 }
 
-/// Wraps `on_error` into a `cpal` error callback.
-fn error_callback(mut on_error: ErrorSink) -> impl FnMut(cpal::Error) + Send + 'static {
+/// Returns whether a stream error stops the stream for good: `cpal` ends a
+/// stream whose device or host went away and keeps running after any other
+/// error.
+fn ends_stream(error: &cpal::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated | ErrorKind::HostUnavailable
+    )
+}
+
+/// Wraps `on_error` into a `cpal` error callback that also sets `failed`
+/// when an error ends the stream.
+fn error_callback(
+    mut on_error: ErrorSink,
+    failed: Arc<AtomicBool>,
+) -> impl FnMut(cpal::Error) + Send + 'static {
     move |error| {
+        if ends_stream(&error) {
+            failed.store(true, Ordering::Relaxed);
+        }
         if is_reportable(&error) {
             on_error(AudioError::from(error));
         } else {
@@ -281,11 +303,17 @@ impl AudioBackend for CpalBackend {
 struct CpalStream {
     _stream: cpal::Stream,
     sample_rate: u32,
+    /// Set by the error callback when an error ends the stream.
+    failed: Arc<AtomicBool>,
 }
 
 impl AudioStream for CpalStream {
     fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 }
 
@@ -306,7 +334,7 @@ fn build_stream<T>(
     device: &Device,
     config: StreamConfig,
     callback: StreamCallback,
-    on_error: ErrorSink,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
     epoch: Instant,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -316,7 +344,6 @@ where
     let channels = usize::from(config.channels);
     let sample_rate = config.sample_rate;
     let mut mono = vec![0.0f32; MAX_BLOCK_FRAMES];
-    let on_error = error_callback(on_error);
     match callback {
         StreamCallback::Input(mut sink) => {
             let mut clock = StreamClock::new(Direction::Input);
@@ -477,8 +504,56 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::music::assert_close;
+
+    #[test]
+    fn only_lost_devices_and_hosts_end_a_stream() {
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::HostUnavailable,
+        ] {
+            assert!(ends_stream(&cpal::Error::new(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::Xrun,
+            ErrorKind::DeviceBusy,
+            ErrorKind::BackendError,
+            ErrorKind::DeviceChanged,
+        ] {
+            assert!(!ends_stream(&cpal::Error::new(kind)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn an_error_that_ends_the_stream_sets_the_flag_and_is_reported() {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let sink_reported = Arc::clone(&reported);
+        let failed = Arc::new(AtomicBool::new(false));
+        let mut callback = error_callback(
+            Box::new(move |error| sink_reported.lock().unwrap().push(error)),
+            Arc::clone(&failed),
+        );
+        callback(cpal::Error::new(ErrorKind::DeviceBusy));
+        assert!(
+            !failed.load(Ordering::Relaxed),
+            "a busy device keeps the stream"
+        );
+        callback(cpal::Error::new(ErrorKind::Xrun));
+        callback(cpal::Error::new(ErrorKind::DeviceNotAvailable));
+        assert!(
+            failed.load(Ordering::Relaxed),
+            "a lost device ends the stream"
+        );
+        assert_eq!(
+            reported.lock().unwrap().len(),
+            2,
+            "the xrun is not reported, the other two are"
+        );
+    }
 
     #[test]
     fn stereo_frames_are_averaged() {

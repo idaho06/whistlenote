@@ -40,12 +40,14 @@ impl Default for FakeConfig {
     }
 }
 
-/// An open stream slot: its id, the device name and the callbacks.
+/// An open stream slot: its id, the device name, the callbacks and whether
+/// the stream failed.
 struct Slot<F> {
     id: u64,
     device: String,
     callback: F,
     on_error: ErrorSink,
+    failed: bool,
 }
 
 struct State {
@@ -119,8 +121,15 @@ fn open_slot<F>(
         device,
         callback,
         on_error,
+        failed: false,
     });
     Ok(id)
+}
+
+/// Returns whether `slot` holds the stream with `id` and that stream failed.
+fn slot_failed<F>(slot: &Option<Slot<F>>, id: u64) -> bool {
+    slot.as_ref()
+        .is_some_and(|slot| slot.id == id && slot.failed)
 }
 
 /// Clears `slot` when it holds the stream with `id`.
@@ -204,6 +213,11 @@ struct FakeStream {
 impl AudioStream for FakeStream {
     fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    fn is_failed(&self) -> bool {
+        let state = lock(&self.state);
+        slot_failed(&state.input, self.id) || slot_failed(&state.output_stream, self.id)
     }
 }
 
@@ -317,14 +331,27 @@ impl FakeHandle {
         state.config.outputs = outputs;
     }
 
-    /// Reports `error` through the open input stream's error sink.
+    /// Fails the open input stream: it reports `error` through its error
+    /// sink and [`AudioStream::is_failed`] returns true from then on.
     pub fn fail_input(&self, error: AudioError) {
-        let _ = self.with_input(|slot| (slot.on_error)(error));
+        let _ = self.with_input(|slot| {
+            slot.failed = true;
+            (slot.on_error)(error);
+        });
     }
 
-    /// Reports `error` through the open output stream's error sink.
+    /// Fails the open output stream the same way as [`Self::fail_input`].
     pub fn fail_output(&self, error: AudioError) {
-        let _ = self.with_output(|slot| (slot.on_error)(error));
+        let _ = self.with_output(|slot| {
+            slot.failed = true;
+            (slot.on_error)(error);
+        });
+    }
+
+    /// Reports `error` through the open input stream's error sink without
+    /// failing the stream, as a backend does for an error it survives.
+    pub fn report_input_error(&self, error: AudioError) {
+        let _ = self.with_input(|slot| (slot.on_error)(error));
     }
 }
 

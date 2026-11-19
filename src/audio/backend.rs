@@ -37,6 +37,9 @@ pub type InputSink = Box<dyn FnMut(&[f32], InputBlockInfo) + Send>;
 pub type OutputSource = Box<dyn FnMut(&mut [f32], OutputBlockInfo) + Send>;
 
 /// Receives errors that a running stream reports.
+///
+/// An error alone does not mean that the stream stopped; see
+/// [`AudioStream::is_failed`].
 pub type ErrorSink = Box<dyn FnMut(AudioError) + Send>;
 
 /// A running audio stream; dropping it stops the stream.
@@ -45,6 +48,11 @@ pub type ErrorSink = Box<dyn FnMut(AudioError) + Send>;
 pub trait AudioStream {
     /// Returns the sample rate of the stream in Hz.
     fn sample_rate(&self) -> u32;
+
+    /// Returns whether the stream stopped for good, for example because its
+    /// device was unplugged; a failed stream delivers no more blocks and
+    /// must be opened again.
+    fn is_failed(&self) -> bool;
 }
 
 /// A source of audio devices and streams.
