@@ -7,7 +7,7 @@
 //! for tests; microphone input is band-passed and pitch-tracked, onsets
 //! are detected, and a metronome renders beat clicks. An engine thread runs
 //! the audio streams and the analysis and reports to the GUI through
-//! channels.
+//! channels. The `ui` module holds the desktop application and its state.
 
 #![deny(missing_docs)]
 
@@ -17,3 +17,4 @@ pub mod engine;
 pub mod export;
 pub mod metronome;
 pub mod music;
+pub mod ui;
