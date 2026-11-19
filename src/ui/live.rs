@@ -1,7 +1,12 @@
-//! Smoothing of live pitch frames into the note the live view shows.
+//! Smoothing of live pitch frames into the note the live view shows, and the
+//! live view that draws it: the note name with its cents and frequency
+//! reading, a cents meter and the input level bar.
+
+use eframe::egui;
 
 use crate::engine::LiveFrame;
-use crate::music::note::freq_to_midi_float;
+use crate::music::note::{freq_to_midi_float, midi_to_name};
+use crate::ui::state::AppState;
 
 /// Frames that must agree in a row before a new note is shown.
 pub const AGREE_FRAMES: u32 = 3;
@@ -103,6 +108,140 @@ impl NoteSmoother {
     /// Returns the smoother to its default state.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Half range of the cents meter in cents; readings beyond it sit at the ends of the scale.
+pub const METER_CENTS: f32 = 50.0;
+
+/// Distance in cents from the shown note within which the needle shows in tune.
+pub const IN_TUNE_CENTS: f32 = 5.0;
+
+/// Level in dBFS at the empty end of the level bar.
+pub const LEVEL_FLOOR_DB: f32 = -60.0;
+
+/// Cents meter ticks: the cents value, the label under the tick and the tick height in points; the zero tick is taller and only the outer ticks and the zero tick carry a label.
+const METER_TICKS: [(f32, &str, f32); 5] = [
+    (-50.0, "-50", 6.0),
+    (-25.0, "", 6.0),
+    (0.0, "0", 10.0),
+    (25.0, "", 6.0),
+    (50.0, "+50", 6.0),
+];
+
+/// Maps a cents reading to a fraction along the cents meter: `-METER_CENTS` is 0.0, `+METER_CENTS` is 1.0, clamped outside the range.
+fn needle_fraction(cents: f32) -> f32 {
+    ((cents + METER_CENTS) / (2.0 * METER_CENTS)).clamp(0.0, 1.0)
+}
+
+/// Returns whether a cents reading is close enough to the shown note to count as in tune.
+fn in_tune(cents: f32) -> bool {
+    cents.abs() <= IN_TUNE_CENTS
+}
+
+/// Returns the level in dBFS, or `None` when `level` is not finite and positive.
+fn level_db(level: f32) -> Option<f32> {
+    if level.is_finite() && level > 0.0 {
+        Some(20.0 * level.log10())
+    } else {
+        None
+    }
+}
+
+/// Maps a level to a fraction of the level bar: `LEVEL_FLOOR_DB` is 0.0, 0 dBFS is 1.0, clamped; a missing level gives 0.0.
+fn level_fraction(level: f32) -> f32 {
+    match level_db(level) {
+        Some(db) => ((db - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB).clamp(0.0, 1.0),
+        None => 0.0,
+    }
+}
+
+/// Returns the level bar text: the level in dBFS, or "silent" when there is no level.
+fn level_text(level: f32) -> String {
+    match level_db(level) {
+        Some(db) => format!("{db:.0} dBFS"),
+        None => "silent".to_string(),
+    }
+}
+
+/// Returns the reading line under the note name: the cents deviation from the shown note and the frequency in Hz.
+fn reading_text(note: &ShownNote) -> String {
+    format!("{:+.0} cents   {:.1} Hz", note.cents, note.freq_hz)
+}
+
+/// Shows the live view: the name of the shown note, its reading in cents and Hz, the cents meter and the input level bar, centered in `ui`; when the engine does not listen, a hint to turn on Listen instead.
+pub fn show(ui: &mut egui::Ui, state: &AppState) {
+    ui.vertical_centered(|ui| {
+        if !state.listening() {
+            ui.add_space(40.0);
+            ui.weak("Turn on Listen to see the whistled note.");
+            return;
+        }
+        let note = state.live_note();
+        let name = match note {
+            Some(note) => midi_to_name(note.midi),
+            None => "-".to_string(),
+        };
+        ui.label(egui::RichText::new(name).size(96.0).strong());
+        let reading = match note {
+            Some(note) => reading_text(&note),
+            None => " ".to_string(),
+        };
+        ui.label(egui::RichText::new(reading).monospace());
+        ui.add_space(8.0);
+        cents_meter(ui, note.map(|note| note.cents));
+        ui.add_space(8.0);
+        ui.label("Input level");
+        let level = state.latest_live().map_or(0.0, |frame| frame.level);
+        ui.add(
+            egui::ProgressBar::new(level_fraction(level))
+                .desired_width(320.0)
+                .text(level_text(level)),
+        );
+    });
+}
+
+/// Draws the cents meter: a base line with ticks and labels, and a needle at `cents` when there is a reading.
+fn cents_meter(ui: &mut egui::Ui, cents: Option<f32>) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(320.0, 48.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let base_y = egui::lerp(rect.top()..=rect.bottom(), 0.6);
+    let line_color = ui.visuals().text_color();
+    let label_color = ui.visuals().weak_text_color();
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), base_y),
+            egui::pos2(rect.right(), base_y),
+        ],
+        egui::Stroke::new(1.0, line_color),
+    );
+    for (tick_cents, label, height) in METER_TICKS {
+        let x = egui::lerp(rect.left()..=rect.right(), needle_fraction(tick_cents));
+        painter.line_segment(
+            [egui::pos2(x, base_y - height), egui::pos2(x, base_y)],
+            egui::Stroke::new(1.0, line_color),
+        );
+        if !label.is_empty() {
+            painter.text(
+                egui::pos2(x, base_y + 4.0),
+                egui::Align2::CENTER_TOP,
+                label,
+                egui::FontId::proportional(11.0),
+                label_color,
+            );
+        }
+    }
+    if let Some(cents) = cents {
+        let x = egui::lerp(rect.left()..=rect.right(), needle_fraction(cents));
+        let color = if in_tune(cents) {
+            egui::Color32::from_rgb(60, 180, 75)
+        } else {
+            ui.visuals().warn_fg_color
+        };
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, base_y)],
+            egui::Stroke::new(3.0, color),
+        );
     }
 }
 
@@ -246,5 +385,69 @@ mod tests {
     #[test]
     fn min_confidence_matches_the_segment_config_default() {
         assert_eq!(MIN_CONFIDENCE, SegmentConfig::default().min_confidence);
+    }
+
+    #[test]
+    fn needle_fraction_maps_the_meter_range() {
+        assert_close(needle_fraction(-METER_CENTS) as f64, 0.0, 1e-6);
+        assert_close(needle_fraction(0.0) as f64, 0.5, 1e-6);
+        assert_close(needle_fraction(METER_CENTS) as f64, 1.0, 1e-6);
+        assert_close(needle_fraction(HOLD_CENTS) as f64, 1.0, 1e-6);
+        assert_close(needle_fraction(-HOLD_CENTS) as f64, 0.0, 1e-6);
+        assert_close(needle_fraction(25.0) as f64, 0.75, 1e-6);
+    }
+
+    #[test]
+    fn in_tune_checks_the_distance_to_the_shown_note() {
+        assert!(in_tune(IN_TUNE_CENTS));
+        assert!(in_tune(-IN_TUNE_CENTS));
+        assert!(!in_tune(IN_TUNE_CENTS + 0.1));
+        assert!(!in_tune(-IN_TUNE_CENTS - 0.1));
+        assert!(in_tune(0.0));
+    }
+
+    #[test]
+    fn level_db_converts_a_level_to_dbfs() {
+        assert_close(level_db(1.0).expect("1.0 has a level") as f64, 0.0, 1e-3);
+        assert_close(
+            level_db(0.01).expect("0.01 has a level") as f64,
+            -40.0,
+            1e-3,
+        );
+        assert_eq!(level_db(0.0), None);
+        assert_eq!(level_db(-1.0), None);
+        assert_eq!(level_db(f32::NAN), None);
+    }
+
+    #[test]
+    fn level_fraction_maps_dbfs_to_the_bar() {
+        assert_close(level_fraction(1.0) as f64, 1.0, 1e-6);
+        assert_close(level_fraction(0.001) as f64, 0.0, 1e-6);
+        assert_close(level_fraction(0.01) as f64, 1.0 / 3.0, 1e-3);
+        assert_close(level_fraction(0.0001) as f64, 0.0, 1e-6);
+        assert_close(level_fraction(2.0) as f64, 1.0, 1e-6);
+        assert_close(level_fraction(0.0) as f64, 0.0, 1e-6);
+    }
+
+    #[test]
+    fn level_text_shows_dbfs_or_silent() {
+        assert_eq!(level_text(0.01), "-40 dBFS");
+        assert_eq!(level_text(0.0), "silent");
+    }
+
+    #[test]
+    fn reading_text_shows_cents_and_hz() {
+        let note = ShownNote {
+            midi: 69,
+            cents: 12.4,
+            freq_hz: 440.0,
+        };
+        assert_eq!(reading_text(&note), "+12 cents   440.0 Hz");
+        let flat = ShownNote {
+            midi: 69,
+            cents: -3.0,
+            freq_hz: 440.0,
+        };
+        assert!(reading_text(&flat).starts_with("-3 cents"));
     }
 }

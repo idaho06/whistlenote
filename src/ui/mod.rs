@@ -167,9 +167,12 @@ impl eframe::App for WhistlenoteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
-        let heading = self.state.tab.label();
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(heading);
+            if self.state.tab == Tab::Live {
+                live::show(ui, &self.state);
+            } else {
+                ui.heading(self.state.tab.label());
+            }
         });
     }
 }
