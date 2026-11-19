@@ -1,6 +1,6 @@
 //! Butterworth biquad filters with state that persists across blocks.
 
-use biquad::{Biquad, Coefficients, DirectForm2Transposed, Hertz, Type, Q_BUTTERWORTH_F32};
+use biquad::{Biquad, Coefficients, DirectForm2Transposed, Hertz, Q_BUTTERWORTH_F32, Type};
 
 /// Cutoff of the band-pass high-pass section in Hz.
 pub const BAND_LOW_HZ: f32 = 300.0;

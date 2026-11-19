@@ -10,10 +10,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use super::AudioError;
 use super::backend::{
     AudioBackend, AudioStream, ErrorSink, InputBlockInfo, InputSink, OutputBlockInfo, OutputSource,
 };
-use super::AudioError;
 
 /// Settings of a fake backend.
 #[derive(Debug, Clone, PartialEq)]

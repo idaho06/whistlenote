@@ -1,7 +1,7 @@
 //! Standard MIDI file export.
 
 use crate::music::quantize::QuantNote;
-use midly::num::{u15, u24, u28, u4, u7};
+use midly::num::{u4, u7, u15, u24, u28};
 use midly::{
     Format, Header, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
 };
@@ -252,9 +252,11 @@ mod tests {
         let smf = parse(&bytes);
         let events = track_events(&smf);
         assert_eq!(events.len(), 4);
-        assert!(events
-            .iter()
-            .all(|(_, kind)| matches!(kind, TrackEventKind::Meta(_))));
+        assert!(
+            events
+                .iter()
+                .all(|(_, kind)| matches!(kind, TrackEventKind::Meta(_)))
+        );
         assert_eq!(
             events.last().map(|(_, kind)| *kind),
             Some(TrackEventKind::Meta(MetaMessage::EndOfTrack))

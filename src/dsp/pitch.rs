@@ -4,10 +4,10 @@
 //! samples every [`HOP`] samples, and stamps each [`PitchFrame`] with the
 //! engine-clock time of the window's centre sample (index `WINDOW / 2`).
 
-use pitch_detection::detector::mcleod::McLeodDetector;
 use pitch_detection::detector::PitchDetector;
+use pitch_detection::detector::mcleod::McLeodDetector;
 
-use super::filter::{BandPass, BAND_HIGH_HZ};
+use super::filter::{BAND_HIGH_HZ, BandPass};
 use crate::audio::rms;
 use crate::music::segment::PitchFrame;
 
@@ -140,7 +140,7 @@ impl PitchTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::filter::tests::{sine, Noise};
+    use crate::dsp::filter::tests::{Noise, sine};
     use crate::music::assert_close;
 
     /// Tracks `signal` in blocks of 300 samples starting at `start_time_s`.
@@ -184,9 +184,11 @@ mod tests {
 
         let mut noise = Noise(7);
         let quiet: Vec<f32> = (0..24_000).map(|_| 0.001 * noise.next()).collect();
-        assert!(track(&quiet, 48_000, 0.0)
-            .iter()
-            .all(|f| f.freq_hz.is_none()));
+        assert!(
+            track(&quiet, 48_000, 0.0)
+                .iter()
+                .all(|f| f.freq_hz.is_none())
+        );
     }
 
     #[test]

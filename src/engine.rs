@@ -14,16 +14,16 @@ use std::fmt::Display;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
 
 use crate::audio::backend::{AudioBackend, AudioStream, ErrorSink};
 use crate::audio::ring::{
-    input_ring, InputReader, DEFAULT_HEADER_CAPACITY, DEFAULT_SAMPLE_CAPACITY,
+    DEFAULT_HEADER_CAPACITY, DEFAULT_SAMPLE_CAPACITY, InputReader, input_ring,
 };
 use crate::audio::rms;
 use crate::dsp::onset::{OnsetConfig, OnsetDetector};
 use crate::dsp::pitch::{PitchConfig, PitchTracker};
-use crate::metronome::{metronome, MetronomeCommand, MetronomeControl, CLICK_S};
+use crate::metronome::{CLICK_S, MetronomeCommand, MetronomeControl, metronome};
 use crate::music::segment::PitchFrame;
 
 /// What a metronome beat belongs to, as reported in [`EngineEvent::Beat`].
@@ -669,12 +669,12 @@ mod tests {
     use crossbeam_channel::Receiver;
 
     use super::*;
-    use crate::audio::fake::{fake_backend, FakeConfig, FakeHandle};
     use crate::audio::AudioError;
+    use crate::audio::fake::{FakeConfig, FakeHandle, fake_backend};
     use crate::dsp::filter::tests::sine;
     use crate::music::assert_close;
-    use crate::music::quantize::{quantize, Grid};
-    use crate::music::segment::{segment, SegmentConfig};
+    use crate::music::quantize::{Grid, quantize};
+    use crate::music::segment::{SegmentConfig, segment};
 
     /// Receives items from `rx` with `recv_timeout` until one matches `pred`
     /// or `timeout` passes; returns the matching item.

@@ -15,13 +15,13 @@ use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    Device, ErrorKind, FromSample, Sample, SampleFormat, SizedSample, StreamConfig, I24, U24,
+    Device, ErrorKind, FromSample, I24, Sample, SampleFormat, SizedSample, StreamConfig, U24,
 };
 
+use super::AudioError;
 use super::backend::{
     AudioBackend, AudioStream, ErrorSink, InputBlockInfo, InputSink, OutputBlockInfo, OutputSource,
 };
-use super::AudioError;
 
 /// Largest number of frames handed to a sink or source in one call; longer
 /// host blocks are split.

@@ -7,8 +7,8 @@
 //! time). Both stay nearly constant when the mapping holds; a steady change
 //! is clock drift. The output plays silence.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 

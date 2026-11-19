@@ -16,8 +16,8 @@
 //! [`MetronomeControl`] that sends commands to it and receives its beats
 //! without locks.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::audio::backend::{OutputBlockInfo, OutputSource};
 
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn control_drives_the_source_through_the_fake_backend() {
         use crate::audio::backend::AudioBackend;
-        use crate::audio::fake::{fake_backend, FakeConfig};
+        use crate::audio::fake::{FakeConfig, fake_backend};
 
         let (backend, handle) = fake_backend(FakeConfig::default());
         let (mut control, source) = metronome();

@@ -144,7 +144,7 @@ impl OnsetDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::filter::tests::{sine, Noise};
+    use crate::dsp::filter::tests::{Noise, sine};
     use crate::music::assert_close;
 
     /// Feeds `signal` to `detector` in blocks of 300 samples, the first

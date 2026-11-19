@@ -8,8 +8,8 @@
 //! samples are counted, and the next accepted block is marked with
 //! [`BlockHeader::after_drop`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::Thread;
 
 use rtrb::{Consumer, Producer, RingBuffer};

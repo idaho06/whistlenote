@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use whistlenote::audio::backend::AudioBackend;
 use whistlenote::audio::cpal_backend::CpalBackend;
-use whistlenote::audio::ring::{input_ring, DEFAULT_HEADER_CAPACITY, DEFAULT_SAMPLE_CAPACITY};
+use whistlenote::audio::ring::{DEFAULT_HEADER_CAPACITY, DEFAULT_SAMPLE_CAPACITY, input_ring};
 use whistlenote::audio::rms;
 
 /// Width of the level bar at full scale.
