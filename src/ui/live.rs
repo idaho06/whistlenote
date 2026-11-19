@@ -174,6 +174,18 @@ const VIEW_WIDTH: f32 = 320.0;
 /// Height of the cents meter in points.
 const METER_HEIGHT: f32 = 48.0;
 
+/// Shows the note readout: the name of `note` in `name_size` points, its reading in cents and Hz and the cents meter; "-" without a note.
+pub(crate) fn note_readout(ui: &mut egui::Ui, note: Option<ShownNote>, name_size: f32) {
+    let (name, reading) = match note {
+        Some(note) => (midi_to_name(note.midi), reading_text(&note)),
+        None => ("-".to_string(), " ".to_string()),
+    };
+    ui.label(egui::RichText::new(name).size(name_size).strong());
+    ui.label(egui::RichText::new(reading).monospace());
+    ui.add_space(8.0);
+    cents_meter(ui, note.map(|note| note.cents));
+}
+
 /// Shows the live view: the name of the shown note, its reading in cents and Hz, the cents meter and the input level bar, centered in `ui`; when the engine does not listen, a hint to turn on Listen instead.
 pub fn show(ui: &mut egui::Ui, state: &AppState) {
     ui.vertical_centered(|ui| {
@@ -182,15 +194,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState) {
             ui.weak("Turn on Listen to see the whistled note.");
             return;
         }
-        let note = state.live_note();
-        let (name, reading) = match note {
-            Some(note) => (midi_to_name(note.midi), reading_text(&note)),
-            None => ("-".to_string(), " ".to_string()),
-        };
-        ui.label(egui::RichText::new(name).size(96.0).strong());
-        ui.label(egui::RichText::new(reading).monospace());
-        ui.add_space(8.0);
-        cents_meter(ui, note.map(|note| note.cents));
+        note_readout(ui, state.live_note(), 96.0);
         ui.add_space(8.0);
         ui.label("Input level");
         let level = state.latest_live().map_or(0.0, |frame| frame.level);

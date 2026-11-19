@@ -419,6 +419,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
             ui.add_space(4.0);
             ui.strong(beat_text);
         }
+        if !state.record.is_idle() {
+            ui.add_space(8.0);
+            crate::ui::live::note_readout(ui, state.live_note(), 48.0);
+        }
         let mut export: Option<(&'static str, &'static str, &'static str, Vec<u8>)> = None;
         if let Some(take) = state.record.take() {
             ui.add_space(8.0);
