@@ -301,9 +301,16 @@ fn finish_frames(
         .collect()
 }
 
+/// Returns the log label of a selected device: its name, or `default` when
+/// no device is selected.
+fn device_label(name: Option<&str>) -> &str {
+    name.unwrap_or("default")
+}
+
 /// Sends an [`EngineEvent::Error`] with `message` on `events`; a send error
 /// is ignored because the receiver is gone.
 fn send_error(events: &Sender<EngineEvent>, message: impl Display) {
+    log::warn!("error: {message}");
     let _ = events.send(EngineEvent::Error(message.to_string()));
 }
 
@@ -350,17 +357,19 @@ impl Worker {
             match command {
                 Ok(command) => {
                     if self.handle(command) {
-                        return;
+                        break;
                     }
                 }
                 Err(TryRecvError::Empty) => std::thread::park_timeout(PARK_TIMEOUT),
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => break,
             }
         }
+        log::debug!("engine stopped");
     }
 
     /// Handles `command`; returns true when the worker stops.
     fn handle(&mut self, command: EngineCommand) -> bool {
+        log::debug!("command: {command:?}");
         match command {
             EngineCommand::StartListening => {
                 self.listening = true;
@@ -414,8 +423,8 @@ impl Worker {
             EngineCommand::Shutdown => return true,
         }
         // The input stays open only while listening or recording.
-        if !self.listening && self.recording.is_none() {
-            self.input = None;
+        if !self.listening && self.recording.is_none() && self.input.take().is_some() {
+            log::debug!("input closed");
         }
         false
     }
@@ -425,6 +434,13 @@ impl Worker {
     fn emit_devices(&self) {
         match (self.backend.list_inputs(), self.backend.list_outputs()) {
             (Ok(inputs), Ok(outputs)) => {
+                log::debug!(
+                    "devices: {} inputs, {} outputs",
+                    inputs.len(),
+                    outputs.len()
+                );
+                log::trace!("input names: {inputs:?}");
+                log::trace!("output names: {outputs:?}");
                 let _ = self.events.send(EngineEvent::Devices { inputs, outputs });
             }
             (Err(error), _) | (_, Err(error)) => send_error(&self.events, error),
@@ -445,6 +461,11 @@ impl Worker {
                 .open_input(self.input_name.as_deref(), writer.into_sink(), on_error);
         match stream {
             Ok(stream) => {
+                log::info!(
+                    "input open: {} at {} Hz",
+                    device_label(self.input_name.as_deref()),
+                    stream.sample_rate()
+                );
                 let (pitch, onset) = analysers(stream.sample_rate());
                 self.input = Some(Input {
                     _stream: stream,
@@ -481,6 +502,11 @@ impl Worker {
             .open_output(self.output_name.as_deref(), source, on_error);
         match stream {
             Ok(stream) => {
+                log::info!(
+                    "output open: {} at {} Hz",
+                    device_label(self.output_name.as_deref()),
+                    stream.sample_rate()
+                );
                 self.output = Some(Output {
                     _stream: stream,
                     control,
@@ -531,6 +557,7 @@ impl Worker {
             self.output.is_some()
         };
         if queued {
+            log::debug!("recording count-in: {bpm} bpm, clicks {clicks}");
             self.recording = Some(Recording {
                 window_s,
                 count_in_seen: false,
@@ -560,6 +587,10 @@ impl Worker {
             ),
             None => (Vec::new(), 0.0),
         };
+        log::debug!(
+            "recording finished: {} frames, origin {origin_s:.3} s",
+            frames.len()
+        );
         let _ = self
             .events
             .send(EngineEvent::RecordingFinished { frames, origin_s });
@@ -569,6 +600,7 @@ impl Worker {
     /// recording sequence and discards the recording without an event.
     fn cancel_recording(&mut self) {
         if self.recording.take().is_some() {
+            log::debug!("recording discarded");
             self.send_metronome(MetronomeCommand::StopRecording);
         }
     }
@@ -645,6 +677,7 @@ impl Worker {
                     {
                         let origin_s = beat.time_s + self.latency_s;
                         recording.origin_s = Some(origin_s);
+                        log::debug!("recording origin: {origin_s:.3} s");
                         let _ = self.events.send(EngineEvent::RecordingStarted { origin_s });
                     }
                 } else if beat.phase == BeatPhase::CountIn && beat.index == 0 {

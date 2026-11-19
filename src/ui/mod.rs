@@ -153,6 +153,7 @@ impl eframe::App for WhistlenoteApp {
             self.state.apply_live(frame);
         }
         for event in self.engine.events().try_iter() {
+            log::trace!("event: {event:?}");
             self.state.apply_event(event);
         }
         ctx.request_repaint_after(if self.state.listening() {

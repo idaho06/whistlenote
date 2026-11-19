@@ -78,6 +78,14 @@ impl CpalBackend {
             Direction::Output => device.default_output_config()?,
         };
         let config = supported.config();
+        log::debug!(
+            "open {direction:?} on {}: {} Hz, {} channels, format {:?}, buffer {:?}",
+            name.unwrap_or("default"),
+            config.sample_rate,
+            config.channels,
+            supported.sample_format(),
+            supported.buffer_size(),
+        );
         let sample_rate = config.sample_rate;
         let epoch = self.epoch;
         macro_rules! build {
@@ -228,6 +236,9 @@ fn error_callback(mut on_error: ErrorSink) -> impl FnMut(cpal::Error) + Send + '
     move |error| {
         if is_reportable(&error) {
             on_error(AudioError::from(error));
+        } else {
+            // Rare events on cpal's stream thread, not per audio block.
+            log::debug!("stream error ignored: {error}");
         }
     }
 }
