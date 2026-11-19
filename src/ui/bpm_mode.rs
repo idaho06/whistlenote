@@ -1,8 +1,13 @@
 //! The tempo state of the BPM tab: onsets heard on the microphone, tap
 //! tempo, the candidate tempo in the BPM field and the tempo used for
-//! recordings.
+//! recordings, and the view of the tab: the onset indicator, the detected
+//! tempo, the tap and candidate controls and the record tempo.
+
+use eframe::egui;
 
 use crate::music::bpm::{TapTempo, estimate_bpm};
+use crate::ui::centered_row;
+use crate::ui::state::AppState;
 
 /// Most recent onsets the estimate uses.
 pub const ONSET_WINDOW: usize = 12;
@@ -133,6 +138,85 @@ impl BpmState {
     }
 }
 
+/// Returns the detected-tempo line: the estimate with the onset count when there is one, otherwise a prompt to clap a steady beat.
+fn detected_text(estimate: Option<f64>, onsets: usize) -> String {
+    match estimate {
+        Some(bpm) => format!("Detected: {bpm:.1} BPM ({onsets} claps)"),
+        None => "Clap a steady beat".to_string(),
+    }
+}
+
+/// Returns the record-tempo line with `bpm`.
+fn record_text(bpm: f64) -> String {
+    format!("Record tempo: {bpm:.1} BPM")
+}
+
+/// Draws the onset indicator: a green filled circle while `lit`, a faint filled circle with a weak outline otherwise.
+fn onset_light(ui: &mut egui::Ui, lit: bool) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+    let center = rect.center();
+    let painter = ui.painter();
+    if lit {
+        painter.circle_filled(center, 16.0, egui::Color32::from_rgb(60, 180, 75));
+    } else {
+        painter.circle_filled(center, 16.0, ui.visuals().faint_bg_color);
+        painter.circle_stroke(
+            center,
+            16.0,
+            egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+        );
+    }
+}
+
+/// Shows the BPM tab: a hint to turn on Listen while the engine is idle, the onset indicator, the detected tempo, a row with the Tap button, the candidate BPM field, the "Use this BPM" and "Clear" buttons, and the record tempo line, centered in `ui`.
+pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.vertical_centered(|ui| {
+        if !state.listening() {
+            ui.weak("Turn on Listen to detect claps; Tap works either way.");
+        }
+        let lit = state.listening()
+            && state
+                .latest_live()
+                .is_some_and(|frame| state.bpm.flash(frame.time_s));
+        onset_light(ui, lit);
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(detected_text(state.bpm.estimate(), state.bpm.onset_count()))
+                .size(28.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        centered_row(ui, "bpm_controls", |ui| {
+            if ui
+                .add(egui::Button::new("Tap").min_size(egui::vec2(80.0, 40.0)))
+                .clicked()
+            {
+                state.bpm.tap(ui.ctx().input(|i| i.time));
+            }
+            let mut bpm = state.bpm.candidate_bpm();
+            let response = ui.add(
+                egui::DragValue::new(&mut bpm)
+                    .range(MIN_BPM..=MAX_BPM)
+                    .speed(0.5)
+                    .fixed_decimals(1)
+                    .suffix(" BPM"),
+            );
+            if response.changed() {
+                state.bpm.set_candidate(bpm);
+            }
+            if ui.button("Use this BPM").clicked() {
+                state.bpm.use_candidate();
+            }
+            if ui.button("Clear").clicked() {
+                state.bpm.clear();
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(record_text(state.bpm.record_bpm()))
+            .on_hover_text("The Record tab uses this tempo");
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +331,25 @@ mod tests {
         state.push_onset(f64::NAN);
         state.push_onset(f64::INFINITY);
         assert_eq!(state.onset_count(), 0);
+    }
+
+    #[test]
+    fn detected_text_shows_the_estimate_and_onset_count() {
+        assert_eq!(
+            detected_text(Some(90.04), 8),
+            "Detected: 90.0 BPM (8 claps)"
+        );
+    }
+
+    #[test]
+    fn detected_text_without_an_estimate_asks_for_claps() {
+        assert_eq!(detected_text(None, 0), "Clap a steady beat");
+        assert_eq!(detected_text(None, 1), "Clap a steady beat");
+    }
+
+    #[test]
+    fn record_text_shows_the_record_tempo() {
+        assert_eq!(record_text(120.0), "Record tempo: 120.0 BPM");
+        assert_eq!(record_text(97.3), "Record tempo: 97.3 BPM");
     }
 }

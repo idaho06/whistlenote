@@ -168,14 +168,38 @@ impl eframe::App for WhistlenoteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.state.tab == Tab::Live {
-                live::show(ui, &self.state);
-            } else {
-                ui.heading(self.state.tab.label());
+        egui::CentralPanel::default().show(ui, |ui| match self.state.tab {
+            Tab::Live => live::show(ui, &self.state),
+            Tab::Bpm => bpm_mode::show(ui, &mut self.state),
+            Tab::Record => {
+                ui.heading(Tab::Record.label());
             }
         });
     }
+}
+
+/// Shows `add_contents` in a horizontal row centered in `ui`.
+///
+/// egui lays a horizontal row out from the left, so the row stores its
+/// width in egui's memory under `id_salt`, which is unique within `ui`, and
+/// is padded by half the free space on the next pass; the first pass of a
+/// new row is left-aligned.
+pub(crate) fn centered_row(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let id = ui.make_persistent_id(id_salt);
+    let width = ui.ctx().data(|data| data.get_temp::<f32>(id));
+    ui.horizontal(|ui| {
+        if let Some(width) = width {
+            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+        }
+        let start = ui.cursor().left();
+        add_contents(ui);
+        let width = ui.min_rect().right() - start;
+        ui.ctx().data_mut(|data| data.insert_temp(id, width));
+    });
 }
 
 /// Shows a combo box with "Default" and every name in `names` and returns
