@@ -31,6 +31,15 @@ pub struct ShownNote {
     pub freq_hz: f32,
 }
 
+/// Builds the shown note of a voiced reading: `midi` with the cents of `midi_float` relative to it and the frame frequency `hz`.
+fn reading(midi: i32, midi_float: f32, hz: f32) -> ShownNote {
+    ShownNote {
+        midi,
+        cents: (midi_float - midi as f32) * 100.0,
+        freq_hz: hz,
+    }
+}
+
 /// Turns live frames into a stable shown note.
 ///
 /// A new note appears once [`AGREE_FRAMES`] voiced frames in a row agree on
@@ -55,12 +64,9 @@ impl NoteSmoother {
     /// agreeing frames on a new note; an unvoiced frame breaks the agreement.
     /// Once [`CLEAR_S`] passes without a voiced frame, the shown note clears.
     pub fn push(&mut self, frame: &LiveFrame) {
-        let voiced = match frame.freq_hz {
-            Some(hz) if hz.is_finite() && hz > 0.0 && frame.confidence >= MIN_CONFIDENCE => {
-                Some(hz)
-            }
-            _ => None,
-        };
+        let voiced = frame
+            .freq_hz
+            .filter(|hz| hz.is_finite() && *hz > 0.0 && frame.confidence >= MIN_CONFIDENCE);
         if let Some(hz) = voiced {
             self.last_voiced_s = frame.time_s;
             let midi_float = freq_to_midi_float(hz);
@@ -68,11 +74,7 @@ impl NoteSmoother {
                 .shown
                 .filter(|shown| ((midi_float - shown.midi as f32) * 100.0).abs() <= HOLD_CENTS);
             if let Some(shown) = held {
-                self.shown = Some(ShownNote {
-                    midi: shown.midi,
-                    cents: (midi_float - shown.midi as f32) * 100.0,
-                    freq_hz: hz,
-                });
+                self.shown = Some(reading(shown.midi, midi_float, hz));
                 self.candidate = None;
             } else {
                 let nearest = midi_float.round() as i32;
@@ -81,11 +83,7 @@ impl NoteSmoother {
                     _ => 1,
                 };
                 if count >= AGREE_FRAMES {
-                    self.shown = Some(ShownNote {
-                        midi: nearest,
-                        cents: (midi_float - nearest as f32) * 100.0,
-                        freq_hz: hz,
-                    });
+                    self.shown = Some(reading(nearest, midi_float, hz));
                     self.candidate = None;
                 } else {
                     self.candidate = Some((nearest, count));
@@ -169,6 +167,12 @@ fn reading_text(note: &ShownNote) -> String {
     format!("{:+.0} cents   {:.1} Hz", note.cents, note.freq_hz)
 }
 
+/// Width of the live view in points, shared by the cents meter and the level bar.
+const VIEW_WIDTH: f32 = 320.0;
+
+/// Height of the cents meter in points.
+const METER_HEIGHT: f32 = 48.0;
+
 /// Shows the live view: the name of the shown note, its reading in cents and Hz, the cents meter and the input level bar, centered in `ui`; when the engine does not listen, a hint to turn on Listen instead.
 pub fn show(ui: &mut egui::Ui, state: &AppState) {
     ui.vertical_centered(|ui| {
@@ -178,15 +182,11 @@ pub fn show(ui: &mut egui::Ui, state: &AppState) {
             return;
         }
         let note = state.live_note();
-        let name = match note {
-            Some(note) => midi_to_name(note.midi),
-            None => "-".to_string(),
+        let (name, reading) = match note {
+            Some(note) => (midi_to_name(note.midi), reading_text(&note)),
+            None => ("-".to_string(), " ".to_string()),
         };
         ui.label(egui::RichText::new(name).size(96.0).strong());
-        let reading = match note {
-            Some(note) => reading_text(&note),
-            None => " ".to_string(),
-        };
         ui.label(egui::RichText::new(reading).monospace());
         ui.add_space(8.0);
         cents_meter(ui, note.map(|note| note.cents));
@@ -195,7 +195,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState) {
         let level = state.latest_live().map_or(0.0, |frame| frame.level);
         ui.add(
             egui::ProgressBar::new(level_fraction(level))
-                .desired_width(320.0)
+                .desired_width(VIEW_WIDTH)
                 .text(level_text(level)),
         );
     });
@@ -203,7 +203,8 @@ pub fn show(ui: &mut egui::Ui, state: &AppState) {
 
 /// Draws the cents meter: a base line with ticks and labels, and a needle at `cents` when there is a reading.
 fn cents_meter(ui: &mut egui::Ui, cents: Option<f32>) {
-    let (rect, _response) = ui.allocate_exact_size(egui::vec2(320.0, 48.0), egui::Sense::hover());
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(VIEW_WIDTH, METER_HEIGHT), egui::Sense::hover());
     let painter = ui.painter();
     let base_y = egui::lerp(rect.top()..=rect.bottom(), 0.6);
     let line_color = ui.visuals().text_color();

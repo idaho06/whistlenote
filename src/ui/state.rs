@@ -213,6 +213,18 @@ mod tests {
         }
     }
 
+    /// Feeds `state` three voiced 440 Hz frames at 10 ms intervals, which shows A4 as the live note.
+    fn feed_three_voiced_frames(state: &mut AppState) {
+        for time_s in [0.0, 0.01, 0.02] {
+            state.apply_live(LiveFrame {
+                time_s,
+                freq_hz: Some(440.0),
+                confidence: 0.95,
+                level: 0.01,
+            });
+        }
+    }
+
     /// Returns a device event with the given lists.
     fn devices(inputs: &[&str], outputs: &[&str]) -> EngineEvent {
         EngineEvent::Devices {
@@ -359,28 +371,14 @@ mod tests {
     #[test]
     fn three_voiced_frames_show_the_live_note() {
         let mut state = AppState::default();
-        for time_s in [0.0, 0.01, 0.02] {
-            state.apply_live(LiveFrame {
-                time_s,
-                freq_hz: Some(440.0),
-                confidence: 0.95,
-                level: 0.01,
-            });
-        }
+        feed_three_voiced_frames(&mut state);
         assert_eq!(state.live_note().map(|note| note.midi), Some(69));
     }
 
     #[test]
     fn stopping_listening_clears_the_live_note() {
         let mut state = AppState::default();
-        for time_s in [0.0, 0.01, 0.02] {
-            state.apply_live(LiveFrame {
-                time_s,
-                freq_hz: Some(440.0),
-                confidence: 0.95,
-                level: 0.01,
-            });
-        }
+        feed_three_voiced_frames(&mut state);
         assert!(state.live_note().is_some());
         state.set_listening(true);
         assert!(state.live_note().is_some());
