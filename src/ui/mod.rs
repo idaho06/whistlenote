@@ -11,6 +11,7 @@
 
 pub mod bpm_mode;
 pub mod live;
+pub mod record_mode;
 pub mod state;
 
 use std::time::Duration;
