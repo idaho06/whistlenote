@@ -1,4 +1,4 @@
-//! The Record tab: the recording state — the phase of a recording, the grid and metronome settings, the latest beat and the finished take — and the view that draws it: the tempo, grid and metronome controls, the Record and Stop buttons, the beat indicator with the beat line, and the notes table and the MIDI and CSV export of the finished take.
+//! The Record tab: the recording state — the phase of a recording, the grid and metronome settings, the latest beat and the finished take — and the view that draws it: the tempo, grid and metronome controls, the Record and Stop buttons, the beat indicator with the beat line, and the finished take with its summary, the edit row that starts at the first note, resets the edits and sets the short-note threshold, the editable notes table with rest rows and per-note delete and merge buttons, and the MIDI and CSV export.
 
 use eframe::egui;
 
@@ -244,6 +244,35 @@ pub fn table_rows(rows: &[(usize, QuantNote)]) -> Vec<Row> {
     table
 }
 
+/// An edit the user asks for in the notes table of the Record tab.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Edit {
+    /// Deletes the edited note at the index.
+    Delete(usize),
+    /// Merges the edited note at the index into the note before it.
+    MergeIntoPrevious(usize),
+    /// Merges the edited note at the index into the note after it.
+    MergeIntoNext(usize),
+    /// Moves beat 0 later by whole beats so the first note starts on beat 0.
+    StartAtFirstNote,
+    /// Resets the edits to the raw segmentation.
+    Reset,
+    /// Sets the short-note threshold in seconds.
+    MergeNoteS(f64),
+}
+
+/// Applies `edit` to `take`.
+fn apply_edit(take: &mut Take, edit: Edit) {
+    match edit {
+        Edit::Delete(index) => take.delete(index),
+        Edit::MergeIntoPrevious(index) => take.merge_into_previous(index),
+        Edit::MergeIntoNext(index) => take.merge_into_next(index),
+        Edit::StartAtFirstNote => take.start_at_first_note(),
+        Edit::Reset => take.reset_edits(),
+        Edit::MergeNoteS(s) => take.set_merge_note_s(s),
+    }
+}
+
 /// The recording state of the Record tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordState {
@@ -423,7 +452,7 @@ fn grid_label(grid: Grid) -> &'static str {
     }
 }
 
-/// Returns the summary line of `take`: empty without a take, "No notes in this take" for a take without notes, and the note count and tempo otherwise.
+/// Returns the summary line of `take`: empty without a take, "No notes in this take" for a take without notes, and the note count and tempo otherwise, followed by " (edited)" when the take is edited.
 fn take_summary(take: Option<&Take>) -> String {
     match take {
         None => String::new(),
@@ -431,10 +460,16 @@ fn take_summary(take: Option<&Take>) -> String {
             let count = take.notes().len();
             if count == 0 {
                 "No notes in this take".to_string()
-            } else if count == 1 {
-                format!("1 note at {:.1} BPM", take.bpm())
             } else {
-                format!("{count} notes at {:.1} BPM", take.bpm())
+                let mut summary = if count == 1 {
+                    format!("1 note at {:.1} BPM", take.bpm())
+                } else {
+                    format!("{count} notes at {:.1} BPM", take.bpm())
+                };
+                if take.is_edited() {
+                    summary.push_str(" (edited)");
+                }
+                summary
             }
         }
     }
@@ -447,6 +482,16 @@ fn note_row(note: &QuantNote) -> [String; 4] {
         format!("{:.2}", note.length_beats),
         midi_to_name(i32::from(note.midi)),
         note.midi.to_string(),
+    ]
+}
+
+/// Returns the table row of a rest from `start_beats` for `length_beats`: the start beat, the length in beats, "rest" and "-".
+fn rest_row(start_beats: f64, length_beats: f64) -> [String; 4] {
+    [
+        format!("{start_beats:.2}"),
+        format!("{length_beats:.2}"),
+        "rest".to_string(),
+        "-".to_string(),
     ]
 }
 
@@ -496,7 +541,7 @@ fn beat_lights(ui: &mut egui::Ui, beat: Option<(u32, BeatPhase)>) {
     }
 }
 
-/// Shows the Record tab: the headphone hint, the tempo, grid and metronome settings, the Record and Stop buttons, the beat indicator with the beat line, and the summary, notes table and MIDI and CSV export of the finished take; returns the command the user's action sends to the engine.
+/// Shows the Record tab: the headphone hint, the tempo, grid and metronome settings, the Record and Stop buttons, the beat indicator with the beat line, and the finished take with its summary, the edit row that starts at the first note, resets the edits and sets the short-note threshold, the notes table with rest rows and per-note delete and merge buttons, and the MIDI and CSV export; returns the command the user's action sends to the engine.
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
     let mut command: Option<EngineCommand> = None;
     ui.vertical_centered(|ui| {
@@ -581,28 +626,115 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
             crate::ui::live::note_readout(ui, state.live_note(), 48.0);
         }
         let mut export: Option<(&'static str, &'static str, &'static str, Vec<u8>)> = None;
+        let mut edit: Option<Edit> = None;
         if let Some(take) = state.record.take() {
             ui.add_space(8.0);
             ui.label(take_summary(Some(take)));
-            let notes = take.notes();
-            if !notes.is_empty() {
+            let has_notes = !take.notes().is_empty();
+            ui.add_space(4.0);
+            centered_row(ui, "record_edit", |ui| {
+                if ui
+                    .add_enabled(has_notes, egui::Button::new("Start at first note").small())
+                    .on_hover_text(
+                        "Move beat 0 later by whole beats so the first note starts on beat 1",
+                    )
+                    .clicked()
+                {
+                    edit = Some(Edit::StartAtFirstNote);
+                }
+                if ui
+                    .add_enabled(take.is_edited(), egui::Button::new("Reset edits").small())
+                    .clicked()
+                {
+                    edit = Some(Edit::Reset);
+                }
+                ui.label("Merge notes shorter than");
+                let mut ms = take.merge_note_s() * 1000.0;
+                let response = ui
+                    .add(
+                        egui::DragValue::new(&mut ms)
+                            .range(0.0..=250.0)
+                            .speed(1.0)
+                            .fixed_decimals(0)
+                            .suffix(" ms"),
+                    )
+                    .on_hover_text(
+                        "Shorter notes that touch a neighbour merge into it; changing this resets the edits",
+                    );
+                if response.changed() {
+                    edit = Some(Edit::MergeNoteS(ms / 1000.0));
+                }
+            });
+            let shift = take.shift_beats();
+            if shift > 0 {
+                ui.add_space(2.0);
+                let noun = if shift == 1 { "beat" } else { "beats" };
+                ui.weak(format!("Beat 0 moved {shift} {noun} later"));
+            }
+            if has_notes {
+                let table = table_rows(take.rows());
+                let first_note = table.iter().position(|row| matches!(row, Row::Note { .. }));
+                let last_note = table.iter().rposition(|row| matches!(row, Row::Note { .. }));
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical()
                     .max_height(220.0)
                     .show(ui, |ui| {
                         egui::Grid::new("notes")
                             .striped(true)
-                            .num_columns(4)
+                            .num_columns(5)
                             .show(ui, |ui| {
-                                for header in ["Start beat", "Length", "Note", "MIDI"] {
+                                for header in ["Start beat", "Length", "Note", "MIDI", "Edit"] {
                                     ui.strong(header);
                                 }
                                 ui.end_row();
-                                for note in notes {
-                                    for cell in note_row(note) {
-                                        ui.label(cell);
+                                for (pos, row) in table.iter().enumerate() {
+                                    match row {
+                                        Row::Rest {
+                                            start_beats,
+                                            length_beats,
+                                        } => {
+                                            for cell in rest_row(*start_beats, *length_beats) {
+                                                ui.weak(cell);
+                                            }
+                                            ui.label("");
+                                            ui.end_row();
+                                        }
+                                        Row::Note { index, note } => {
+                                            for cell in note_row(note) {
+                                                ui.label(cell);
+                                            }
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("Delete").clicked() {
+                                                    edit = Some(Edit::Delete(*index));
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        Some(pos) != first_note,
+                                                        egui::Button::new("Merge ←").small(),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Merge into the previous note, which keeps its pitch",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    edit = Some(Edit::MergeIntoPrevious(*index));
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        Some(pos) != last_note,
+                                                        egui::Button::new("Merge →").small(),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Merge into the next note, which keeps its pitch",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    edit = Some(Edit::MergeIntoNext(*index));
+                                                }
+                                            });
+                                            ui.end_row();
+                                        }
                                     }
-                                    ui.end_row();
                                 }
                             });
                     });
@@ -616,6 +748,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
                     }
                 });
             }
+        }
+        if let (Some(edit), Some(take)) = (edit, state.record.take_mut()) {
+            apply_edit(take, edit);
         }
         if let Some((default_name, filter_name, extension, bytes)) = export {
             save(state, default_name, filter_name, extension, bytes);
@@ -1165,5 +1300,70 @@ mod tests {
         let (mut state, _) = recorded_state(tone_frames(1.0, 0.6, 440.0));
         state.take_mut().expect("a take").delete(0);
         assert!(state.take().expect("a take").notes().is_empty());
+    }
+
+    #[test]
+    fn rest_row_formats_a_rest() {
+        assert_eq!(rest_row(0.0, 2.0), ["0.00", "2.00", "rest", "-"]);
+    }
+
+    #[test]
+    fn apply_edit_deletes_merges_and_resets() {
+        let mut take = three_note_take();
+        apply_edit(&mut take, Edit::Delete(1));
+        assert_eq!(take.notes().len(), 2);
+        let midis: Vec<u8> = take.notes().iter().map(|note| note.midi).collect();
+        assert_eq!(midis, [69, 76]);
+
+        let mut take = three_note_take();
+        apply_edit(&mut take, Edit::MergeIntoPrevious(1));
+        assert_eq!(take.notes().len(), 2);
+        let midis: Vec<u8> = take.notes().iter().map(|note| note.midi).collect();
+        assert_eq!(midis, [69, 76]);
+        let first = take.notes()[0];
+        assert_eq!(first.midi, 69);
+        assert!(
+            first.length_beats > 2.0,
+            "the first note covers both notes: {} beats",
+            first.length_beats
+        );
+
+        let mut take = three_note_take();
+        apply_edit(&mut take, Edit::MergeIntoNext(1));
+        assert_eq!(take.notes().len(), 2);
+        let midis: Vec<u8> = take.notes().iter().map(|note| note.midi).collect();
+        assert_eq!(midis, [69, 76]);
+        let second = take.notes()[1];
+        assert_eq!(second.midi, 76);
+        assert_close(second.start_beats, 2.0, 0.26);
+
+        let mut take = three_note_take();
+        apply_edit(&mut take, Edit::Delete(1));
+        assert_eq!(take.notes().len(), 2);
+        apply_edit(&mut take, Edit::Reset);
+        assert_eq!(take.notes().len(), 3);
+        assert!(!take.is_edited());
+    }
+
+    #[test]
+    fn apply_edit_sets_the_short_note_threshold() {
+        let mut take = three_note_take();
+        apply_edit(&mut take, Edit::MergeNoteS(0.0));
+        assert_eq!(take.merge_note_s(), 0.0);
+    }
+
+    #[test]
+    fn apply_edit_start_at_first_note_moves_beat_zero() {
+        let frames = tone_frames(3.0, 0.5, 440.0);
+        let mut take = Take::new(frames, 1.0, 120.0, Grid::Sixteenth);
+        apply_edit(&mut take, Edit::StartAtFirstNote);
+        assert_eq!(take.shift_beats(), 4);
+    }
+
+    #[test]
+    fn take_summary_marks_an_edited_take() {
+        let mut take = three_note_take();
+        take.delete(1);
+        assert_eq!(take_summary(Some(&take)), "2 notes at 120.0 BPM (edited)");
     }
 }
