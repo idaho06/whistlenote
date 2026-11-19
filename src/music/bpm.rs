@@ -3,9 +3,9 @@
 use super::median;
 
 /// Lowest tempo in BPM that is reported.
-const MIN_BPM: f64 = 40.0;
+pub const MIN_BPM: f64 = 40.0;
 /// Highest tempo in BPM that is reported.
-const MAX_BPM: f64 = 220.0;
+pub const MAX_BPM: f64 = 220.0;
 /// Longest onset interval in seconds that is kept.
 const MAX_INTERVAL_S: f64 = 4.0;
 /// Number of taps that [`TapTempo`] stores.

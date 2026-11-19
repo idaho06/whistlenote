@@ -6,6 +6,7 @@ use eframe::egui;
 
 use crate::engine::LiveFrame;
 use crate::music::note::{freq_to_midi_float, midi_to_name};
+use crate::ui::GOOD_COLOR;
 use crate::ui::state::AppState;
 
 /// Frames that must agree in a row before a new note is shown.
@@ -235,7 +236,7 @@ fn cents_meter(ui: &mut egui::Ui, cents: Option<f32>) {
     if let Some(cents) = cents {
         let x = egui::lerp(rect.left()..=rect.right(), needle_fraction(cents));
         let color = if in_tune(cents) {
-            egui::Color32::from_rgb(60, 180, 75)
+            GOOD_COLOR
         } else {
             ui.visuals().warn_fg_color
         };

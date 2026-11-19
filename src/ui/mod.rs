@@ -31,6 +31,9 @@ const REPAINT_IDLE: Duration = Duration::from_millis(100);
 /// Width of the device combo boxes in the top bar.
 const DEVICE_COMBO_WIDTH: f32 = 220.0;
 
+/// Green of the in-tune needle in the live view and the lit onset indicator in the BPM tab.
+pub(crate) const GOOD_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 180, 75);
+
 /// Opens the main window and runs the application until the window closes.
 pub fn run() -> eframe::Result {
     log::info!("whistlenote {} starting", env!("CARGO_PKG_VERSION"));

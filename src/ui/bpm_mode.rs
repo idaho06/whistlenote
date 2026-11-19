@@ -5,7 +5,9 @@
 
 use eframe::egui;
 
+pub use crate::music::bpm::{MAX_BPM, MIN_BPM};
 use crate::music::bpm::{TapTempo, estimate_bpm};
+use crate::ui::GOOD_COLOR;
 use crate::ui::centered_row;
 use crate::ui::state::AppState;
 
@@ -17,12 +19,6 @@ pub const RUN_GAP_S: f64 = 4.0;
 
 /// How long the onset indicator stays lit in seconds.
 pub const FLASH_S: f64 = 0.15;
-
-/// Lowest tempo in BPM the candidate accepts.
-pub const MIN_BPM: f64 = 40.0;
-
-/// Highest tempo in BPM the candidate accepts.
-pub const MAX_BPM: f64 = 220.0;
 
 /// Tempo in BPM the BPM field starts with.
 pub const DEFAULT_BPM: f64 = 120.0;
@@ -100,11 +96,7 @@ impl BpmState {
 
     /// Records a tap at `now_s` seconds, returns its tempo and makes it the candidate.
     pub fn tap(&mut self, now_s: f64) -> Option<f64> {
-        let bpm = self.taps.tap(now_s);
-        if let Some(bpm) = bpm {
-            self.set_candidate(bpm);
-        }
-        bpm
+        self.taps.tap(now_s).inspect(|&bpm| self.set_candidate(bpm))
     }
 
     /// Returns the tempo in the BPM field.
@@ -151,18 +143,25 @@ fn record_text(bpm: f64) -> String {
     format!("Record tempo: {bpm:.1} BPM")
 }
 
+/// Radius of the onset indicator circle in points.
+const LIGHT_RADIUS: f32 = 16.0;
+
+/// Side length of the square the onset indicator is drawn in, in points.
+const LIGHT_SIZE: f32 = 40.0;
+
 /// Draws the onset indicator: a green filled circle while `lit`, a faint filled circle with a weak outline otherwise.
 fn onset_light(ui: &mut egui::Ui, lit: bool) {
-    let (rect, _response) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(LIGHT_SIZE, LIGHT_SIZE), egui::Sense::hover());
     let center = rect.center();
     let painter = ui.painter();
     if lit {
-        painter.circle_filled(center, 16.0, egui::Color32::from_rgb(60, 180, 75));
+        painter.circle_filled(center, LIGHT_RADIUS, GOOD_COLOR);
     } else {
-        painter.circle_filled(center, 16.0, ui.visuals().faint_bg_color);
+        painter.circle_filled(center, LIGHT_RADIUS, ui.visuals().faint_bg_color);
         painter.circle_stroke(
             center,
-            16.0,
+            LIGHT_RADIUS,
             egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
         );
     }
