@@ -9,6 +9,7 @@
 //! events of the engine into the state and turns user actions into engine
 //! commands.
 
+pub mod live;
 pub mod state;
 
 use std::time::Duration;

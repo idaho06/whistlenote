@@ -5,6 +5,7 @@
 //! the commands the engine expects.
 
 use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
+use crate::ui::live::{NoteSmoother, ShownNote};
 
 /// The largest absolute latency offset in milliseconds.
 pub(crate) const MAX_LATENCY_MS: f64 = 200.0;
@@ -53,6 +54,8 @@ pub struct AppState {
     error: Option<(String, u32)>,
     /// Latest live pitch frame.
     latest_live: Option<LiveFrame>,
+    /// The smoother of the live note.
+    live: NoteSmoother,
 }
 
 impl AppState {
@@ -72,8 +75,9 @@ impl AppState {
         }
     }
 
-    /// Stores `frame` as the latest live frame.
+    /// Folds `frame` into the live note smoother and stores it as the latest live frame.
     pub fn apply_live(&mut self, frame: LiveFrame) {
+        self.live.push(&frame);
         self.latest_live = Some(frame);
     }
 
@@ -100,12 +104,15 @@ impl AppState {
         Some(EngineCommand::SetLatencyMs(clamped))
     }
 
-    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged.
+    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother, since frames stop arriving and its time-based clearing does not run.
     pub fn set_listening(&mut self, on: bool) -> Option<EngineCommand> {
         if self.listening == on {
             return None;
         }
         self.listening = on;
+        if !on {
+            self.live.reset();
+        }
         Some(if on {
             EngineCommand::StartListening
         } else {
@@ -158,6 +165,11 @@ impl AppState {
     /// Returns the latest live pitch frame, if one arrived.
     pub fn latest_live(&self) -> Option<LiveFrame> {
         self.latest_live
+    }
+
+    /// Returns the smoothed live note the live view shows, if one is shown.
+    pub fn live_note(&self) -> Option<ShownNote> {
+        self.live.shown()
     }
 
     /// Returns whether the selected input is not in the reported input list; `None` is never missing.
@@ -342,6 +354,38 @@ mod tests {
         assert_eq!(state.latest_live(), Some(first));
         state.apply_live(second);
         assert_eq!(state.latest_live(), Some(second));
+    }
+
+    #[test]
+    fn three_voiced_frames_show_the_live_note() {
+        let mut state = AppState::default();
+        for time_s in [0.0, 0.01, 0.02] {
+            state.apply_live(LiveFrame {
+                time_s,
+                freq_hz: Some(440.0),
+                confidence: 0.95,
+                level: 0.01,
+            });
+        }
+        assert_eq!(state.live_note().map(|note| note.midi), Some(69));
+    }
+
+    #[test]
+    fn stopping_listening_clears_the_live_note() {
+        let mut state = AppState::default();
+        for time_s in [0.0, 0.01, 0.02] {
+            state.apply_live(LiveFrame {
+                time_s,
+                freq_hz: Some(440.0),
+                confidence: 0.95,
+                level: 0.01,
+            });
+        }
+        assert!(state.live_note().is_some());
+        state.set_listening(true);
+        assert!(state.live_note().is_some());
+        state.set_listening(false);
+        assert_eq!(state.live_note(), None);
     }
 
     #[test]
