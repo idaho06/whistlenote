@@ -63,15 +63,15 @@ impl CpalBackend {
         self.epoch
     }
 
-    /// Opens and starts a stream in `direction` on the device `name`, with
-    /// the data callback `callback`.
+    /// Opens and starts a stream on the device `name`, with the data
+    /// callback `callback`, whose kind sets the stream's direction.
     fn open(
         &self,
-        direction: Direction,
         name: Option<&str>,
         callback: StreamCallback,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
+        let direction = callback.direction();
         let device = find_device(direction, name)?;
         let supported = match direction {
             Direction::Input => device.default_input_config()?,
@@ -126,6 +126,16 @@ enum StreamCallback {
     Input(InputSink),
     /// Fills mono output blocks.
     Output(OutputSource),
+}
+
+impl StreamCallback {
+    /// Returns the direction of the stream that the callback serves.
+    fn direction(&self) -> Direction {
+        match self {
+            StreamCallback::Input(_) => Direction::Input,
+            StreamCallback::Output(_) => Direction::Output,
+        }
+    }
 }
 
 /// Returns the devices of `direction` with their unique names.
@@ -243,12 +253,7 @@ impl AudioBackend for CpalBackend {
         sink: InputSink,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        self.open(
-            Direction::Input,
-            name,
-            StreamCallback::Input(sink),
-            on_error,
-        )
+        self.open(name, StreamCallback::Input(sink), on_error)
     }
 
     fn open_output(
@@ -257,12 +262,7 @@ impl AudioBackend for CpalBackend {
         source: OutputSource,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        self.open(
-            Direction::Output,
-            name,
-            StreamCallback::Output(source),
-            on_error,
-        )
+        self.open(name, StreamCallback::Output(source), on_error)
     }
 }
 
@@ -375,8 +375,9 @@ where
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StreamClock {
     direction: Direction,
-    /// Engine-clock nanoseconds minus host nanoseconds, once chosen.
-    offset_ns: Option<i128>,
+    /// Engine-clock nanoseconds minus host nanoseconds: the smallest offset
+    /// seen over the first callbacks.
+    offset_ns: i128,
     callbacks: u32,
     last_callback_ns: Option<u128>,
     fallback: bool,
@@ -386,7 +387,7 @@ impl StreamClock {
     fn new(direction: Direction) -> Self {
         Self {
             direction,
-            offset_ns: None,
+            offset_ns: i128::MAX,
             callbacks: 0,
             last_callback_ns: None,
             fallback: false,
@@ -419,13 +420,11 @@ impl StreamClock {
             };
         }
 
-        let offset_ns = now_ns - callback_ns as i128;
         if self.callbacks < ANCHOR_CALLBACKS {
             self.callbacks += 1;
-            self.offset_ns = Some(self.offset_ns.map_or(offset_ns, |o| o.min(offset_ns)));
+            self.offset_ns = self.offset_ns.min(now_ns - callback_ns as i128);
         }
-        let offset_ns = self.offset_ns.unwrap_or(offset_ns);
-        (target_ns as i128 + offset_ns) as f64 / 1e9
+        (target_ns as i128 + self.offset_ns) as f64 / 1e9
     }
 }
 

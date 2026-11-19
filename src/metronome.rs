@@ -86,19 +86,6 @@ pub enum MetronomeCommand {
     StopRecording,
 }
 
-/// What the metronome plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// Nothing plays.
-    Idle,
-    /// The free-running sequence plays.
-    Free,
-    /// The count-in bar of a recording plays.
-    CountIn,
-    /// The recording beats play.
-    Recording,
-}
-
 /// A ringing click.
 struct Click {
     /// Frequency of the click in Hz.
@@ -112,8 +99,8 @@ struct Click {
 /// The free-running and recording sequences it plays are described in the
 /// [module documentation](crate::metronome).
 pub struct Metronome {
-    /// What the metronome plays.
-    mode: Mode,
+    /// The sequence that plays, or `None` while idle.
+    mode: Option<BeatPhase>,
     /// Tempo of the free sequence in BPM.
     free_bpm: f64,
     /// Whether the free sequence is enabled.
@@ -124,9 +111,8 @@ pub struct Metronome {
     clicks: bool,
     /// Index of the next beat.
     index: u32,
-    /// Whether the next beat fires at the start of the next block.
-    start_pending: bool,
-    /// Exact sample position of the last fired beat.
+    /// Exact sample position of the last fired beat; negative infinity
+    /// makes the next beat fire at the start of the next block.
     last_beat: f64,
     /// Absolute sample index of the next block's first sample, starting at 0.
     position: u64,
@@ -145,14 +131,13 @@ impl Metronome {
     /// Creates a stopped metronome at 120 BPM.
     pub fn new() -> Self {
         Self {
-            mode: Mode::Idle,
+            mode: None,
             free_bpm: 120.0,
             free_enabled: false,
             record_bpm: 120.0,
             clicks: false,
             index: 0,
-            start_pending: false,
-            last_beat: 0.0,
+            last_beat: f64::NEG_INFINITY,
             position: 0,
             click: None,
         }
@@ -167,13 +152,11 @@ impl Metronome {
                 }
                 self.free_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                 self.free_enabled = enabled;
-                if matches!(self.mode, Mode::Idle | Mode::Free) {
+                if matches!(self.mode, None | Some(BeatPhase::Free)) {
                     if !enabled {
-                        self.mode = Mode::Idle;
-                    } else if self.mode == Mode::Idle {
-                        self.mode = Mode::Free;
-                        self.index = 0;
-                        self.start_pending = true;
+                        self.mode = None;
+                    } else if self.mode.is_none() {
+                        self.start(BeatPhase::Free);
                     }
                 }
             }
@@ -183,18 +166,13 @@ impl Metronome {
                 }
                 self.record_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                 self.clicks = clicks;
-                self.mode = Mode::CountIn;
-                self.index = 0;
-                self.start_pending = true;
+                self.start(BeatPhase::CountIn);
             }
             MetronomeCommand::StopRecording => {
-                if matches!(self.mode, Mode::CountIn | Mode::Recording) {
-                    if self.free_enabled {
-                        self.mode = Mode::Free;
-                        self.index = 0;
-                    } else {
-                        self.mode = Mode::Idle;
-                    }
+                // The free sequence continues the grid from the last beat.
+                if matches!(self.mode, Some(BeatPhase::CountIn | BeatPhase::Recording)) {
+                    self.mode = self.free_enabled.then_some(BeatPhase::Free);
+                    self.index = 0;
                 }
             }
         }
@@ -216,26 +194,16 @@ impl Metronome {
     ) {
         let block_start = self.position as f64;
         let rate = f64::from(info.sample_rate);
-        let block_end = block_start + out.len() as f64;
         let click_len = (CLICK_S * rate).round() as usize;
         let tau = CLICK_S / 100.0_f64.ln();
+        let mut next = self.next_beat(block_start, rate);
         for (i, sample) in out.iter_mut().enumerate() {
             let here = block_start + i as f64;
-            while let Some(bpm) = self.current_bpm() {
-                let interval = 60.0 * rate / bpm;
-                let next = if self.start_pending {
-                    block_start
-                } else {
-                    (self.last_beat + interval).max(block_start)
-                };
-                let fire = (next - POSITION_EPSILON).ceil();
-                if fire >= block_end || fire > here {
-                    break;
-                }
-                self.last_beat = next;
-                self.start_pending = false;
+            while let Some((exact, fire, phase)) = next.filter(|&(_, fire, _)| fire <= here) {
+                self.last_beat = exact;
                 let index = self.index;
-                let (phase, accent, audible) = self.advance_beat();
+                let (accent, audible) = self.advance_beat(phase);
+                next = self.next_beat(block_start, rate);
                 on_beat(Beat {
                     index,
                     accent,
@@ -264,39 +232,46 @@ impl Metronome {
         self.position += out.len() as u64;
     }
 
-    /// Tempo of the sequence that is running in BPM, or `None` while idle.
-    fn current_bpm(&self) -> Option<f64> {
-        match self.mode {
-            Mode::Idle => None,
-            Mode::Free => Some(self.free_bpm),
-            Mode::CountIn | Mode::Recording => Some(self.record_bpm),
-        }
+    /// Starts `phase` with its first beat at the start of the next block.
+    fn start(&mut self, phase: BeatPhase) {
+        self.mode = Some(phase);
+        self.index = 0;
+        self.last_beat = f64::NEG_INFINITY;
     }
 
-    /// Advances past one beat and returns its phase, accent and audibility.
+    /// Returns the exact position, the firing sample and the phase of the
+    /// next beat, or `None` while idle; the beat is no earlier than
+    /// `block_start`.
+    fn next_beat(&self, block_start: f64, rate: f64) -> Option<(f64, f64, BeatPhase)> {
+        let phase = self.mode?;
+        let bpm = match phase {
+            BeatPhase::Free => self.free_bpm,
+            BeatPhase::CountIn | BeatPhase::Recording => self.record_bpm,
+        };
+        let exact = (self.last_beat + 60.0 * rate / bpm).max(block_start);
+        Some((exact, (exact - POSITION_EPSILON).ceil(), phase))
+    }
+
+    /// Advances past one beat of `phase` and returns its accent and
+    /// audibility.
     ///
     /// A count-in ends after [`BEATS_PER_BAR`] beats, and the recording
     /// starts at the next beat.
-    fn advance_beat(&mut self) -> (BeatPhase, bool, bool) {
+    fn advance_beat(&mut self, phase: BeatPhase) -> (bool, bool) {
         let index = self.index;
-        let (phase, accent, audible) = match self.mode {
-            Mode::Free => (BeatPhase::Free, index.is_multiple_of(BEATS_PER_BAR), true),
-            Mode::CountIn => (BeatPhase::CountIn, index == 0, true),
-            Mode::Recording => (
-                BeatPhase::Recording,
-                index.is_multiple_of(BEATS_PER_BAR),
-                self.clicks,
-            ),
-            // The render loop fires beats only while a sequence runs, so
-            // this arm cannot be taken.
-            Mode::Idle => (BeatPhase::Free, false, false),
-        };
-        self.index = index + 1;
-        if self.mode == Mode::CountIn && self.index >= BEATS_PER_BAR {
-            self.mode = Mode::Recording;
-            self.index = 0;
+        self.index += 1;
+        match phase {
+            BeatPhase::Free => (index.is_multiple_of(BEATS_PER_BAR), true),
+            BeatPhase::CountIn => {
+                // The recording beats continue the count-in's grid.
+                if self.index >= BEATS_PER_BAR {
+                    self.mode = Some(BeatPhase::Recording);
+                    self.index = 0;
+                }
+                (index == 0, true)
+            }
+            BeatPhase::Recording => (index.is_multiple_of(BEATS_PER_BAR), self.clicks),
         }
-        (phase, accent, audible)
     }
 }
 

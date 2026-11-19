@@ -134,6 +134,19 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// A seeded xorshift32 generator of uniform noise in -1..1.
+    pub(crate) struct Noise(pub(crate) u32);
+
+    impl Noise {
+        /// Returns the next pseudo-random value in -1..1.
+        pub(crate) fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0 as f32 / u32::MAX as f32 * 2.0 - 1.0
+        }
+    }
+
     /// Returns the steady-state gain of `filter` for a sine at `freq_hz`.
     fn gain(mut filter: BandPass, freq_hz: f32, sample_rate: u32) -> f32 {
         let mut signal = sine(freq_hz, 1.0, sample_rate, sample_rate as usize);

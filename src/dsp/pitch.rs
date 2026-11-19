@@ -140,7 +140,7 @@ impl PitchTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::filter::tests::sine;
+    use crate::dsp::filter::tests::{sine, Noise};
     use crate::music::assert_close;
 
     /// Tracks `signal` in blocks of 300 samples starting at `start_time_s`.
@@ -152,18 +152,6 @@ mod tests {
             tracker.process(block, time_s, &mut frames);
         }
         frames
-    }
-
-    /// A seeded xorshift generator of uniform noise in -1..1.
-    struct Noise(u32);
-
-    impl Noise {
-        fn next(&mut self) -> f32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 17;
-            self.0 ^= self.0 << 5;
-            self.0 as f32 / u32::MAX as f32 * 2.0 - 1.0
-        }
     }
 
     fn assert_all_near(frames: &[PitchFrame], freq_hz: f32) {

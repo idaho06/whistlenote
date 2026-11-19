@@ -117,13 +117,18 @@ impl OnsetDetector {
         let log_e = (energy + LOG_FLOOR).ln();
         if let Some(prev_log_e) = self.prev_log_e {
             let flux = (log_e - prev_log_e).max(0.0);
-            let threshold = median(self.flux_history.iter().copied().collect()).unwrap_or(0.0)
-                + THRESHOLD_OFFSET;
-            let loud_enough = rms(&self.window) >= self.config.gate_rms;
-            let past_refractory = self
-                .last_onset_s
-                .is_none_or(|last| time_s - last >= REFRACTORY_S);
-            if flux > threshold && loud_enough && past_refractory {
+            // The flux values are never negative, so their median is at
+            // least 0 and a flux up to THRESHOLD_OFFSET never qualifies; the
+            // cheap tests run first and the median only when they pass.
+            let is_onset = flux > THRESHOLD_OFFSET
+                && self
+                    .last_onset_s
+                    .is_none_or(|last| time_s - last >= REFRACTORY_S)
+                && rms(&self.window) >= self.config.gate_rms
+                && flux
+                    > median(self.flux_history.iter().copied().collect()).unwrap_or(0.0)
+                        + THRESHOLD_OFFSET;
+            if is_onset {
                 out.push(time_s);
                 self.last_onset_s = Some(time_s);
             }
@@ -139,23 +144,8 @@ impl OnsetDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::filter::tests::sine;
+    use crate::dsp::filter::tests::{sine, Noise};
     use crate::music::assert_close;
-
-    /// A seeded xorshift32 generator of uniform values in −1..1.
-    struct Noise(u32);
-
-    impl Noise {
-        /// Returns the next pseudo-random value in −1..1.
-        fn next(&mut self) -> f32 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            self.0 = x;
-            x as f32 / u32::MAX as f32 * 2.0 - 1.0
-        }
-    }
 
     /// Feeds `signal` to `detector` in blocks of 300 samples, the first
     /// sample having time `start_time_s`, and appends onsets to `out`.
