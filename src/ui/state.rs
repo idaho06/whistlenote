@@ -5,6 +5,7 @@
 //! the commands the engine expects.
 
 use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
+use crate::ui::bpm_mode::BpmState;
 use crate::ui::live::{NoteSmoother, ShownNote};
 
 /// The largest absolute latency offset in milliseconds.
@@ -56,13 +57,17 @@ pub struct AppState {
     latest_live: Option<LiveFrame>,
     /// The smoother of the live note.
     live: NoteSmoother,
+    /// The tempo state of the BPM tab, including the tempo used for recordings.
+    pub bpm: BpmState,
 }
 
 impl AppState {
     /// Applies `event`: a device list replaces the stored list and keeps the
-    /// selections, a repeated error raises its count, other events change nothing.
+    /// selections, an onset feeds the tempo state of the BPM tab, a repeated
+    /// error raises its count, other events change nothing.
     pub fn apply_event(&mut self, event: EngineEvent) {
         match event {
+            EngineEvent::Onset { time_s } => self.bpm.push_onset(time_s),
             EngineEvent::Devices { inputs, outputs } => {
                 self.inputs = inputs;
                 self.outputs = outputs;
@@ -201,6 +206,7 @@ fn missing(selection: &Option<String>, names: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::engine::BeatPhase;
+    use crate::music::assert_close;
     use crate::music::segment::PitchFrame;
 
     /// Returns a live frame at `time_s`.
@@ -398,7 +404,6 @@ mod tests {
         let before = state.clone();
 
         for event in [
-            EngineEvent::Onset { time_s: 1.0 },
             EngineEvent::Beat {
                 index: 0,
                 accent: true,
@@ -418,5 +423,19 @@ mod tests {
             state.apply_event(event);
         }
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn onset_events_feed_the_bpm_state() {
+        let mut state = AppState::default();
+        for time_s in [0.0, 0.5, 1.0] {
+            state.apply_event(EngineEvent::Onset { time_s });
+        }
+        assert_eq!(state.bpm.onset_count(), 3);
+        assert_close(
+            state.bpm.estimate().expect("a tempo is estimated"),
+            120.0,
+            0.5,
+        );
     }
 }
