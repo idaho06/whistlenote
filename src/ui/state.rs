@@ -82,10 +82,11 @@ impl AppState {
         }
     }
 
-    /// Folds `frame` into the live note smoother and stores it as the latest live frame.
+    /// Folds `frame` into the live note smoother, stores it as the latest live frame and feeds it to the running recording of the Record tab, which collects the live frames and rebuilds its preview from them.
     pub fn apply_live(&mut self, frame: LiveFrame) {
         self.live.push(&frame);
         self.latest_live = Some(frame);
+        self.record.push_live(&frame);
     }
 
     /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running recording, since the engine discards it without an event.
@@ -531,5 +532,27 @@ mod tests {
             120.0,
             0.5,
         );
+    }
+
+    #[test]
+    fn live_frames_build_the_preview_of_the_running_recording() {
+        let mut state = AppState::default();
+        state.record.start(120.0);
+        // `start` enters the count-in, so the start event moves the state into the recording.
+        state.apply_event(EngineEvent::RecordingStarted { origin_s: 0.0 });
+        for i in 0..30 {
+            state.apply_live(LiveFrame {
+                time_s: i as f64 * 0.01,
+                freq_hz: Some(440.0),
+                confidence: 0.95,
+                level: 0.01,
+            });
+        }
+        let preview = state
+            .record
+            .preview()
+            .expect("a preview after 30 live frames");
+        assert_eq!(preview.notes().len(), 1);
+        assert_eq!(preview.notes()[0].midi, 69);
     }
 }

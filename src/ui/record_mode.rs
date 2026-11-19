@@ -1,8 +1,8 @@
-//! The Record tab: the recording state — the phase of a recording, the grid and metronome settings, the latest beat and the finished take — and the view that draws it: the tempo, grid and metronome controls, the Record and Stop buttons, the beat indicator with the beat line, and the finished take with its summary, the edit row that starts at the first note, resets the edits and sets the short-note threshold, the editable notes table with rest rows and per-note delete and merge buttons, and the MIDI and CSV export.
+//! The Record tab: the recording state — the phase of a recording, the grid and metronome settings, the latest beat, the live frames and preview of the running recording and the finished take — and the view that draws it: the tempo, grid and metronome controls, the Record and Stop buttons, the beat indicator with the beat line, the preview of the notes recorded so far while a recording runs, and the finished take with its summary, the edit row that starts at the first note, resets the edits and sets the short-note threshold, the editable notes table with rest rows and per-note delete and merge buttons, and the MIDI and CSV export.
 
 use eframe::egui;
 
-use crate::engine::{BeatPhase, EngineCommand, EngineEvent};
+use crate::engine::{BeatPhase, EngineCommand, EngineEvent, LiveFrame};
 use crate::export::csv::to_csv;
 use crate::export::midi::to_midi_bytes;
 use crate::metronome::BEATS_PER_BAR;
@@ -273,12 +273,15 @@ fn apply_edit(take: &mut Take, edit: Edit) {
     }
 }
 
+/// Live frames between two rebuilds of the preview of the running recording; about 0.1 s.
+pub const PREVIEW_EVERY_FRAMES: usize = 10;
+
 /// The recording state of the Record tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordState {
     /// Phase of the running recording.
     phase: RecordPhase,
-    /// Grid the finished take is quantized onto.
+    /// Grid the finished take and the preview are quantized onto.
     grid: Grid,
     /// Whether recording beats are audible.
     metronome: bool,
@@ -290,6 +293,14 @@ pub struct RecordState {
     count_in_seen: bool,
     /// The latest finished take.
     take: Option<Take>,
+    /// Beat 0 of the running recording, once the engine reports the start.
+    origin_s: Option<f64>,
+    /// Live frames of the running recording, from its start.
+    live_frames: Vec<PitchFrame>,
+    /// Live frames pushed since the preview was last rebuilt.
+    unprocessed: usize,
+    /// Notes of the running recording so far.
+    preview: Option<Take>,
 }
 
 impl Default for RecordState {
@@ -302,6 +313,10 @@ impl Default for RecordState {
             last_beat: None,
             count_in_seen: false,
             take: None,
+            origin_s: None,
+            live_frames: Vec::new(),
+            unprocessed: 0,
+            preview: None,
         }
     }
 }
@@ -332,6 +347,11 @@ impl RecordState {
         self.take.as_mut()
     }
 
+    /// Returns the preview of the running recording — its notes so far — once one has been built.
+    pub fn preview(&self) -> Option<&Take> {
+        self.preview.as_ref()
+    }
+
     /// Returns the index and phase of the latest beat of the running recording.
     pub fn last_beat(&self) -> Option<(u32, BeatPhase)> {
         self.last_beat
@@ -347,11 +367,14 @@ impl RecordState {
         if self.is_idle() { None } else { Some(self.bpm) }
     }
 
-    /// Stores `grid` and re-quantizes the finished take onto it, if there is one.
+    /// Stores `grid` and re-quantizes the finished take and the preview onto it, if there are any.
     pub fn set_grid(&mut self, grid: Grid) {
         self.grid = grid;
         if let Some(take) = &mut self.take {
             take.set_grid(grid);
+        }
+        if let Some(preview) = &mut self.preview {
+            preview.set_grid(grid);
         }
     }
 
@@ -362,7 +385,7 @@ impl RecordState {
         }
     }
 
-    /// Locks `bpm`, clears the latest beat, enters the count-in and returns the command that starts the recording; returns `None` and changes nothing unless the tab is idle and `bpm` is finite and positive. The finished take is kept.
+    /// Locks `bpm`, clears the latest beat and the live frames and preview of the running recording, enters the count-in and returns the command that starts the recording; returns `None` and changes nothing unless the tab is idle and `bpm` is finite and positive. The finished take is kept.
     pub fn start(&mut self, bpm: f64) -> Option<EngineCommand> {
         if !self.is_idle() || !bpm.is_finite() || bpm <= 0.0 {
             return None;
@@ -370,6 +393,10 @@ impl RecordState {
         self.bpm = bpm;
         self.last_beat = None;
         self.count_in_seen = false;
+        self.origin_s = None;
+        self.live_frames.clear();
+        self.unprocessed = 0;
+        self.preview = None;
         self.phase = RecordPhase::CountIn;
         Some(EngineCommand::StartRecording {
             bpm,
@@ -388,16 +415,20 @@ impl RecordState {
         }
     }
 
-    /// Returns to idle without a take when a recording runs, because the engine discards a recording without an event when listening stops or a device changes; the finished take is kept.
+    /// Returns to idle without a take when a recording runs, because the engine discards a recording without an event when listening stops or a device changes; the live frames and the preview are cleared and the finished take is kept.
     pub fn cancel(&mut self) {
         if !self.is_idle() {
             self.phase = RecordPhase::Idle;
             self.last_beat = None;
             self.count_in_seen = false;
+            self.origin_s = None;
+            self.live_frames.clear();
+            self.unprocessed = 0;
+            self.preview = None;
         }
     }
 
-    /// Folds `event` into the state: a beat while a recording runs updates the latest beat and a count-in beat marks the count-in as seen, a start moves the count-in into the recording, a finish stores the take and returns to idle, an error before the first count-in beat aborts the start. Other events change nothing.
+    /// Folds `event` into the state: a beat while a recording runs updates the latest beat and a count-in beat marks the count-in as seen, a start moves the count-in into the recording and stores its origin, a finish stores the take, clears the live frames and the preview and returns to idle, an error before the first count-in beat aborts the start. Other events change nothing.
     pub fn apply_event(&mut self, event: &EngineEvent) {
         match event {
             EngineEvent::Beat { index, phase, .. } if !self.is_idle() => {
@@ -406,19 +437,48 @@ impl RecordState {
                     self.count_in_seen = true;
                 }
             }
-            EngineEvent::RecordingStarted { .. } if self.phase == RecordPhase::CountIn => {
+            EngineEvent::RecordingStarted { origin_s } if self.phase == RecordPhase::CountIn => {
                 self.phase = RecordPhase::Recording;
+                self.origin_s = Some(*origin_s);
             }
             EngineEvent::RecordingFinished { frames, origin_s } if !self.is_idle() => {
                 self.take = Some(Take::new(frames.clone(), *origin_s, self.bpm, self.grid));
                 self.phase = RecordPhase::Idle;
                 self.last_beat = None;
                 self.count_in_seen = false;
+                self.origin_s = None;
+                self.live_frames.clear();
+                self.unprocessed = 0;
+                self.preview = None;
             }
             EngineEvent::Error(_) if self.phase == RecordPhase::CountIn && !self.count_in_seen => {
                 self.phase = RecordPhase::Idle;
             }
             _ => {}
+        }
+    }
+
+    /// Folds a live frame of the engine into the running recording: while a recording runs, the frame is collected as a pitch frame and every [`PREVIEW_EVERY_FRAMES`] collected frames the preview is rebuilt from all collected frames; while idle or stopping the frame is ignored, and no preview is built before the recording start arrived.
+    pub fn push_live(&mut self, frame: &LiveFrame) {
+        if self.is_idle() || self.phase == RecordPhase::Stopping {
+            return;
+        }
+        self.live_frames.push(PitchFrame {
+            time_s: frame.time_s,
+            freq_hz: frame.freq_hz,
+            confidence: frame.confidence,
+        });
+        self.unprocessed += 1;
+        if let Some(origin_s) = self.origin_s
+            && self.unprocessed >= PREVIEW_EVERY_FRAMES
+        {
+            self.preview = Some(Take::new(
+                self.live_frames.clone(),
+                origin_s,
+                self.bpm,
+                self.grid,
+            ));
+            self.unprocessed = 0;
         }
     }
 
@@ -475,6 +535,15 @@ fn take_summary(take: Option<&Take>) -> String {
     }
 }
 
+/// Returns the note-count text of the preview of the running recording: "No notes yet", "1 note so far" or "{count} notes so far".
+fn preview_summary(count: usize) -> String {
+    match count {
+        0 => "No notes yet".to_string(),
+        1 => "1 note so far".to_string(),
+        count => format!("{count} notes so far"),
+    }
+}
+
 /// Returns the table row of `note`: the start beat, the length in beats, the note name and the MIDI number.
 fn note_row(note: &QuantNote) -> [String; 4] {
     [
@@ -493,6 +562,96 @@ fn rest_row(start_beats: f64, length_beats: f64) -> [String; 4] {
         "rest".to_string(),
         "-".to_string(),
     ]
+}
+
+/// Draws the notes table of `take` — the rest rows and the note rows — and returns the edit a per-note button asks for; an editable table has an "Edit" column with delete and merge buttons, a non-editable table has four columns, sticks to the bottom so the newest rows stay visible and returns `None`.
+fn notes_table(ui: &mut egui::Ui, take: &Take, editable: bool) -> Option<Edit> {
+    let mut edit: Option<Edit> = None;
+    let table = table_rows(take.rows());
+    let first_note = table.iter().position(|row| matches!(row, Row::Note { .. }));
+    let last_note = table
+        .iter()
+        .rposition(|row| matches!(row, Row::Note { .. }));
+    let (grid_salt, scroll_salt, columns) = if editable {
+        ("notes", "notes_scroll", 5)
+    } else {
+        ("preview_notes", "preview_notes_scroll", 4)
+    };
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .id_salt(scroll_salt)
+        .stick_to_bottom(!editable)
+        .show(ui, |ui| {
+            egui::Grid::new(grid_salt)
+                .striped(true)
+                .num_columns(columns)
+                .show(ui, |ui| {
+                    if editable {
+                        for header in ["Start beat", "Length", "Note", "MIDI", "Edit"] {
+                            ui.strong(header);
+                        }
+                    } else {
+                        for header in ["Start beat", "Length", "Note", "MIDI"] {
+                            ui.strong(header);
+                        }
+                    }
+                    ui.end_row();
+                    for (pos, row) in table.iter().enumerate() {
+                        match row {
+                            Row::Rest {
+                                start_beats,
+                                length_beats,
+                            } => {
+                                for cell in rest_row(*start_beats, *length_beats) {
+                                    ui.weak(cell);
+                                }
+                                if editable {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                            Row::Note { index, note } => {
+                                for cell in note_row(note) {
+                                    ui.label(cell);
+                                }
+                                if editable {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("Delete").clicked() {
+                                            edit = Some(Edit::Delete(*index));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                Some(pos) != first_note,
+                                                egui::Button::new("Merge ←").small(),
+                                            )
+                                            .on_hover_text(
+                                                "Merge into the previous note, which keeps its pitch",
+                                            )
+                                            .clicked()
+                                        {
+                                            edit = Some(Edit::MergeIntoPrevious(*index));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                Some(pos) != last_note,
+                                                egui::Button::new("Merge →").small(),
+                                            )
+                                            .on_hover_text(
+                                                "Merge into the next note, which keeps its pitch",
+                                            )
+                                            .clicked()
+                                        {
+                                            edit = Some(Edit::MergeIntoNext(*index));
+                                        }
+                                    });
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    }
+                });
+        });
+    edit
 }
 
 /// Returns the position in the bar and the phase of the latest beat, or `None` without a beat.
@@ -541,7 +700,7 @@ fn beat_lights(ui: &mut egui::Ui, beat: Option<(u32, BeatPhase)>) {
     }
 }
 
-/// Shows the Record tab: the headphone hint, the tempo, grid and metronome settings, the Record and Stop buttons, the beat indicator with the beat line, and the finished take with its summary, the edit row that starts at the first note, resets the edits and sets the short-note threshold, the notes table with rest rows and per-note delete and merge buttons, and the MIDI and CSV export; returns the command the user's action sends to the engine.
+/// Shows the Record tab: the headphone hint, the tempo, grid and metronome settings, the Record and Stop buttons, the beat indicator with the beat line, the live note, the preview of the notes recorded so far while a recording runs, and the finished take while idle with its summary, the edit row that starts at the first note, resets the edits and sets the short-note threshold, the notes table with rest rows and per-note delete and merge buttons, and the MIDI and CSV export; returns the command the user's action sends to the engine.
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
     let mut command: Option<EngineCommand> = None;
     ui.vertical_centered(|ui| {
@@ -627,7 +786,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
         }
         let mut export: Option<(&'static str, &'static str, &'static str, Vec<u8>)> = None;
         let mut edit: Option<Edit> = None;
-        if let Some(take) = state.record.take() {
+        if !state.record.is_idle() {
+            if let Some(preview) = state.record.preview() {
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "Recording: {}",
+                    preview_summary(preview.notes().len())
+                ));
+                if !preview.notes().is_empty() {
+                    ui.add_space(4.0);
+                    notes_table(ui, preview, false);
+                }
+            }
+        } else if let Some(take) = state.record.take() {
             ui.add_space(8.0);
             ui.label(take_summary(Some(take)));
             let has_notes = !take.notes().is_empty();
@@ -672,72 +843,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> Option<EngineCommand> {
                 ui.weak(format!("Beat 0 moved {shift} {noun} later"));
             }
             if has_notes {
-                let table = table_rows(take.rows());
-                let first_note = table.iter().position(|row| matches!(row, Row::Note { .. }));
-                let last_note = table.iter().rposition(|row| matches!(row, Row::Note { .. }));
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("notes")
-                            .striped(true)
-                            .num_columns(5)
-                            .show(ui, |ui| {
-                                for header in ["Start beat", "Length", "Note", "MIDI", "Edit"] {
-                                    ui.strong(header);
-                                }
-                                ui.end_row();
-                                for (pos, row) in table.iter().enumerate() {
-                                    match row {
-                                        Row::Rest {
-                                            start_beats,
-                                            length_beats,
-                                        } => {
-                                            for cell in rest_row(*start_beats, *length_beats) {
-                                                ui.weak(cell);
-                                            }
-                                            ui.label("");
-                                            ui.end_row();
-                                        }
-                                        Row::Note { index, note } => {
-                                            for cell in note_row(note) {
-                                                ui.label(cell);
-                                            }
-                                            ui.horizontal(|ui| {
-                                                if ui.small_button("Delete").clicked() {
-                                                    edit = Some(Edit::Delete(*index));
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        Some(pos) != first_note,
-                                                        egui::Button::new("Merge ←").small(),
-                                                    )
-                                                    .on_hover_text(
-                                                        "Merge into the previous note, which keeps its pitch",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    edit = Some(Edit::MergeIntoPrevious(*index));
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        Some(pos) != last_note,
-                                                        egui::Button::new("Merge →").small(),
-                                                    )
-                                                    .on_hover_text(
-                                                        "Merge into the next note, which keeps its pitch",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    edit = Some(Edit::MergeIntoNext(*index));
-                                                }
-                                            });
-                                            ui.end_row();
-                                        }
-                                    }
-                                }
-                            });
-                    });
+                if let Some(table_edit) = notes_table(ui, take, true) {
+                    edit = Some(table_edit);
+                }
                 ui.add_space(8.0);
                 centered_row(ui, "record_export", |ui| {
                     if ui.button("Save MIDI").clicked() {
@@ -806,6 +915,26 @@ mod tests {
                 confidence: 0.95,
             })
             .collect()
+    }
+
+    /// Returns `frames` as live frames with level 0.01.
+    fn live_frames(frames: &[PitchFrame]) -> Vec<LiveFrame> {
+        frames
+            .iter()
+            .map(|frame| LiveFrame {
+                time_s: frame.time_s,
+                freq_hz: frame.freq_hz,
+                confidence: frame.confidence,
+                level: 0.01,
+            })
+            .collect()
+    }
+
+    /// Pushes `frames` as live frames into `state`.
+    fn push_live_frames(state: &mut RecordState, frames: &[PitchFrame]) {
+        for frame in live_frames(frames) {
+            state.push_live(&frame);
+        }
     }
 
     /// Runs a full recording at 120 BPM with `frames` and origin 1.0 and returns the state and the frames.
@@ -1365,5 +1494,119 @@ mod tests {
         let mut take = three_note_take();
         take.delete(1);
         assert_eq!(take_summary(Some(&take)), "2 notes at 120.0 BPM (edited)");
+    }
+
+    #[test]
+    fn live_frames_are_ignored_while_idle() {
+        let mut state = RecordState::default();
+        push_live_frames(&mut state, &tone_frames(0.0, 0.5, 440.0));
+        assert!(state.preview().is_none());
+    }
+
+    #[test]
+    fn the_preview_is_built_once_the_recording_started() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        push_live_frames(&mut state, &tone_frames(0.0, 0.05, 440.0));
+        assert!(
+            state.preview().is_none(),
+            "frames of the count-in are collected but no preview is built without an origin"
+        );
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        assert!(state.preview().is_none());
+        push_live_frames(&mut state, &tone_frames(0.05, 0.05, 440.0));
+        assert!(
+            state.preview().is_some(),
+            "the tenth collected frame builds the preview"
+        );
+    }
+
+    #[test]
+    fn a_tone_gives_a_one_note_preview_starting_at_beat_zero() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        push_live_frames(&mut state, &tone_frames(1.0, 0.6, 440.0));
+        let preview = state.preview().expect("a preview after 60 frames");
+        assert_eq!(preview.notes().len(), 1);
+        assert_eq!(preview.notes()[0].midi, 69);
+        assert_close(preview.notes()[0].start_beats, 0.0, 1e-9);
+    }
+
+    #[test]
+    fn stopping_ignores_live_frames_and_the_finish_clears_the_preview() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        push_live_frames(&mut state, &tone_frames(1.0, 0.2, 440.0));
+        assert!(state.preview().is_some());
+        assert_eq!(state.stop(), Some(EngineCommand::StopRecording));
+        push_live_frames(&mut state, &tone_frames(1.2, 0.2, 440.0));
+        let preview = state.preview().expect("the preview survives the stop");
+        assert_eq!(
+            preview.frame_count(),
+            20,
+            "frames pushed after the stop are ignored"
+        );
+        state.apply_event(&EngineEvent::RecordingFinished {
+            frames: tone_frames(1.0, 0.6, 440.0),
+            origin_s: 1.0,
+        });
+        assert!(state.is_idle());
+        assert!(state.preview().is_none(), "the finish clears the preview");
+        let take = state.take().expect("a take");
+        assert_eq!(take.frame_count(), 60);
+    }
+
+    #[test]
+    fn cancel_clears_the_preview() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        push_live_frames(&mut state, &tone_frames(1.0, 0.2, 440.0));
+        assert!(state.preview().is_some());
+        state.cancel();
+        assert!(state.is_idle());
+        assert!(state.preview().is_none());
+    }
+
+    #[test]
+    fn a_new_recording_starts_without_a_preview() {
+        let (mut state, _) = recorded_state(tone_frames(1.0, 0.6, 440.0));
+        state.start(120.0);
+        assert!(state.preview().is_none());
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 5.0 });
+        push_live_frames(&mut state, &tone_frames(5.0, 0.2, 440.0));
+        let preview = state.preview().expect("a preview");
+        assert_eq!(
+            preview.frame_count(),
+            20,
+            "only the frames of the new recording are collected"
+        );
+    }
+
+    #[test]
+    fn set_grid_requantizes_the_preview() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        let frames = tone_frames(1.0, 0.6, 440.0);
+        push_live_frames(&mut state, &frames);
+        state.set_grid(Grid::Quarter);
+        let preview = state.preview().expect("a preview");
+        let expected = quantize(
+            &segment(&frames, &SegmentConfig::default()),
+            120.0,
+            Grid::Quarter,
+            1.0,
+        );
+        assert_eq!(preview.notes(), expected.as_slice());
+    }
+
+    #[test]
+    fn preview_summary_counts_the_notes() {
+        assert_eq!(preview_summary(0), "No notes yet");
+        assert_eq!(preview_summary(1), "1 note so far");
+        assert_eq!(preview_summary(3), "3 notes so far");
     }
 }
