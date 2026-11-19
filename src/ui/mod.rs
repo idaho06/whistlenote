@@ -31,6 +31,7 @@ const DEVICE_COMBO_WIDTH: f32 = 220.0;
 
 /// Opens the main window and runs the application until the window closes.
 pub fn run() -> eframe::Result {
+    log::info!("whistlenote {} starting", env!("CARGO_PKG_VERSION"));
     let engine = Engine::spawn(CpalBackend::new());
     let app = WhistlenoteApp {
         engine,
