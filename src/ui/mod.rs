@@ -100,7 +100,7 @@ impl WhistlenoteApp {
 
             if ui
                 .button("Refresh")
-                .on_hover_text("Refresh device lists")
+                .on_hover_text("Refresh the device lists and reopen a lost input or output")
                 .clicked()
             {
                 self.send(Some(EngineCommand::RefreshDevices));

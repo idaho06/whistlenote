@@ -11,6 +11,8 @@
 //! recording is reported with its origin on the reliable event channel.
 
 use std::fmt::Display;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -138,7 +140,10 @@ pub enum EngineCommand {
         /// Latency offset in milliseconds.
         f64,
     ),
-    /// Reports the current device lists as an [`EngineEvent::Devices`] event.
+    /// Reports the current device lists as an [`EngineEvent::Devices`]
+    /// event; before the lists are emitted, a lost input is reopened while
+    /// listening and a lost output is reopened while the free-running
+    /// metronome is on.
     RefreshDevices,
     /// Stops the engine thread.
     Shutdown,
@@ -242,6 +247,9 @@ struct Worker {
 struct Input {
     /// The stream; dropping it stops the stream.
     _stream: Box<dyn AudioStream>,
+    /// Set by the stream's error sink when the stream fails; the worker
+    /// drops the stream once it sees the flag.
+    failed: Arc<AtomicBool>,
     reader: InputReader,
     pitch: PitchTracker,
     onset: OnsetDetector,
@@ -255,6 +263,9 @@ struct Input {
 struct Output {
     /// The stream; dropping it stops the stream.
     _stream: Box<dyn AudioStream>,
+    /// Set by the stream's error sink when the stream fails; the worker
+    /// drops the stream once it sees the flag.
+    failed: Arc<AtomicBool>,
     /// The handle that controls the metronome and receives its beats.
     control: MetronomeControl,
     /// Number of dropped beats already reported as an error event.
@@ -314,10 +325,14 @@ fn send_error(events: &Sender<EngineEvent>, message: impl Display) {
     let _ = events.send(EngineEvent::Error(message.to_string()));
 }
 
-/// Returns an [`ErrorSink`] that reports every stream error as an
-/// [`EngineEvent::Error`] event on `events`.
-fn error_sink(events: Sender<EngineEvent>) -> ErrorSink {
-    Box::new(move |error| send_error(&events, error))
+/// Returns an [`ErrorSink`] that sets `failed` and reports every stream
+/// error as an [`EngineEvent::Error`] event on `events`; the flag tells the
+/// worker that the stream is dead and must be dropped.
+fn error_sink(events: Sender<EngineEvent>, failed: Arc<AtomicBool>) -> ErrorSink {
+    Box::new(move |error| {
+        failed.store(true, Ordering::Relaxed);
+        send_error(&events, error);
+    })
 }
 
 /// Returns how much the counter `total` grew since `reported`, if it grew,
@@ -342,8 +357,10 @@ impl Worker {
     /// disconnected command channel.
     ///
     /// The input blocks and beats delivered before a command are processed
-    /// before it. While no stream is open the worker waits for the next
-    /// command; otherwise it parks between input blocks.
+    /// before it, and a stream whose error sink fired is dropped right after
+    /// them, so a dead stream never stays in place. While no stream is open
+    /// the worker waits for the next command; otherwise it parks between
+    /// input blocks.
     fn run(mut self) {
         self.emit_devices();
         loop {
@@ -354,6 +371,7 @@ impl Worker {
             };
             self.drain_input();
             self.drain_beats();
+            self.drop_failed_streams();
             match command {
                 Ok(command) => {
                     if self.handle(command) {
@@ -367,7 +385,10 @@ impl Worker {
         log::debug!("engine stopped");
     }
 
-    /// Handles `command`; returns true when the worker stops.
+    /// Handles `command`; returns true when the worker stops. Besides
+    /// reporting the device lists, a `RefreshDevices` reopens a lost input
+    /// while listening and a lost output while the free-running metronome
+    /// is on.
     fn handle(&mut self, command: EngineCommand) -> bool {
         log::debug!("command: {command:?}");
         match command {
@@ -419,7 +440,18 @@ impl Worker {
                     self.latency_s = ms.clamp(-200.0, 200.0) / 1000.0;
                 }
             }
-            EngineCommand::RefreshDevices => self.emit_devices(),
+            EngineCommand::RefreshDevices => {
+                // Reopen what a failure dropped, so the refresh recovers
+                // the streams that are still wanted; an open error arrives
+                // before the Devices event.
+                if self.listening && self.input.is_none() {
+                    self.open_input();
+                }
+                if self.free_enabled && self.output.is_none() {
+                    self.open_output(None);
+                }
+                self.emit_devices();
+            }
             EngineCommand::Shutdown => return true,
         }
         // The input stays open only while listening or recording.
@@ -455,7 +487,8 @@ impl Worker {
             DEFAULT_HEADER_CAPACITY,
             std::thread::current(),
         );
-        let on_error = error_sink(self.events.clone());
+        let failed = Arc::new(AtomicBool::new(false));
+        let on_error = error_sink(self.events.clone(), failed.clone());
         let stream =
             self.backend
                 .open_input(self.input_name.as_deref(), writer.into_sink(), on_error);
@@ -469,6 +502,7 @@ impl Worker {
                 let (pitch, onset) = analysers(stream.sample_rate());
                 self.input = Some(Input {
                     _stream: stream,
+                    failed,
                     reader,
                     pitch,
                     onset,
@@ -496,7 +530,8 @@ impl Worker {
         if let Some(command) = first {
             let _ = control.send(command);
         }
-        let on_error = error_sink(self.events.clone());
+        let failed = Arc::new(AtomicBool::new(false));
+        let on_error = error_sink(self.events.clone(), failed.clone());
         let stream = self
             .backend
             .open_output(self.output_name.as_deref(), source, on_error);
@@ -509,6 +544,7 @@ impl Worker {
                 );
                 self.output = Some(Output {
                     _stream: stream,
+                    failed,
                     control,
                     reported_dropped_beats: 0,
                 });
@@ -602,6 +638,33 @@ impl Worker {
         if self.recording.take().is_some() {
             log::debug!("recording discarded");
             self.send_metronome(MetronomeCommand::StopRecording);
+        }
+    }
+
+    /// Drops the streams whose error sink set their `failed` flag: a failed
+    /// input is closed after a running recording is finished, so the frames
+    /// so far are reported, and a failed output is closed the same way.
+    /// `listening` and the metronome settings stay as they are, so a refresh
+    /// reopens what was lost; errors that are not stream failures never set
+    /// a flag and never drop a stream.
+    fn drop_failed_streams(&mut self) {
+        let input_failed = self
+            .input
+            .as_ref()
+            .is_some_and(|input| input.failed.load(Ordering::Relaxed));
+        if input_failed {
+            log::warn!("input lost");
+            self.finish_recording();
+            self.input = None;
+        }
+        let output_failed = self
+            .output
+            .as_ref()
+            .is_some_and(|output| output.failed.load(Ordering::Relaxed));
+        if output_failed {
+            log::warn!("output lost");
+            self.finish_recording();
+            self.output = None;
         }
     }
 
@@ -1481,5 +1544,165 @@ mod tests {
         let count_in_start = last_count_in_start.expect("a count-in beat with index 0");
         assert_close(origin_s, count_in_start + 2.0, 1e-9);
         assert!(origin_s > 2.0, "the origin {origin_s} is not past 2.0 s");
+    }
+
+    #[test]
+    fn a_failed_input_is_dropped_and_refresh_reopens_it() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartListening);
+        wait_input_open(&handle);
+
+        handle.fail_input(AudioError::Backend("unplugged".to_string()));
+        let event = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Error(_))
+        })
+        .expect("an error event");
+        match event {
+            EngineEvent::Error(message) => assert!(message.contains("unplugged"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(
+            wait_until(Duration::from_secs(2), || handle.input_device().is_none()),
+            "the failed input is dropped"
+        );
+
+        engine.send(EngineCommand::RefreshDevices);
+        wait_input_open(&handle);
+
+        handle.push_input(&sine(440.0, 0.3, 48_000, 24_000));
+        handle.step_n(94);
+        let frame = wait_for(engine.live(), Duration::from_secs(2), |frame| {
+            frame.freq_hz.is_some()
+        })
+        .expect("a voiced live frame after the reopen");
+        let freq_hz = frame.freq_hz.expect("the frame is voiced");
+        assert!(
+            (freq_hz - 440.0).abs() / 440.0 < 0.01,
+            "{freq_hz} Hz instead of 440 Hz"
+        );
+    }
+
+    #[test]
+    fn a_failed_input_ends_a_running_recording() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+
+        handle.push_input(&vec![0.0_f32; 96_000]); // 2 s of silence
+        handle.push_input(&sine(1046.5, 0.3, 48_000, 96_000));
+        handle.step_n(750); // 4 s
+        assert_close(wait_started(&engine), 2.0, 1e-9);
+        sync(&engine); // the queued input is drained before the failure
+
+        // No StopRecording: the failed input ends the recording by itself.
+        handle.fail_input(AudioError::Backend("gone".to_string()));
+        let (frames, origin_s) = wait_finished(&engine);
+        assert_close(origin_s, 2.0, 1e-9);
+        assert!(
+            !frames.is_empty(),
+            "the recording reports the frames so far"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || handle.input_device().is_none()),
+            "the failed input is dropped"
+        );
+    }
+
+    #[test]
+    fn a_failed_output_is_dropped_and_refresh_reopens_it_while_the_metronome_runs() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        wait_output_open(&handle);
+
+        handle.fail_output(AudioError::Backend("gone".to_string()));
+        let event = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::Error(_))
+        })
+        .expect("an error event");
+        match event {
+            EngineEvent::Error(message) => assert!(message.contains("gone"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(
+            wait_until(Duration::from_secs(2), || handle.output_device().is_none()),
+            "the failed output is dropped"
+        );
+
+        engine.send(EngineCommand::RefreshDevices);
+        wait_output_open(&handle);
+    }
+
+    #[test]
+    fn refresh_does_not_open_streams_that_are_not_wanted() {
+        let (engine, handle) = spawn_engine();
+        let seen = sync(&engine);
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Error(_))),
+            "an Error arrived on a plain refresh: {seen:?}"
+        );
+        assert_eq!(handle.input_device(), None);
+        assert_eq!(handle.output_device(), None);
+    }
+
+    #[test]
+    fn drop_failed_streams_only_drops_flagged_streams() {
+        let (backend, handle) = fake_backend(FakeConfig::default());
+        let (_commands, command_rx) = unbounded();
+        let (live, _live_rx) = bounded(LIVE_CAPACITY);
+        let (events, _event_rx) = unbounded();
+        let mut worker = Worker {
+            backend: Box::new(backend),
+            commands: command_rx,
+            live,
+            events,
+            input_name: None,
+            listening: true,
+            input: None,
+            output_name: None,
+            free_bpm: 120.0,
+            free_enabled: false,
+            output: None,
+            latency_s: 0.0,
+            recording: None,
+        };
+        worker.open_input();
+        worker.free_enabled = true;
+        worker.open_output(None);
+        assert!(worker.input.is_some(), "the input opened");
+        assert!(worker.output.is_some(), "the output opened");
+
+        // Errors that are not stream failures set no flag, so the streams
+        // stay open.
+        worker.drop_failed_streams();
+        assert!(worker.input.is_some(), "an unset flag keeps the input");
+        assert!(worker.output.is_some(), "an unset flag keeps the output");
+        assert_eq!(handle.input_device().as_deref(), Some("Fake Microphone"));
+        assert_eq!(handle.output_device().as_deref(), Some("Fake Speakers"));
+
+        worker
+            .input
+            .as_ref()
+            .expect("the input is open")
+            .failed
+            .store(true, Ordering::Relaxed);
+        worker
+            .output
+            .as_ref()
+            .expect("the output is open")
+            .failed
+            .store(true, Ordering::Relaxed);
+        worker.drop_failed_streams();
+        assert!(worker.input.is_none(), "a set flag drops the input");
+        assert!(worker.output.is_none(), "a set flag drops the output");
+        assert_eq!(handle.input_device(), None);
+        assert_eq!(handle.output_device(), None);
     }
 }
