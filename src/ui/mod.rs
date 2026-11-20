@@ -24,11 +24,11 @@ use std::time::Duration;
 use eframe::egui;
 
 use self::prefs::PrefsWindow;
-use self::state::{AppState, MAX_LATENCY_MS, Tab, rate_label};
+use self::state::{AppState, Tab, rate_label};
 use crate::audio::cpal_backend::CpalBackend;
 use crate::dsp::pitch::LOW_RATE_HZ;
 use crate::engine::{Engine, EngineCommand};
-use crate::settings::{Settings, Tuning, VERSION};
+use crate::settings::{self, Settings, Tuning};
 
 /// Repaint interval while the engine listens.
 const REPAINT_LISTENING: Duration = Duration::from_millis(16);
@@ -51,7 +51,7 @@ pub(crate) const GOOD_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 180, 75
 pub fn run() -> eframe::Result {
     log::info!("whistlenote {} starting", env!("CARGO_PKG_VERSION"));
     let engine = Engine::spawn(CpalBackend::new());
-    let settings_path = crate::settings::default_path();
+    let settings_path = settings::default_path();
     let (settings, warning) = match settings_path.as_deref() {
         Some(path) => Settings::load_from(path),
         None => {
@@ -97,12 +97,7 @@ fn initial_state(settings: &Settings, warning: Option<String>) -> AppState {
 /// Returns the settings written on exit: the session of `state` and the tuning
 /// last loaded or saved, sanitized.
 fn exit_settings(state: &AppState, saved_tuning: &Tuning) -> Settings {
-    Settings {
-        version: VERSION,
-        session: state.session(),
-        tuning: saved_tuning.clone(),
-    }
-    .sanitized()
+    Settings::new(state.session(), saved_tuning.clone())
 }
 
 /// The application: the engine handle and the state the views share.
@@ -167,7 +162,7 @@ impl WhistlenoteApp {
             let mut ms = self.state.latency_ms();
             ui.add(
                 egui::DragValue::new(&mut ms)
-                    .range(-MAX_LATENCY_MS..=MAX_LATENCY_MS)
+                    .range(settings::range::LATENCY_MS)
                     .suffix(" ms"),
             );
             let command = self.state.set_latency_ms(ms);

@@ -3,7 +3,7 @@
 use crate::export::csv::to_csv_at;
 use crate::export::midi::{MidiOptions, to_midi_bytes_with};
 use crate::music::quantize::{Grid, MIN_LENGTH_B, QuantNote, quantize_indexed, step_beats};
-use crate::music::segment::{PitchFrame, RawNote, SegmentConfig, segment};
+use crate::music::segment::{self, PitchFrame, RawNote, SegmentConfig};
 
 /// A finished recording: its frames and the notes quantized from them, editable before export.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,7 +42,7 @@ impl Take {
         segment: SegmentConfig,
         midi: MidiOptions,
     ) -> Self {
-        let raw = crate::music::segment::segment(&frames, &segment);
+        let raw = segment::segment(&frames, &segment);
         let edited = raw.clone();
         let mut take = Self {
             frames,
@@ -176,14 +176,12 @@ impl Take {
         self.shift_beats
     }
 
-    /// Stores `s` as the short-note threshold of the segmentation config, re-segments `frames` with the config, resets the edits and requantizes; a non-finite or negative `s` is ignored.
+    /// Stores `s` as the short-note threshold of the segmentation config as [`Take::set_segment_config`] does: re-segments `frames`, resets the edits and requantizes; a non-finite or negative `s` is ignored.
     pub fn set_merge_note_s(&mut self, s: f64) {
-        if !s.is_finite() || s < 0.0 {
-            return;
-        }
-        self.segment.merge_note_s = s;
-        self.raw = segment(&self.frames, &self.segment);
-        self.reset_edits();
+        self.set_segment_config(SegmentConfig {
+            merge_note_s: s,
+            ..self.segment
+        });
     }
 
     /// Returns the short-note threshold of the segmentation config.
@@ -204,7 +202,7 @@ impl Take {
         if !seconds_valid || !segment.a4_hz.is_finite() || segment.a4_hz <= 0.0 {
             return;
         }
-        self.raw = crate::music::segment::segment(&self.frames, &segment);
+        self.raw = segment::segment(&self.frames, &segment);
         self.segment = segment;
         self.reset_edits();
     }

@@ -6,7 +6,7 @@ use std::path::Path;
 use eframe::egui;
 
 use crate::settings::range as r;
-use crate::settings::{Settings, Tuning, VERSION};
+use crate::settings::{Settings, Tuning};
 use crate::ui::record_mode::Take;
 use crate::ui::state::AppState;
 
@@ -87,8 +87,6 @@ const SECTION_GAP: f32 = 16.0;
 /// A button of the preferences window clicked in one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
-    /// No button was clicked.
-    None,
     /// "Defaults" resets the values of the current section.
     Defaults,
     /// "Restore all" resets the values of every section.
@@ -161,12 +159,15 @@ impl PrefsWindow {
         if !self.open {
             return;
         }
-        if state.tuning() != &self.original {
-            state.apply_tuning(&self.original);
-        }
+        state.apply_tuning(&self.original);
         if let Some((generation, take)) = self.snapshot.take() {
             state.record.restore_take(generation, take);
         }
+        self.close();
+    }
+
+    /// Closes the window and drops the take snapshot and the save error.
+    fn close(&mut self) {
         self.open = false;
         self.snapshot = None;
         self.save_error = None;
@@ -201,20 +202,11 @@ impl PrefsWindow {
             );
             return None;
         };
-        let settings = Settings {
-            version: VERSION,
-            session: state.session(),
-            tuning: self.draft.clone(),
-        }
-        .sanitized();
+        let settings = Settings::new(state.session(), self.draft.clone());
         match settings.save_to(path) {
             Ok(()) => {
-                if state.tuning() != &settings.tuning {
-                    state.apply_tuning(&settings.tuning);
-                }
-                self.open = false;
-                self.snapshot = None;
-                self.save_error = None;
+                state.apply_tuning(&settings.tuning);
+                self.close();
                 Some(settings.tuning)
             }
             Err(error) => {
@@ -237,8 +229,7 @@ impl PrefsWindow {
         let recording = !state.record.is_idle();
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape))
             && ctx.memory(|m| m.focused().is_none());
-        let save_error = self.save_error().map(str::to_string);
-        let mut action = Action::None;
+        let mut action = None;
         egui::Window::new("Preferences")
             .collapsible(false)
             .resizable(true)
@@ -246,12 +237,12 @@ impl PrefsWindow {
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
-                        for &section in &Section::ALL {
+                        for section in Section::ALL {
                             if ui
                                 .selectable_label(self.section == section, section.label())
                                 .clicked()
                             {
-                                self.set_section(section);
+                                self.section = section;
                             }
                         }
                     });
@@ -261,76 +252,53 @@ impl PrefsWindow {
                     ui.vertical(|ui| self.section_ui(ui, recording));
                 });
                 ui.separator();
-                ui.horizontal_top(|ui| {
-                    if ui
-                        .button("Defaults")
-                        .on_hover_text("Resets the values of this section")
-                        .clicked()
-                    {
-                        action = Action::Defaults;
-                    }
-                    if ui
-                        .button("Restore all")
-                        .on_hover_text("Resets the values of every section")
-                        .clicked()
-                    {
-                        action = Action::RestoreAll;
-                    }
-                    // One button high: a layout that takes the window's full
-                    // height makes the resizable window grow every frame.
-                    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-                    let layout = egui::Layout::right_to_left(egui::Align::Center);
-                    ui.allocate_ui_with_layout(size, layout, |ui| {
-                        if ui
-                            .button("Save")
-                            .on_hover_text("Saves the values and closes the window")
-                            .clicked()
-                        {
-                            action = Action::Save;
-                        }
-                        if ui
-                            .button("Cancel")
-                            .on_hover_text(
-                                "Restores the values the window opened with and closes it",
-                            )
-                            .clicked()
-                        {
-                            action = Action::Cancel;
-                        }
-                    });
-                });
+                let (left, right) = egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        let defaults = button(ui, "Defaults", "Resets the values of this section");
+                        let all = button(ui, "Restore all", "Resets the values of every section");
+                        clicked(&[(defaults, Action::Defaults), (all, Action::RestoreAll)])
+                    },
+                    |ui| {
+                        let save = button(ui, "Save", "Saves the values and closes the window");
+                        let cancel = button(
+                            ui,
+                            "Cancel",
+                            "Restores the values the window opened with and closes it",
+                        );
+                        clicked(&[(save, Action::Save), (cancel, Action::Cancel)])
+                    },
+                );
+                action = left.or(right);
                 if let Some(path) = path {
                     ui.weak(format!("Settings file: {}", path.display()));
                 } else {
                     ui.weak("No configuration directory is available");
                 }
-                if let Some(error) = &save_error {
-                    let color = ui.visuals().error_fg_color;
-                    ui.colored_label(color, error);
+                if let Some(error) = &self.save_error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
                 }
             });
         if escape {
-            action = Action::Cancel;
+            action = Some(Action::Cancel);
         }
         let saved = match action {
-            Action::Cancel => {
+            Some(Action::Cancel) => {
                 self.cancel(state);
                 None
             }
-            Action::Save => self.save(state, path),
-            Action::Defaults => {
+            Some(Action::Save) => self.save(state, path),
+            Some(Action::Defaults) => {
                 self.reset_section();
                 None
             }
-            Action::RestoreAll => {
+            Some(Action::RestoreAll) => {
                 self.restore_all();
                 None
             }
-            Action::None => None,
+            None => None,
         };
-        if self.open {
-            self.apply(state);
-        }
+        self.apply(state);
         saved
     }
 
@@ -339,253 +307,11 @@ impl PrefsWindow {
         let section = self.section;
         let label = section.label();
         ui.heading(label);
-        let draft = &mut self.draft;
         egui::Grid::new(("prefs_basic", label))
             .num_columns(2)
             .striped(true)
-            .show(ui, |ui| match section {
-                Section::Tuning => {
-                    drag_row(
-                        ui,
-                        "A4 reference",
-                        egui::DragValue::new(&mut draft.voicing.a4_hz)
-                            .range(r::A4_HZ)
-                            .speed(0.1)
-                            .fixed_decimals(1)
-                            .suffix(" Hz"),
-                        "Pitch of A4. Note names, cents and the CSV frequencies follow it; MIDI files store note numbers, which a player plays in its own tuning.",
-                    );
-                    drag_row(
-                        ui,
-                        "Voiced confidence",
-                        egui::DragValue::new(&mut draft.voicing.min_confidence)
-                            .range(r::MIN_CONFIDENCE)
-                            .speed(0.01)
-                            .fixed_decimals(2),
-                        "How sure the pitch tracker must be for a frame to count as part of a note; higher drops doubtful frames.",
-                    );
-                }
-                Section::Pitch => {
-                    drag_row(
-                        ui,
-                        "Silence level",
-                        egui::DragValue::new(&mut draft.pitch.silence_dbfs)
-                            .range(r::SILENCE_DBFS)
-                            .speed(0.5)
-                            .fixed_decimals(0)
-                            .suffix(" dBFS"),
-                        "Quieter input counts as silence.",
-                    );
-                    drag_row(
-                        ui,
-                        "Clarity",
-                        egui::DragValue::new(&mut draft.pitch.clarity)
-                            .range(r::CLARITY)
-                            .speed(0.01)
-                            .fixed_decimals(2),
-                        "How clear a pitch must be to be tracked; higher ignores breathy sounds.",
-                    );
-                    let range =
-                        within(r::MIN_HZ, draft.pitch.band_low_hz + 1.0, draft.pitch.max_hz - 1.0);
-                    drag_row(
-                        ui,
-                        "Lowest pitch",
-                        egui::DragValue::new(&mut draft.pitch.min_hz)
-                            .range(range)
-                            .speed(5.0)
-                            .fixed_decimals(0)
-                            .suffix(" Hz"),
-                        "Lower pitches are ignored.",
-                    );
-                    let range =
-                        within(r::MAX_HZ, draft.pitch.min_hz + 1.0, draft.pitch.band_high_hz);
-                    drag_row(
-                        ui,
-                        "Highest pitch",
-                        egui::DragValue::new(&mut draft.pitch.max_hz)
-                            .range(range)
-                            .speed(5.0)
-                            .fixed_decimals(0)
-                            .suffix(" Hz"),
-                        "Higher pitches are ignored; the tracker also stays below a quarter of the input sample rate.",
-                    );
-                }
-                Section::Onsets => {
-                    drag_row(
-                        ui,
-                        "Clap gate",
-                        egui::DragValue::new(&mut draft.onsets.gate_dbfs)
-                            .range(r::GATE_DBFS)
-                            .speed(0.5)
-                            .fixed_decimals(0)
-                            .suffix(" dBFS"),
-                        "Quieter claps are ignored.",
-                    );
-                    drag_row(
-                        ui,
-                        "Sensitivity offset",
-                        egui::DragValue::new(&mut draft.onsets.threshold)
-                            .range(r::THRESHOLD)
-                            .speed(0.01)
-                            .fixed_decimals(2),
-                        "How far a clap must rise above the recent sound; lower detects softer claps and more false ones.",
-                    );
-                    drag_row(
-                        ui,
-                        "Time between claps",
-                        egui::DragValue::new(&mut draft.onsets.refractory_ms)
-                            .range(r::REFRACTORY_MS)
-                            .speed(1.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "A clap sooner than this after the previous one is ignored.",
-                    );
-                }
-                Section::Notes => {
-                    drag_row(
-                        ui,
-                        "Shortest note",
-                        egui::DragValue::new(&mut draft.notes.min_note_ms)
-                            .range(r::MIN_NOTE_MS)
-                            .speed(1.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "Shorter notes are dropped.",
-                    );
-                    drag_row(
-                        ui,
-                        "Median smoothing",
-                        egui::DragValue::new(&mut draft.notes.median_frames)
-                            .range(r::MEDIAN_FRAMES)
-                            .speed(0.1)
-                            .fixed_decimals(0)
-                            .suffix(" frames"),
-                        "Smooths the pitch over this many frames; higher steadies wobbly notes and blurs fast ones.",
-                    );
-                    drag_row(
-                        ui,
-                        "Join gap",
-                        egui::DragValue::new(&mut draft.notes.max_gap_ms)
-                            .range(r::MAX_GAP_MS)
-                            .speed(1.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "Two equal notes with a shorter gap between them join into one.",
-                    );
-                    drag_row(
-                        ui,
-                        "Merge short notes",
-                        egui::DragValue::new(&mut draft.notes.merge_note_ms)
-                            .range(r::MERGE_NOTE_MS)
-                            .speed(1.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "Shorter notes that touch a neighbour merge into it.",
-                    );
-                }
-                Section::Timing => {
-                    drag_row(
-                        ui,
-                        "Pre-roll",
-                        egui::DragValue::new(&mut draft.timing.pre_roll_ms)
-                            .range(r::PRE_ROLL_MS)
-                            .speed(1.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "How much audio before the first beat a recording keeps, so a note started slightly early is not cut.",
-                    );
-                }
-                Section::Metronome => {
-                    drag_row(
-                        ui,
-                        "Click volume",
-                        egui::DragValue::new(&mut draft.metronome.volume_percent)
-                            .range(r::VOLUME_PERCENT)
-                            .speed(0.5)
-                            .fixed_decimals(0)
-                            .suffix(" %"),
-                        "Volume of the metronome click.",
-                    );
-                }
-                Section::Tempo => {
-                    drag_row(
-                        ui,
-                        "Claps used",
-                        egui::DragValue::new(&mut draft.tempo.onset_window)
-                            .range(r::ONSET_WINDOW)
-                            .speed(0.1)
-                            .fixed_decimals(0)
-                            .suffix(" claps"),
-                        "The tempo is estimated from this many most recent claps.",
-                    );
-                    drag_row(
-                        ui,
-                        "New run after",
-                        egui::DragValue::new(&mut draft.tempo.run_gap_ms)
-                            .range(r::RUN_GAP_MS)
-                            .speed(10.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "A pause longer than this starts a new tempo estimate.",
-                    );
-                }
-                Section::Live => {
-                    drag_row(
-                        ui,
-                        "Agreeing frames",
-                        egui::DragValue::new(&mut draft.live.agree_frames)
-                            .range(r::AGREE_FRAMES)
-                            .speed(0.1)
-                            .fixed_decimals(0)
-                            .suffix(" frames"),
-                        "Frames in a row that must agree before a new note is shown; higher is steadier and slower.",
-                    );
-                    drag_row(
-                        ui,
-                        "Clear after",
-                        egui::DragValue::new(&mut draft.live.clear_ms)
-                            .range(r::CLEAR_MS)
-                            .speed(5.0)
-                            .fixed_decimals(0)
-                            .suffix(" ms"),
-                        "The shown note clears after this much silence.",
-                    );
-                    drag_row(
-                        ui,
-                        "In-tune band",
-                        egui::DragValue::new(&mut draft.live.in_tune_cents)
-                            .range(r::IN_TUNE_CENTS)
-                            .speed(0.1)
-                            .fixed_decimals(0)
-                            .suffix(" cents"),
-                        "The needle shows in tune within this many cents.",
-                    );
-                }
-                Section::Export => {
-                    drag_row(
-                        ui,
-                        "MIDI velocity",
-                        egui::DragValue::new(&mut draft.export.velocity)
-                            .range(r::VELOCITY)
-                            .speed(0.1)
-                            .fixed_decimals(0),
-                        "Velocity of the exported notes.",
-                    );
-                    drag_row(
-                        ui,
-                        "MIDI channel",
-                        egui::DragValue::new(&mut draft.export.channel)
-                            .range(r::CHANNEL)
-                            .speed(0.1)
-                            .fixed_decimals(0),
-                        "Channel of the exported notes; channel 10 plays drums on General MIDI players.",
-                    );
-                }
-            });
-        if matches!(
-            section,
-            Section::Pitch | Section::Onsets | Section::Metronome | Section::Tempo | Section::Live
-        ) {
+            .show(ui, |ui| basic_rows(ui, section, &mut self.draft));
+        if let Some(rows) = advanced_rows(section) {
             egui::CollapsingHeader::new("Advanced")
                 .id_salt(("prefs_advanced", label))
                 .default_open(false)
@@ -593,125 +319,7 @@ impl PrefsWindow {
                     egui::Grid::new(("prefs_advanced_rows", label))
                         .num_columns(2)
                         .striped(true)
-                        .show(ui, |ui| match section {
-                            Section::Pitch => {
-                                let range =
-                                    within(r::BAND_LOW_HZ, f64::MIN, draft.pitch.min_hz - 1.0);
-                                drag_row(
-                                    ui,
-                                    "Band-pass low edge",
-                                    egui::DragValue::new(&mut draft.pitch.band_low_hz)
-                                        .range(range)
-                                        .speed(5.0)
-                                        .fixed_decimals(0)
-                                        .suffix(" Hz"),
-                                    "The input is filtered to this band before pitch tracking.",
-                                );
-                                let range =
-                                    within(r::BAND_HIGH_HZ, draft.pitch.max_hz, f64::MAX);
-                                drag_row(
-                                    ui,
-                                    "Band-pass high edge",
-                                    egui::DragValue::new(&mut draft.pitch.band_high_hz)
-                                        .range(range)
-                                        .speed(5.0)
-                                        .fixed_decimals(0)
-                                        .suffix(" Hz"),
-                                    "The input is filtered to this band before pitch tracking.",
-                                );
-                            }
-                            Section::Onsets => {
-                                drag_row(
-                                    ui,
-                                    "High-pass cutoff",
-                                    egui::DragValue::new(&mut draft.onsets.high_pass_hz)
-                                        .range(r::HIGH_PASS_HZ)
-                                        .speed(5.0)
-                                        .fixed_decimals(0)
-                                        .suffix(" Hz"),
-                                    "Clap detection listens above this frequency.",
-                                );
-                                drag_row(
-                                    ui,
-                                    "Flux history",
-                                    egui::DragValue::new(&mut draft.onsets.history_ms)
-                                        .range(r::HISTORY_MS)
-                                        .speed(5.0)
-                                        .fixed_decimals(0)
-                                        .suffix(" ms"),
-                                    "How much recent sound the sensitivity offset is measured against.",
-                                );
-                            }
-                            Section::Metronome => {
-                                drag_row(
-                                    ui,
-                                    "Accent pitch",
-                                    egui::DragValue::new(&mut draft.metronome.accent_hz)
-                                        .range(r::CLICK_HZ)
-                                        .speed(5.0)
-                                        .fixed_decimals(0)
-                                        .suffix(" Hz"),
-                                    "Pitch of the first click of a bar.",
-                                );
-                                drag_row(
-                                    ui,
-                                    "Beat pitch",
-                                    egui::DragValue::new(&mut draft.metronome.beat_hz)
-                                        .range(r::CLICK_HZ)
-                                        .speed(5.0)
-                                        .fixed_decimals(0)
-                                        .suffix(" Hz"),
-                                    "Pitch of the other clicks.",
-                                );
-                            }
-                            Section::Tempo => {
-                                let range = within(r::MIN_BPM, f64::MIN, draft.tempo.max_bpm / 2.0);
-                                drag_row(
-                                    ui,
-                                    "Slowest tempo",
-                                    egui::DragValue::new(&mut draft.tempo.min_bpm)
-                                        .range(range)
-                                        .speed(0.5)
-                                        .fixed_decimals(0)
-                                        .suffix(" BPM"),
-                                    "Tempos are reported between the slowest and the fastest tempo; the fastest is at least twice the slowest.",
-                                );
-                                let range = within(r::MAX_BPM, draft.tempo.min_bpm * 2.0, f64::MAX);
-                                drag_row(
-                                    ui,
-                                    "Fastest tempo",
-                                    egui::DragValue::new(&mut draft.tempo.max_bpm)
-                                        .range(range)
-                                        .speed(0.5)
-                                        .fixed_decimals(0)
-                                        .suffix(" BPM"),
-                                    "Tempos are reported between the slowest and the fastest tempo; the fastest is at least twice the slowest.",
-                                );
-                            }
-                            Section::Live => {
-                                drag_row(
-                                    ui,
-                                    "Hold range",
-                                    egui::DragValue::new(&mut draft.live.hold_cents)
-                                        .range(r::HOLD_CENTS)
-                                        .speed(0.5)
-                                        .fixed_decimals(0)
-                                        .suffix(" cents"),
-                                    "The shown note stays while the pitch is within this many cents of it.",
-                                );
-                                drag_row(
-                                    ui,
-                                    "Level meter floor",
-                                    egui::DragValue::new(&mut draft.live.level_floor_db)
-                                        .range(r::LEVEL_FLOOR_DB)
-                                        .speed(0.5)
-                                        .fixed_decimals(0)
-                                        .suffix(" dB"),
-                                    "Bottom of the input level meter.",
-                                );
-                            }
-                            _ => {}
-                        });
+                        .show(ui, |ui| rows(ui, &mut self.draft));
                 });
         }
         if matches!(section, Section::Tuning | Section::Notes) {
@@ -725,11 +333,290 @@ impl PrefsWindow {
     }
 }
 
-/// Returns `range` narrowed to the bounds `low` and `high` without inverting it: the start is the larger of the range start and `low`, and the end is the larger of that start and the smaller of the range end and `high`, so crossed bounds give a one-point range.
-fn within(range: RangeInclusive<f64>, low: f64, high: f64) -> RangeInclusive<f64> {
-    let start = range.start().max(low);
-    let end = start.max(range.end().min(high));
-    start..=end
+/// Hover text shared by the two band-pass edges.
+const BAND_HOVER: &str = "The input is filtered to this band before pitch tracking.";
+
+/// Hover text shared by the two tempo limits.
+const TEMPO_HOVER: &str = "Tempos are reported between the slowest and the fastest tempo; the fastest is at least twice the slowest.";
+
+/// Draws the basic rows of `section`, editing the tuning `d`.
+fn basic_rows(ui: &mut egui::Ui, section: Section, d: &mut Tuning) {
+    match section {
+        Section::Tuning => {
+            let v = &mut d.voicing;
+            drag_row(
+                ui,
+                "A4 reference",
+                num(&mut v.a4_hz, r::A4_HZ, 0.1, 1, " Hz"),
+                "Pitch of A4. Note names, cents and the CSV frequencies follow it; MIDI files store note numbers, which a player plays in its own tuning.",
+            );
+            drag_row(
+                ui,
+                "Voiced confidence",
+                num(&mut v.min_confidence, r::MIN_CONFIDENCE, 0.01, 2, ""),
+                "How sure the pitch tracker must be for a frame to count as part of a note; higher drops doubtful frames.",
+            );
+        }
+        Section::Pitch => {
+            let p = &mut d.pitch;
+            drag_row(
+                ui,
+                "Silence level",
+                num(&mut p.silence_dbfs, r::SILENCE_DBFS, 0.5, 0, " dBFS"),
+                "Quieter input counts as silence.",
+            );
+            drag_row(
+                ui,
+                "Clarity",
+                num(&mut p.clarity, r::CLARITY, 0.01, 2, ""),
+                "How clear a pitch must be to be tracked; higher ignores breathy sounds.",
+            );
+            let range = p.min_hz_range();
+            drag_row(
+                ui,
+                "Lowest pitch",
+                num(&mut p.min_hz, range, 5.0, 0, " Hz"),
+                "Lower pitches are ignored.",
+            );
+            let range = p.max_hz_range();
+            drag_row(
+                ui,
+                "Highest pitch",
+                num(&mut p.max_hz, range, 5.0, 0, " Hz"),
+                "Higher pitches are ignored; the tracker also stays below a quarter of the input sample rate.",
+            );
+        }
+        Section::Onsets => {
+            let o = &mut d.onsets;
+            drag_row(
+                ui,
+                "Clap gate",
+                num(&mut o.gate_dbfs, r::GATE_DBFS, 0.5, 0, " dBFS"),
+                "Quieter claps are ignored.",
+            );
+            drag_row(
+                ui,
+                "Sensitivity offset",
+                num(&mut o.threshold, r::THRESHOLD, 0.01, 2, ""),
+                "How far a clap must rise above the recent sound; lower detects softer claps and more false ones.",
+            );
+            drag_row(
+                ui,
+                "Time between claps",
+                num(&mut o.refractory_ms, r::REFRACTORY_MS, 1.0, 0, " ms"),
+                "A clap sooner than this after the previous one is ignored.",
+            );
+        }
+        Section::Notes => {
+            let n = &mut d.notes;
+            drag_row(
+                ui,
+                "Shortest note",
+                num(&mut n.min_note_ms, r::MIN_NOTE_MS, 1.0, 0, " ms"),
+                "Shorter notes are dropped.",
+            );
+            drag_row(
+                ui,
+                "Median smoothing",
+                count(&mut n.median_frames, r::MEDIAN_FRAMES, " frames"),
+                "Smooths the pitch over this many frames; higher steadies wobbly notes and blurs fast ones.",
+            );
+            drag_row(
+                ui,
+                "Join gap",
+                num(&mut n.max_gap_ms, r::MAX_GAP_MS, 1.0, 0, " ms"),
+                "Two equal notes with a shorter gap between them join into one.",
+            );
+            drag_row(
+                ui,
+                "Merge short notes",
+                num(&mut n.merge_note_ms, r::MERGE_NOTE_MS, 1.0, 0, " ms"),
+                "Shorter notes that touch a neighbour merge into it.",
+            );
+        }
+        Section::Timing => drag_row(
+            ui,
+            "Pre-roll",
+            num(&mut d.timing.pre_roll_ms, r::PRE_ROLL_MS, 1.0, 0, " ms"),
+            "How much audio before the first beat a recording keeps, so a note started slightly early is not cut.",
+        ),
+        Section::Metronome => drag_row(
+            ui,
+            "Click volume",
+            num(
+                &mut d.metronome.volume_percent,
+                r::VOLUME_PERCENT,
+                0.5,
+                0,
+                " %",
+            ),
+            "Volume of the metronome click.",
+        ),
+        Section::Tempo => {
+            let t = &mut d.tempo;
+            drag_row(
+                ui,
+                "Claps used",
+                count(&mut t.onset_window, r::ONSET_WINDOW, " claps"),
+                "The tempo is estimated from this many most recent claps.",
+            );
+            drag_row(
+                ui,
+                "New run after",
+                num(&mut t.run_gap_ms, r::RUN_GAP_MS, 10.0, 0, " ms"),
+                "A pause longer than this starts a new tempo estimate.",
+            );
+        }
+        Section::Live => {
+            let l = &mut d.live;
+            drag_row(
+                ui,
+                "Agreeing frames",
+                count(&mut l.agree_frames, r::AGREE_FRAMES, " frames"),
+                "Frames in a row that must agree before a new note is shown; higher is steadier and slower.",
+            );
+            drag_row(
+                ui,
+                "Clear after",
+                num(&mut l.clear_ms, r::CLEAR_MS, 5.0, 0, " ms"),
+                "The shown note clears after this much silence.",
+            );
+            drag_row(
+                ui,
+                "In-tune band",
+                num(&mut l.in_tune_cents, r::IN_TUNE_CENTS, 0.1, 0, " cents"),
+                "The needle shows in tune within this many cents.",
+            );
+        }
+        Section::Export => {
+            let e = &mut d.export;
+            drag_row(
+                ui,
+                "MIDI velocity",
+                count(&mut e.velocity, r::VELOCITY, ""),
+                "Velocity of the exported notes.",
+            );
+            drag_row(
+                ui,
+                "MIDI channel",
+                count(&mut e.channel, r::CHANNEL, ""),
+                "Channel of the exported notes; channel 10 plays drums on General MIDI players.",
+            );
+        }
+    }
+}
+
+/// Returns the function that draws the Advanced rows of `section`, editing the tuning, or `None` for a section without an Advanced area.
+fn advanced_rows(section: Section) -> Option<fn(&mut egui::Ui, &mut Tuning)> {
+    match section {
+        Section::Pitch => Some(|ui, d| {
+            let p = &mut d.pitch;
+            let range = p.band_low_hz_range();
+            drag_row(
+                ui,
+                "Band-pass low edge",
+                num(&mut p.band_low_hz, range, 5.0, 0, " Hz"),
+                BAND_HOVER,
+            );
+            let range = p.band_high_hz_range();
+            drag_row(
+                ui,
+                "Band-pass high edge",
+                num(&mut p.band_high_hz, range, 5.0, 0, " Hz"),
+                BAND_HOVER,
+            );
+        }),
+        Section::Onsets => Some(|ui, d| {
+            let o = &mut d.onsets;
+            drag_row(
+                ui,
+                "High-pass cutoff",
+                num(&mut o.high_pass_hz, r::HIGH_PASS_HZ, 5.0, 0, " Hz"),
+                "Clap detection listens above this frequency.",
+            );
+            drag_row(
+                ui,
+                "Flux history",
+                num(&mut o.history_ms, r::HISTORY_MS, 5.0, 0, " ms"),
+                "How much recent sound the sensitivity offset is measured against.",
+            );
+        }),
+        Section::Metronome => Some(|ui, d| {
+            let m = &mut d.metronome;
+            drag_row(
+                ui,
+                "Accent pitch",
+                num(&mut m.accent_hz, r::CLICK_HZ, 5.0, 0, " Hz"),
+                "Pitch of the first click of a bar.",
+            );
+            drag_row(
+                ui,
+                "Beat pitch",
+                num(&mut m.beat_hz, r::CLICK_HZ, 5.0, 0, " Hz"),
+                "Pitch of the other clicks.",
+            );
+        }),
+        Section::Tempo => Some(|ui, d| {
+            let t = &mut d.tempo;
+            let range = t.min_bpm_range();
+            drag_row(
+                ui,
+                "Slowest tempo",
+                num(&mut t.min_bpm, range, 0.5, 0, " BPM"),
+                TEMPO_HOVER,
+            );
+            let range = t.max_bpm_range();
+            drag_row(
+                ui,
+                "Fastest tempo",
+                num(&mut t.max_bpm, range, 0.5, 0, " BPM"),
+                TEMPO_HOVER,
+            );
+        }),
+        Section::Live => Some(|ui, d| {
+            let l = &mut d.live;
+            drag_row(
+                ui,
+                "Hold range",
+                num(&mut l.hold_cents, r::HOLD_CENTS, 0.5, 0, " cents"),
+                "The shown note stays while the pitch is within this many cents of it.",
+            );
+            drag_row(
+                ui,
+                "Level meter floor",
+                num(&mut l.level_floor_db, r::LEVEL_FLOOR_DB, 0.5, 0, " dB"),
+                "Bottom of the input level meter.",
+            );
+        }),
+        Section::Tuning | Section::Notes | Section::Timing | Section::Export => None,
+    }
+}
+
+/// Returns a drag value for `value` within `range`, changing by `speed` per dragged point and shown with `decimals` decimals and `suffix`.
+fn num<'a>(
+    value: &'a mut f64,
+    range: RangeInclusive<f64>,
+    speed: f64,
+    decimals: usize,
+    suffix: &'static str,
+) -> egui::DragValue<'a> {
+    egui::DragValue::new(value)
+        .range(range)
+        .speed(speed)
+        .fixed_decimals(decimals)
+        .suffix(suffix)
+}
+
+/// Returns a drag value for the whole number `value` within `range`, shown with `suffix`.
+fn count<'a>(
+    value: &'a mut u32,
+    range: RangeInclusive<u32>,
+    suffix: &'static str,
+) -> egui::DragValue<'a> {
+    egui::DragValue::new(value)
+        .range(range)
+        .speed(0.1)
+        .suffix(suffix)
 }
 
 /// Draws one row of a settings grid: `label` in the first column and the `drag` value in the second column, both with `hover` as their hover text, then ends the row.
@@ -739,14 +626,27 @@ fn drag_row(ui: &mut egui::Ui, label: &str, drag: egui::DragValue<'_>, hover: &s
     ui.end_row();
 }
 
+/// Returns the action of the first clicked button among `buttons`, each a click flag with its action.
+fn clicked(buttons: &[(bool, Action)]) -> Option<Action> {
+    buttons
+        .iter()
+        .find_map(|&(clicked, action)| clicked.then_some(action))
+}
+
+/// Draws a button with `hover` as its hover text and returns whether it was clicked.
+fn button(ui: &mut egui::Ui, label: &str, hover: &str) -> bool {
+    ui.button(label).on_hover_text(hover).clicked()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::engine::{BeatPhase, EngineEvent};
-    use crate::settings::Pitch;
-    use crate::ui::record_mode::test_support::{beat, recorded_state, tone_frames};
+    use crate::settings::{FILE_NAME, Pitch};
+    use crate::ui::record_mode::test_support::{
+        record_into, recorded_state, three_tone_frames, tone_frames,
+    };
 
     /// Returns a fresh scratch directory for the test `name` in the temporary directory.
     fn scratch_dir(name: &str) -> PathBuf {
@@ -759,11 +659,7 @@ mod tests {
     /// Returns the state with a finished take of three tones at 1.0, 2.0 and 3.0 s recorded at 120 BPM; the take has 3 notes.
     fn state_with_take() -> AppState {
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
-        let mut frames = tone_frames(1.0, 0.5, 440.0);
-        frames.extend(tone_frames(2.0, 0.5, 523.25));
-        frames.extend(tone_frames(3.0, 0.5, 659.26));
-        state.record = recorded_state(frames).0;
+        state.record = recorded_state(three_tone_frames()).0;
         let take = state.record.take().expect("a take");
         assert_eq!(take.notes().len(), 3);
         state
@@ -784,8 +680,7 @@ mod tests {
 
     #[test]
     fn opening_an_open_window_keeps_the_draft() {
-        let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
+        let state = AppState::default();
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
         prefs.draft_mut().voicing.a4_hz = 432.0;
@@ -796,7 +691,6 @@ mod tests {
     #[test]
     fn apply_applies_a_changed_draft_and_ignores_a_closed_window() {
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.draft_mut().voicing.a4_hz = 432.0;
         prefs.apply(&mut state);
@@ -814,7 +708,6 @@ mod tests {
     #[test]
     fn cancel_restores_the_original_tuning_and_closes() {
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.cancel(&mut state);
         assert_eq!(
@@ -870,19 +763,7 @@ mod tests {
         prefs.open(&state);
         prefs.draft_mut().notes.min_note_ms = 200.0;
         prefs.apply(&mut state);
-        assert!(state.record.start(120.0).is_some());
-        for i in 0..4 {
-            state.record.apply_event(&beat(i, BeatPhase::CountIn));
-        }
-        state
-            .record
-            .apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
-        state.record.apply_event(&beat(0, BeatPhase::Recording));
-        assert!(state.record.stop().is_some());
-        state.record.apply_event(&EngineEvent::RecordingFinished {
-            frames: tone_frames(1.0, 0.5, 440.0),
-            origin_s: 1.0,
-        });
+        record_into(&mut state.record, tone_frames(1.0, 0.5, 440.0));
         prefs.cancel(&mut state);
         let take = state.record.take().expect("a take");
         assert_eq!(take.notes().len(), 1);
@@ -911,9 +792,8 @@ mod tests {
     #[test]
     fn save_writes_the_settings_and_closes() {
         let dir = scratch_dir("save");
-        let path = dir.join("settings.toml");
+        let path = dir.join(FILE_NAME);
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         assert!(state.set_latency_ms(25.0).is_some());
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
@@ -935,7 +815,6 @@ mod tests {
     #[test]
     fn save_without_a_path_keeps_the_window_open_with_an_error() {
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
         assert_eq!(prefs.save(&mut state, None), None);
@@ -953,10 +832,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("blocker"), "a file").unwrap();
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
-        let path = dir.join("blocker").join("settings.toml");
+        let path = dir.join("blocker").join(FILE_NAME);
         assert_eq!(prefs.save(&mut state, Some(&path)), None);
         assert!(prefs.is_open());
         let error = prefs.save_error().expect("an error");
@@ -974,35 +852,36 @@ mod tests {
         assert_eq!(Section::default(), Section::Tuning);
     }
 
-    #[test]
-    fn within_narrows_the_range_to_the_inner_bounds() {
-        assert_eq!(within(0.0..=100.0, 20.0, 80.0), 20.0..=80.0);
-        assert_eq!(within(50.0..=4000.0, 300.0, 3000.0), 300.0..=3000.0);
-        assert_eq!(within(50.0..=4000.0, f64::MIN, f64::MAX), 50.0..=4000.0);
-    }
-
-    #[test]
-    fn within_gives_a_one_point_range_for_crossed_bounds() {
-        assert_eq!(within(50.0..=100.0, 200.0, 300.0), 200.0..=200.0);
-        assert_eq!(within(50.0..=100.0, 80.0, 60.0), 80.0..=80.0);
-        let range = within(50.0..=100.0, 200.0, 300.0);
-        assert_eq!(range.start(), range.end());
+    /// Runs one frame of `ctx` on a 1200 × 900 screen with `events`, showing `prefs` without a settings path, and returns what `show` returns.
+    fn frame(
+        ctx: &egui::Context,
+        prefs: &mut PrefsWindow,
+        state: &mut AppState,
+        events: Vec<egui::Event>,
+    ) -> Option<Tuning> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut saved = None;
+        ctx.run_ui(input, |ui| saved = prefs.show(ui.ctx(), state, None))
+            .drop_without_applying_deltas();
+        saved
     }
 
     #[test]
     fn show_draws_every_section_and_stays_open_without_saving() {
         let ctx = egui::Context::default();
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
-        let mut saved: Option<Tuning> = None;
-        for &section in &Section::ALL {
+        for section in Section::ALL {
             prefs.set_section(section);
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                saved = prefs.show(ui.ctx(), &mut state, None);
-            });
-            output.drop_without_applying_deltas();
+            let saved = frame(&ctx, &mut prefs, &mut state, Vec::new());
             assert!(prefs.is_open(), "{section:?} closed the window");
             assert_eq!(saved, None, "{section:?} saved");
             assert_eq!(
@@ -1017,29 +896,21 @@ mod tests {
     fn escape_cancels_the_window() {
         let ctx = egui::Context::default();
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
         prefs.draft_mut().voicing.a4_hz = 432.0;
         prefs.apply(&mut state);
         assert_eq!(state.tuning().voicing.a4_hz, 432.0);
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let _ = prefs.show(ui.ctx(), &mut state, None);
-        });
-        output.drop_without_applying_deltas();
+        frame(&ctx, &mut prefs, &mut state, Vec::new());
         assert!(prefs.is_open(), "without Esc the window stays open");
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::Key {
+        let escape = egui::Event::Key {
             key: egui::Key::Escape,
             physical_key: Some(egui::Key::Escape),
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
-        });
-        let output = ctx.run_ui(input, |ui| {
-            let _ = prefs.show(ui.ctx(), &mut state, None);
-        });
-        output.drop_without_applying_deltas();
+        };
+        frame(&ctx, &mut prefs, &mut state, vec![escape]);
         assert!(!prefs.is_open(), "Esc closes the window");
         assert_eq!(state.tuning().voicing.a4_hz, 440.0);
     }
@@ -1048,48 +919,28 @@ mod tests {
     fn the_window_keeps_its_size_over_frames() {
         let ctx = egui::Context::default();
         let mut state = AppState::default();
-        state.apply_tuning(&Tuning::default());
         let mut prefs = PrefsWindow::default();
         prefs.open(&state);
-        let window_rect = |ctx: &egui::Context| {
+        let window_size = |ctx: &egui::Context| {
             ctx.memory(|m| {
                 m.layer_ids()
                     .filter(|layer| layer.order == egui::Order::Middle)
                     .find_map(|layer| m.area_rect(layer.id))
             })
             .expect("the window is drawn")
+            .size()
         };
         let mut sizes = Vec::new();
-        for &section in &Section::ALL {
+        for section in Section::ALL {
             prefs.set_section(section);
             for _ in 0..20 {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1200.0, 900.0),
-                    )),
-                    ..Default::default()
-                };
-                let output = ctx.run_ui(input, |ui| {
-                    let _ = prefs.show(ui.ctx(), &mut state, None);
-                });
-                output.drop_without_applying_deltas();
+                frame(&ctx, &mut prefs, &mut state, Vec::new());
             }
-            let first = window_rect(&ctx).size();
+            let first = window_size(&ctx);
             for _ in 0..20 {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1200.0, 900.0),
-                    )),
-                    ..Default::default()
-                };
-                let output = ctx.run_ui(input, |ui| {
-                    let _ = prefs.show(ui.ctx(), &mut state, None);
-                });
-                output.drop_without_applying_deltas();
+                frame(&ctx, &mut prefs, &mut state, Vec::new());
             }
-            let last = window_rect(&ctx).size();
+            let last = window_size(&ctx);
             assert_eq!(
                 first, last,
                 "{section:?}: the window changes size between frames"

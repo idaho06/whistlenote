@@ -18,6 +18,12 @@ use crate::music::segment::SegmentConfig;
 /// Version of the settings format.
 pub const VERSION: u32 = 1;
 
+/// Smallest distance in Hz between the lowest and the highest pitch.
+pub const PITCH_GAP_HZ: f64 = 1.0;
+
+/// Smallest ratio of the fastest to the slowest tempo, so that an octave always fits the tempo folding.
+pub const TEMPO_SPAN: f64 = 2.0;
+
 /// Name of the settings file in the user's configuration directory.
 pub const FILE_NAME: &str = "settings.toml";
 
@@ -442,6 +448,16 @@ pub fn dbfs_to_rms(dbfs: f64) -> f32 {
 }
 
 impl Settings {
+    /// Returns the settings with `session` and `tuning`, [sanitized](Settings::sanitized).
+    pub fn new(session: Session, tuning: Tuning) -> Self {
+        Self {
+            version: VERSION,
+            session,
+            tuning,
+        }
+        .sanitized()
+    }
+
     /// Reads the settings from the TOML file at `path` and returns them together with a warning for the user.
     ///
     /// A missing file gives the defaults and no warning; any other read error gives the defaults and a warning. A file whose text does not parse as `Settings` is renamed to a sibling file with ".invalid" appended and the defaults are used with a warning. A parsed file is returned [`sanitized`](Settings::sanitized) and gives no warning.
@@ -503,7 +519,7 @@ impl Settings {
 
     /// Returns the settings with every value in its range.
     ///
-    /// A float that is not finite takes its field's default, then it is clamped into its range; an integer is clamped. `version` becomes [`VERSION`]. An input or output that is `Some` of an empty or whitespace-only string becomes `None`. After the per-field clamps, `band_low_hz` and `band_high_hz` both take their defaults when `band_low_hz >= band_high_hz`, `min_hz` is clamped up to `band_low_hz` and `max_hz` down to `band_high_hz`, and when `min_hz >= max_hz` all four take their defaults. `min_bpm` and `max_bpm` both take their defaults when `max_bpm < 2.0 * min_bpm`.
+    /// A float that is not finite takes its field's default, then it is clamped into its range; an integer is clamped. `version` becomes [`VERSION`]. An input or output that is `Some` of an empty or whitespace-only string becomes `None`. After the per-field clamps, `band_low_hz` and `band_high_hz` both take their defaults when `band_low_hz >= band_high_hz`, `min_hz` is clamped up to `band_low_hz` and `max_hz` down to `band_high_hz`, and when `max_hz` is less than [`PITCH_GAP_HZ`] above `min_hz` all four take their defaults. `min_bpm` and `max_bpm` both take their defaults when `max_bpm < TEMPO_SPAN * min_bpm`.
     pub fn sanitized(self) -> Self {
         Self {
             version: VERSION,
@@ -585,11 +601,11 @@ impl Tuning {
         }
     }
 
-    /// Returns the MIDI export options for these tuning values: the velocity clamped to 1..=127 and the 1-based channel converted to the zero-based MIDI channel.
+    /// Returns the MIDI export options for these tuning values: the velocity clamped into [`range::VELOCITY`] and the 1-based channel clamped into [`range::CHANNEL`] and converted to the zero-based MIDI channel.
     pub fn midi(&self) -> MidiOptions {
         MidiOptions {
-            velocity: self.export.velocity.clamp(1, 127) as u8,
-            channel: (self.export.channel.clamp(1, 16) - 1) as u8,
+            velocity: int(self.export.velocity, &range::VELOCITY) as u8,
+            channel: (int(self.export.channel, &range::CHANNEL) - 1) as u8,
         }
     }
 }
@@ -625,13 +641,33 @@ impl Pitch {
         }
         s.min_hz = s.min_hz.max(s.band_low_hz);
         s.max_hz = s.max_hz.min(s.band_high_hz);
-        if s.min_hz >= s.max_hz {
+        if s.min_hz + PITCH_GAP_HZ > s.max_hz {
             s.band_low_hz = d.band_low_hz;
             s.band_high_hz = d.band_high_hz;
             s.min_hz = d.min_hz;
             s.max_hz = d.max_hz;
         }
         s
+    }
+
+    /// Returns the range the lowest pitch may take with the other pitch values: from the band-pass low edge to [`PITCH_GAP_HZ`] below the highest pitch, within [`range::MIN_HZ`].
+    pub fn min_hz_range(&self) -> RangeInclusive<f64> {
+        within(range::MIN_HZ, self.band_low_hz, self.max_hz - PITCH_GAP_HZ)
+    }
+
+    /// Returns the range the highest pitch may take with the other pitch values: from [`PITCH_GAP_HZ`] above the lowest pitch to the band-pass high edge, within [`range::MAX_HZ`].
+    pub fn max_hz_range(&self) -> RangeInclusive<f64> {
+        within(range::MAX_HZ, self.min_hz + PITCH_GAP_HZ, self.band_high_hz)
+    }
+
+    /// Returns the range the band-pass low edge may take with the other pitch values: up to the lowest pitch, within [`range::BAND_LOW_HZ`].
+    pub fn band_low_hz_range(&self) -> RangeInclusive<f64> {
+        within(range::BAND_LOW_HZ, f64::MIN, self.min_hz)
+    }
+
+    /// Returns the range the band-pass high edge may take with the other pitch values: from the highest pitch up, within [`range::BAND_HIGH_HZ`].
+    pub fn band_high_hz_range(&self) -> RangeInclusive<f64> {
+        within(range::BAND_HIGH_HZ, self.max_hz, f64::MAX)
     }
 }
 
@@ -693,11 +729,21 @@ impl Tempo {
             min_bpm: float(self.min_bpm, d.min_bpm, &range::MIN_BPM),
             max_bpm: float(self.max_bpm, d.max_bpm, &range::MAX_BPM),
         };
-        if s.max_bpm < 2.0 * s.min_bpm {
+        if s.max_bpm < TEMPO_SPAN * s.min_bpm {
             s.min_bpm = d.min_bpm;
             s.max_bpm = d.max_bpm;
         }
         s
+    }
+
+    /// Returns the range the slowest tempo may take with the fastest one: up to the fastest tempo divided by [`TEMPO_SPAN`], within [`range::MIN_BPM`].
+    pub fn min_bpm_range(&self) -> RangeInclusive<f64> {
+        within(range::MIN_BPM, f64::MIN, self.max_bpm / TEMPO_SPAN)
+    }
+
+    /// Returns the range the fastest tempo may take with the slowest one: from the slowest tempo times [`TEMPO_SPAN`] up, within [`range::MAX_BPM`].
+    pub fn max_bpm_range(&self) -> RangeInclusive<f64> {
+        within(range::MAX_BPM, self.min_bpm * TEMPO_SPAN, f64::MAX)
     }
 }
 
@@ -731,6 +777,13 @@ impl Export {
 fn float(value: f64, default: f64, range: &RangeInclusive<f64>) -> f64 {
     let value = if value.is_finite() { value } else { default };
     value.clamp(*range.start(), *range.end())
+}
+
+/// Returns `range` narrowed to the bounds `low` and `high` without inverting it: the start is the larger of the range start and `low`, and the end is the larger of that start and the smaller of the range end and `high`, so crossed bounds give a one-point range.
+fn within(range: RangeInclusive<f64>, low: f64, high: f64) -> RangeInclusive<f64> {
+    let start = range.start().max(low);
+    let end = start.max(range.end().min(high));
+    start..=end
 }
 
 /// Returns `value` clamped into `range`.
@@ -767,6 +820,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+    use crate::music::assert_close;
 
     /// Returns a fresh scratch directory for the test `name` in the temporary directory.
     fn scratch_dir(name: &str) -> PathBuf {
@@ -780,18 +834,12 @@ mod tests {
 
     /// Asserts that the f32 values `a` and `b` differ by at most 1e-5.
     fn assert_close_f32(a: f32, b: f32) {
-        assert!(
-            (a - b).abs() <= 1e-5,
-            "{a} and {b} differ by more than 1e-5"
-        );
+        assert_close(a.into(), b.into(), 1e-5);
     }
 
     /// Asserts that the f64 values `a` and `b` differ by at most 1e-9.
     fn assert_close_f64(a: f64, b: f64) {
-        assert!(
-            (a - b).abs() <= 1e-9,
-            "{a} and {b} differ by more than 1e-9"
-        );
+        assert_close(a, b, 1e-9);
     }
 
     #[test]
@@ -1087,5 +1135,46 @@ mod tests {
                     .any(|component| component.as_os_str() == "whistlenote")
             );
         }
+    }
+
+    #[test]
+    fn within_narrows_the_range_to_the_inner_bounds() {
+        assert_eq!(within(0.0..=100.0, 20.0, 80.0), 20.0..=80.0);
+        assert_eq!(within(50.0..=4000.0, 300.0, 3000.0), 300.0..=3000.0);
+        assert_eq!(within(50.0..=4000.0, f64::MIN, f64::MAX), 50.0..=4000.0);
+    }
+
+    #[test]
+    fn within_gives_a_one_point_range_for_crossed_bounds() {
+        assert_eq!(within(50.0..=100.0, 200.0, 300.0), 200.0..=200.0);
+        assert_eq!(within(50.0..=100.0, 80.0, 60.0), 80.0..=80.0);
+        let range = within(50.0..=100.0, 200.0, 300.0);
+        assert_eq!(range.start(), range.end());
+    }
+
+    #[test]
+    fn the_pitch_ranges_follow_the_other_pitch_values() {
+        let p = Pitch {
+            band_low_hz: 300.0,
+            min_hz: 400.0,
+            max_hz: 3000.0,
+            band_high_hz: 4000.0,
+            ..Pitch::default()
+        };
+        assert_eq!(p.min_hz_range(), 300.0..=2999.0);
+        assert_eq!(p.max_hz_range(), 401.0..=4000.0);
+        assert_eq!(p.band_low_hz_range(), 50.0..=400.0);
+        assert_eq!(p.band_high_hz_range(), 3000.0..=8000.0);
+    }
+
+    #[test]
+    fn the_tempo_ranges_keep_an_octave_between_the_limits() {
+        let t = Tempo {
+            min_bpm: 60.0,
+            max_bpm: 180.0,
+            ..Tempo::default()
+        };
+        assert_eq!(t.min_bpm_range(), 40.0..=90.0);
+        assert_eq!(t.max_bpm_range(), 120.0..=220.0);
     }
 }

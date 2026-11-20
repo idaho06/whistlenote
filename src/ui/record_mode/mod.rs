@@ -350,9 +350,8 @@ pub(crate) mod test_support {
             .collect()
     }
 
-    /// Runs a full recording at 120 BPM with `frames` and origin 1.0 and returns the state and the frames.
-    pub(crate) fn recorded_state(frames: Vec<PitchFrame>) -> (RecordState, Vec<PitchFrame>) {
-        let mut state = RecordState::default();
+    /// Runs a full recording at 120 BPM with `frames` and origin 1.0 through `state`: the start, the count-in bar, the recording start and its first beat, the stop and the finish.
+    pub(crate) fn record_into(state: &mut RecordState, frames: Vec<PitchFrame>) {
         state.start(120.0);
         for i in 0..4 {
             state.apply_event(&beat(i, BeatPhase::CountIn));
@@ -361,24 +360,35 @@ pub(crate) mod test_support {
         state.apply_event(&beat(0, BeatPhase::Recording));
         state.stop();
         state.apply_event(&EngineEvent::RecordingFinished {
-            frames: frames.clone(),
+            frames,
             origin_s: 1.0,
         });
+    }
+
+    /// Runs a full recording at 120 BPM with `frames` and origin 1.0 in a fresh state and returns the state and the frames.
+    pub(crate) fn recorded_state(frames: Vec<PitchFrame>) -> (RecordState, Vec<PitchFrame>) {
+        let mut state = RecordState::default();
+        record_into(&mut state, frames.clone());
         (state, frames)
     }
 
-    /// Builds a take of three tones at 1.0, 2.0 and 3.0 s (A4, C5, E5) recorded at 120 BPM with beat 0 at 1.0 s on the sixteenth grid; the notes sit at beats 0, 2 and 4.
-    pub(crate) fn three_note_take() -> Take {
+    /// Returns the frames of three 0.5 s tones at 1.0, 2.0 and 3.0 s: A4, C5 and E5.
+    pub(crate) fn three_tone_frames() -> Vec<PitchFrame> {
         let mut frames = tone_frames(1.0, 0.5, 440.0);
         frames.extend(tone_frames(2.0, 0.5, 523.25));
         frames.extend(tone_frames(3.0, 0.5, 659.26));
-        Take::new(frames, 1.0, 120.0, Grid::Sixteenth)
+        frames
+    }
+
+    /// Builds a take of [`three_tone_frames`] recorded at 120 BPM with beat 0 at 1.0 s on the sixteenth grid; the notes sit at beats 0, 2 and 4.
+    pub(crate) fn three_note_take() -> Take {
+        Take::new(three_tone_frames(), 1.0, 120.0, Grid::Sixteenth)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{beat, live_frames, recorded_state, tone_frames};
+    use super::test_support::{beat, live_frames, record_into, recorded_state, tone_frames};
     use super::*;
     use crate::export::csv::to_csv;
     use crate::export::midi::{MidiOptions, to_midi_bytes};
@@ -795,17 +805,7 @@ mod tests {
             velocity: 64,
             channel: 9,
         });
-        state.start(120.0);
-        for i in 0..4 {
-            state.apply_event(&beat(i, BeatPhase::CountIn));
-        }
-        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
-        state.apply_event(&beat(0, BeatPhase::Recording));
-        state.stop();
-        state.apply_event(&EngineEvent::RecordingFinished {
-            frames: tone_frames(1.0, 0.5, 440.0),
-            origin_s: 1.0,
-        });
+        record_into(&mut state, tone_frames(1.0, 0.5, 440.0));
         let take = state.take().expect("a take");
         assert!(take.notes().is_empty());
         assert_eq!(

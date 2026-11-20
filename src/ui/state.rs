@@ -10,7 +10,7 @@ use crate::ui::bpm_mode::{BpmState, TempoConfig};
 use crate::ui::live::{LiveConfig, NoteSmoother, ShownNote};
 use crate::ui::record_mode::RecordState;
 
-pub(crate) use crate::engine::MAX_LATENCY_MS;
+use crate::engine::MAX_LATENCY_MS;
 
 /// Returns the label of an input rate in Hz: whole kHz without decimals, otherwise one decimal rounded, for example "48 kHz" for 48_000 and "44.1 kHz" for 44_100.
 pub fn rate_label(rate_hz: u32) -> String {
@@ -171,8 +171,11 @@ impl AppState {
         Some(EngineCommand::SetLatencyMs(clamped))
     }
 
-    /// Applies `tuning` to the views and stores it as the applied tuning: the live readout, the tempo estimate of the BPM tab, and the segmentation and MIDI options of the Record tab. A changed segmentation re-segments the shown take and resets its edits.
+    /// Applies `tuning` to the views and stores it as the applied tuning: the live readout, the tempo estimate of the BPM tab, and the segmentation and MIDI options of the Record tab. A changed segmentation re-segments the shown take and resets its edits; a tuning equal to the applied one changes nothing.
     pub fn apply_tuning(&mut self, tuning: &Tuning) {
+        if *tuning == self.tuning {
+            return;
+        }
         self.tuning = tuning.clone();
         self.live.set_config(LiveConfig::from(tuning));
         self.bpm.set_config(TempoConfig::from(tuning));
@@ -201,7 +204,7 @@ impl AppState {
         commands
     }
 
-    /// Restores `session`: queues the latency command, sets the recording tempo, the grid and the metronome of the Record tab, and selects a saved device directly, queuing its command; the queued commands go out through [`AppState::engine_commands`]. When a device was restored, the next device list checks the restored devices against it.
+    /// Restores `session`: queues the latency command, sets the recording tempo, the grid and the metronome of the Record tab, and selects a saved device as [`AppState::select_input`] and [`AppState::select_output`] do, queuing its command; the queued commands go out through [`AppState::engine_commands`]. When a device was restored, the next device list checks the restored devices against it.
     pub fn restore_session(&mut self, session: &Session) {
         if let Some(command) = self.set_latency_ms(session.latency_ms) {
             self.pending.push(command);
@@ -209,22 +212,13 @@ impl AppState {
         self.bpm.set_record_bpm(session.record_bpm);
         self.record.set_grid(session.grid.into());
         self.record.set_metronome(session.metronome);
-        let mut restored_device = false;
-        if let Some(input) = &session.input {
-            self.input = Some(input.clone());
-            self.pending
-                .push(EngineCommand::SelectInput(Some(input.clone())));
-            restored_device = true;
+        if let Some(command) = self.select_input(session.input.clone()) {
+            self.pending.push(command);
         }
-        if let Some(output) = &session.output {
-            self.output = Some(output.clone());
-            self.pending
-                .push(EngineCommand::SelectOutput(Some(output.clone())));
-            restored_device = true;
+        if let Some(command) = self.select_output(session.output.clone()) {
+            self.pending.push(command);
         }
-        if restored_device {
-            self.check_restored = true;
-        }
+        self.check_restored |= session.input.is_some() || session.output.is_some();
     }
 
     /// Returns the session values to save: a restored device name that fell back to the default device, otherwise the selected device, together with the latency offset, the recording tempo, the grid and the metronome.
