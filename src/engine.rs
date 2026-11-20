@@ -7,8 +7,10 @@
 //! renders its clicks on the output stream.
 //!
 //! A recording plays one count-in bar on the metronome and then collects
-//! the pitch frames of the input until it is stopped; the finished
-//! recording is reported with its origin on the reliable event channel.
+//! the pitch frames of the input until it is stopped; a recording that
+//! reaches its origin is reported with its frames on the reliable event
+//! channel, and one that ends before its origin is reported as
+//! [`EngineEvent::RecordingAborted`].
 
 use std::fmt::Display;
 use std::thread::JoinHandle;
@@ -82,7 +84,8 @@ pub enum EngineEvent {
         /// the latency offset.
         origin_s: f64,
     },
-    /// A recording finished and its pitch frames are reported.
+    /// A recording that reached its origin finished and its pitch frames
+    /// are reported.
     RecordingFinished {
         /// Pitch frames of the recording, from [`PRE_ROLL_S`] before the
         /// origin; frames that overlap an audible click are unvoiced.
@@ -90,6 +93,8 @@ pub enum EngineEvent {
         /// Engine-clock time of the recording origin in seconds.
         origin_s: f64,
     },
+    /// The recording ended before its origin; it has no frames.
+    RecordingAborted,
     /// A non-fatal error occurred.
     Error(
         /// Description of the error.
@@ -121,15 +126,20 @@ pub enum EngineCommand {
     /// Starts a recording: one count-in bar at `bpm`, then the recording;
     /// `metronome` makes the recording beats audible. The input and output
     /// streams open when none are open, so a recording works without
-    /// [`EngineCommand::StartListening`].
+    /// [`EngineCommand::StartListening`]. The recording ends with one
+    /// [`EngineEvent::RecordingFinished`] or one
+    /// [`EngineEvent::RecordingAborted`]; a start that fails sends an
+    /// [`EngineEvent::Error`] and then [`EngineEvent::RecordingAborted`].
     StartRecording {
         /// Tempo in BPM.
         bpm: f64,
         /// Whether the recording beats are audible.
         metronome: bool,
     },
-    /// Ends the recording and reports its frames as a
-    /// [`EngineEvent::RecordingFinished`] event.
+    /// Ends the recording: reports its frames as
+    /// [`EngineEvent::RecordingFinished`] when its origin was reached, or
+    /// sends [`EngineEvent::RecordingAborted`] during the count-in; without
+    /// a recording it sends nothing.
     StopRecording,
     /// Sets the latency offset in milliseconds that is added to the origin
     /// of a recording, clamped to -200..=200; it applies to recordings
@@ -315,6 +325,12 @@ fn device_label(name: Option<&str>) -> &str {
 fn send_error(events: &Sender<EngineEvent>, message: impl Display) {
     log::warn!("error: {message}");
     let _ = events.send(EngineEvent::Error(message.to_string()));
+}
+
+/// Sends an [`EngineEvent::RecordingAborted`] on `events`; a send error is
+/// ignored because the receiver is gone.
+fn send_aborted(events: &Sender<EngineEvent>) {
+    let _ = events.send(EngineEvent::RecordingAborted);
 }
 
 /// Returns an [`ErrorSink`] that reports every stream error as an
@@ -552,19 +568,22 @@ impl Worker {
 
     /// Starts a recording at `bpm`: opens the streams it needs and queues
     /// the count-in; `clicks` makes the recording beats audible. A failure
-    /// becomes an error event and starts nothing.
+    /// becomes an error event followed by an [`EngineEvent::RecordingAborted`]
+    /// and starts nothing.
     fn start_recording(&mut self, bpm: f64, clicks: bool) {
-        if !bpm.is_finite() {
-            send_error(&self.events, "invalid tempo");
-            return;
-        }
         // A running recording is discarded without an event.
         self.cancel_recording();
+        if !bpm.is_finite() {
+            send_error(&self.events, "invalid tempo");
+            send_aborted(&self.events);
+            return;
+        }
         if self.input.is_none() {
             self.open_input();
         }
         // An open that failed already emitted an error event.
         let Some(input) = &self.input else {
+            send_aborted(&self.events);
             return;
         };
         let window_s = input.pitch.window_s();
@@ -585,35 +604,43 @@ impl Worker {
                 clicks: Vec::new(),
                 frames: Vec::new(),
             });
+        } else {
+            // The output could not be opened or the metronome command queue
+            // is full; the open or queue failure already emitted an error.
+            send_aborted(&self.events);
         }
     }
 
-    /// Ends the recording, if one runs, and reports its frames; a recording
-    /// stopped during the count-in has no frames and origin 0.
+    /// Ends the recording, if one runs: reports its frames as a
+    /// [`EngineEvent::RecordingFinished`] when its origin was reached, and
+    /// sends an [`EngineEvent::RecordingAborted`] when it is still in its
+    /// count-in.
     fn finish_recording(&mut self) {
         let Some(recording) = self.recording.take() else {
             return;
         };
         self.send_metronome(MetronomeCommand::StopRecording);
-        let (frames, origin_s) = match recording.origin_s {
-            Some(origin_s) => (
-                finish_frames(
+        match recording.origin_s {
+            Some(origin_s) => {
+                let frames = finish_frames(
                     recording.frames,
                     origin_s,
                     &recording.clicks,
                     recording.window_s,
-                ),
-                origin_s,
-            ),
-            None => (Vec::new(), 0.0),
-        };
-        log::debug!(
-            "recording finished: {} frames, origin {origin_s:.3} s",
-            frames.len()
-        );
-        let _ = self
-            .events
-            .send(EngineEvent::RecordingFinished { frames, origin_s });
+                );
+                log::debug!(
+                    "recording finished: {} frames, origin {origin_s:.3} s",
+                    frames.len()
+                );
+                let _ = self
+                    .events
+                    .send(EngineEvent::RecordingFinished { frames, origin_s });
+            }
+            None => {
+                log::debug!("recording aborted before its origin");
+                send_aborted(&self.events);
+            }
+        }
     }
 
     /// Cancels a running recording: ends the metronome's count-in or
@@ -625,9 +652,11 @@ impl Worker {
         }
     }
 
-    /// Drops each stream that failed, after finishing a running recording so
-    /// its frames so far are reported, and says how to recover; `listening`
-    /// and the metronome settings stay, so a refresh reopens what was lost.
+    /// Drops each stream that failed, after ending a running recording so
+    /// its frames so far are reported or its end during the count-in is
+    /// sent as an [`EngineEvent::RecordingAborted`], and says how to
+    /// recover; `listening` and the metronome settings stay, so a refresh
+    /// reopens what was lost.
     fn drop_failed_streams(&mut self) {
         let input_failed = self.input.as_ref().is_some_and(|i| i.stream.is_failed());
         let output_failed = self.output.as_ref().is_some_and(|o| o.stream.is_failed());
@@ -784,17 +813,23 @@ mod tests {
         }
     }
 
-    /// Spawns an engine on a fake backend and consumes the startup `Devices`
-    /// event, so that later waits see only later events; returns the engine
-    /// and the fake handle.
-    fn spawn_engine() -> (Engine, FakeHandle) {
-        let (backend, handle) = fake_backend(FakeConfig::default());
+    /// Spawns an engine on a fake backend with `config` and consumes the
+    /// startup `Devices` event, so that later waits see only later events;
+    /// returns the engine and the fake handle.
+    fn spawn_engine_on(config: FakeConfig) -> (Engine, FakeHandle) {
+        let (backend, handle) = fake_backend(config);
         let engine = Engine::spawn(backend);
         let startup = wait_for(engine.events(), Duration::from_secs(2), |event| {
             matches!(event, EngineEvent::Devices { .. })
         });
         assert!(startup.is_some(), "the startup Devices event");
         (engine, handle)
+    }
+
+    /// Spawns an engine on a fake backend with the default config; see
+    /// [`spawn_engine_on`].
+    fn spawn_engine() -> (Engine, FakeHandle) {
+        spawn_engine_on(FakeConfig::default())
     }
 
     /// Sends `RefreshDevices` and waits for the `Devices` answer, returning
@@ -848,6 +883,16 @@ mod tests {
         }) {
             Some(EngineEvent::RecordingFinished { frames, origin_s }) => (frames, origin_s),
             other => panic!("expected RecordingFinished, got {other:?}"),
+        }
+    }
+
+    /// Waits for the next `RecordingAborted` event.
+    fn wait_aborted(engine: &Engine) {
+        match wait_for(engine.events(), Duration::from_secs(5), |event| {
+            matches!(event, EngineEvent::RecordingAborted)
+        }) {
+            Some(EngineEvent::RecordingAborted) => {}
+            other => panic!("expected RecordingAborted, got {other:?}"),
         }
     }
 
@@ -1216,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn stopping_during_the_count_in_gives_an_empty_recording() {
+    fn stopping_during_the_count_in_aborts_the_recording() {
         let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
@@ -1227,18 +1272,28 @@ mod tests {
         engine.send(EngineCommand::StopRecording);
 
         let mut started_seen = false;
-        let finished = wait_for(engine.events(), Duration::from_secs(5), |event| {
+        let mut finished_seen = false;
+        let aborted = wait_for(engine.events(), Duration::from_secs(5), |event| {
             started_seen |= matches!(event, EngineEvent::RecordingStarted { .. });
-            matches!(event, EngineEvent::RecordingFinished { .. })
+            finished_seen |= matches!(event, EngineEvent::RecordingFinished { .. });
+            matches!(event, EngineEvent::RecordingAborted)
         })
-        .expect("a RecordingFinished event");
-        assert!(!started_seen, "no RecordingStarted before the finish");
-        assert_eq!(
-            finished,
-            EngineEvent::RecordingFinished {
-                frames: Vec::new(),
-                origin_s: 0.0,
-            }
+        .expect("a RecordingAborted event");
+        assert_eq!(aborted, EngineEvent::RecordingAborted);
+        assert!(!started_seen, "no RecordingStarted before the abort");
+        assert!(!finished_seen, "no RecordingFinished before the abort");
+        let seen = sync(&engine);
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
+            "a RecordingFinished arrived after the abort: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingAborted)),
+            "a second RecordingAborted arrived: {seen:?}"
         );
     }
 
@@ -1439,6 +1494,7 @@ mod tests {
         });
         let message = wait_error(&engine);
         assert!(message.contains("tempo"), "{message}");
+        wait_aborted(&engine);
 
         sync(&engine);
         assert_eq!(handle.input_device(), None);
@@ -1605,14 +1661,68 @@ mod tests {
         wait_both_streams(&handle);
 
         handle.fail_output(AudioError::Backend("gone".to_string()));
-        let (frames, origin_s) = wait_finished(&engine);
-        assert!(frames.is_empty(), "stopped during the count-in");
-        assert_eq!(origin_s, 0.0);
+        wait_aborted(&engine);
         wait_output_closed(&handle);
         wait_input_closed(&handle);
 
         sync(&engine);
         assert_eq!(handle.input_device(), None);
         assert_eq!(handle.output_device(), None);
+    }
+
+    #[test]
+    fn a_recording_whose_output_cannot_open_aborts() {
+        // No output device: opening the output fails with an error.
+        let (engine, handle) = spawn_engine_on(FakeConfig {
+            outputs: Vec::new(),
+            ..FakeConfig::default()
+        });
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        let message = wait_error(&engine);
+        assert!(message.contains("no audio device"), "{message}");
+        wait_aborted(&engine);
+
+        let seen = sync(&engine);
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
+            "a RecordingFinished arrived after the abort: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingAborted)),
+            "a second RecordingAborted arrived: {seen:?}"
+        );
+        assert_eq!(handle.output_device(), None);
+        wait_input_closed(&handle);
+    }
+
+    #[test]
+    fn stopping_after_the_origin_finishes_the_recording() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+        handle.step_n(400); // 2.133 s: past the count-in
+        assert_close(wait_started(&engine), 2.0, 1e-9);
+
+        engine.send(EngineCommand::StopRecording);
+        let (frames, origin_s) = wait_finished(&engine);
+        assert_close(origin_s, 2.0, 1e-9);
+        assert!(!frames.is_empty(), "the recording has frames");
+        let seen = sync(&engine);
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::RecordingAborted)),
+            "a RecordingAborted arrived after the RecordingFinished: {seen:?}"
+        );
     }
 }

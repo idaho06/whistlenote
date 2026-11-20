@@ -167,7 +167,7 @@ impl RecordState {
         }
     }
 
-    /// Folds `event` into the state: a beat while a recording runs updates the latest beat and a count-in beat marks the count-in as seen, a start moves the count-in into the recording and stores its origin, a finish stores the take, clears the live frames and the preview and returns to idle, an error before the first count-in beat aborts the start. Other events change nothing.
+    /// Folds `event` into the state: a beat while a recording runs updates the latest beat and a count-in beat marks the count-in as seen, a start moves the count-in into the recording and stores its origin, a finish stores the take, clears the live frames and the preview and returns to idle, an abort returns to idle like [`Self::cancel`] and keeps the earlier take, an error before the first count-in beat aborts the start. Other events change nothing.
     pub fn apply_event(&mut self, event: &EngineEvent) {
         match event {
             EngineEvent::Beat { index, phase, .. } if !self.is_idle() => {
@@ -185,6 +185,7 @@ impl RecordState {
                 self.phase = RecordPhase::Idle;
                 self.clear_run();
             }
+            EngineEvent::RecordingAborted => self.cancel(),
             EngineEvent::Error(_) if self.phase == RecordPhase::CountIn && !self.count_in_seen => {
                 self.phase = RecordPhase::Idle;
             }
@@ -472,20 +473,17 @@ mod tests {
     }
 
     #[test]
-    fn stopping_during_the_count_in_gives_an_empty_take() {
-        let mut state = RecordState::default();
+    fn stopping_during_the_count_in_keeps_the_earlier_take() {
+        let (mut state, _) = recorded_state(tone_frames(1.0, 0.6, 440.0));
+        let take_before = state.take().cloned();
+        assert!(take_before.is_some());
         state.start(120.0);
         state.apply_event(&beat(0, BeatPhase::CountIn));
         assert_eq!(state.stop(), Some(EngineCommand::StopRecording));
-        state.apply_event(&EngineEvent::RecordingFinished {
-            frames: Vec::new(),
-            origin_s: 0.0,
-        });
+        state.apply_event(&EngineEvent::RecordingAborted);
         assert!(state.is_idle());
-        let take = state.take().expect("a take");
-        assert!(take.notes().is_empty());
-        assert_eq!(take.frame_count(), 0);
-        assert_eq!(take.origin_s(), 0.0);
+        assert_eq!(state.last_beat(), None);
+        assert_eq!(state.take(), take_before.as_ref());
     }
 
     #[test]
