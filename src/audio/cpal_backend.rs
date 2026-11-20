@@ -236,14 +236,24 @@ fn is_reportable(error: &cpal::Error) -> bool {
     )
 }
 
-/// Returns whether a stream error stops the stream for good: `cpal` ends a
-/// stream whose device or host went away and keeps running after any other
-/// error.
-fn ends_stream(error: &cpal::Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated | ErrorKind::HostUnavailable
-    )
+/// Whether every stream error ends the stream on this platform: true on
+/// Windows, where the WASAPI stream worker stops after any error, and false
+/// elsewhere, where `cpal` keeps a stream running after errors other than a
+/// lost device, an invalidated stream or a lost host.
+const EVERY_ERROR_ENDS_STREAM: bool = cfg!(windows);
+
+/// Returns whether a stream error ends the stream for good. When
+/// `every_error_ends` holds, every error ends the stream; otherwise only a
+/// lost device, an invalidated stream or a lost host does, and `cpal` keeps
+/// the stream running after any other error.
+fn ends_stream(error: &cpal::Error, every_error_ends: bool) -> bool {
+    every_error_ends
+        || matches!(
+            error.kind(),
+            ErrorKind::DeviceNotAvailable
+                | ErrorKind::StreamInvalidated
+                | ErrorKind::HostUnavailable
+        )
 }
 
 /// Wraps `on_error` into a `cpal` error callback that also sets `failed`
@@ -253,7 +263,7 @@ fn error_callback(
     failed: Arc<AtomicBool>,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
     move |error| {
-        if ends_stream(&error) {
+        if ends_stream(&error, EVERY_ERROR_ENDS_STREAM) {
             failed.store(true, Ordering::Relaxed);
         }
         if is_reportable(&error) {
@@ -510,13 +520,13 @@ mod tests {
     use crate::music::assert_close;
 
     #[test]
-    fn only_lost_devices_and_hosts_end_a_stream() {
+    fn without_every_error_ending_only_lost_devices_and_hosts_end_a_stream() {
         for kind in [
             ErrorKind::DeviceNotAvailable,
             ErrorKind::StreamInvalidated,
             ErrorKind::HostUnavailable,
         ] {
-            assert!(ends_stream(&cpal::Error::new(kind)), "{kind:?}");
+            assert!(ends_stream(&cpal::Error::new(kind), false), "{kind:?}");
         }
         for kind in [
             ErrorKind::Xrun,
@@ -524,7 +534,22 @@ mod tests {
             ErrorKind::BackendError,
             ErrorKind::DeviceChanged,
         ] {
-            assert!(!ends_stream(&cpal::Error::new(kind)), "{kind:?}");
+            assert!(!ends_stream(&cpal::Error::new(kind), false), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn with_every_error_ending_every_kind_ends_a_stream() {
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::HostUnavailable,
+            ErrorKind::Xrun,
+            ErrorKind::DeviceBusy,
+            ErrorKind::BackendError,
+            ErrorKind::DeviceChanged,
+        ] {
+            assert!(ends_stream(&cpal::Error::new(kind), true), "{kind:?}");
         }
     }
 
