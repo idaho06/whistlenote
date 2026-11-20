@@ -5,6 +5,19 @@ use crate::export::midi::to_midi_bytes;
 use crate::music::quantize::{Grid, QuantNote, quantize_indexed};
 use crate::music::segment::{PitchFrame, RawNote, SegmentConfig, segment};
 
+/// Tolerance in beats: the smallest length a shifted row keeps, and the step of [`Grid::Off`].
+const BEAT_EPS: f64 = 1e-9;
+
+/// Returns the step of `grid` in beats: 1.0 for [`Grid::Quarter`], 0.5 for [`Grid::Eighth`], 0.25 for [`Grid::Sixteenth`] and the beat tolerance for [`Grid::Off`].
+fn grid_step(grid: Grid) -> f64 {
+    match grid {
+        Grid::Off => BEAT_EPS,
+        Grid::Quarter => 1.0,
+        Grid::Eighth => 0.5,
+        Grid::Sixteenth => 0.25,
+    }
+}
+
 /// A finished recording: its frames and the notes quantized from them, editable before export.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Take {
@@ -22,9 +35,9 @@ pub struct Take {
     raw: Vec<RawNote>,
     /// The raw notes after the user's edits, in time order.
     edited: Vec<RawNote>,
-    /// Whole beats beat 0 moves later by.
+    /// Whole beats beat 0 has moved later by; `requantize` shifts the rows in beat space by this amount.
     shift_beats: u32,
-    /// The edited notes quantized onto the grid, each with its index in `edited`.
+    /// The edited notes quantized onto the grid and shifted in beat space by `shift_beats`, each with its index in `edited`.
     rows: Vec<(usize, QuantNote)>,
     /// The notes of `rows`.
     notes: Vec<QuantNote>,
@@ -58,11 +71,27 @@ impl Take {
         take
     }
 
-    /// Recomputes `rows` and `notes` from the edited notes, the grid and the shifted origin.
+    /// Recomputes `rows` and `notes` from the edited notes, the grid and the recorded `origin_s`: the notes are quantized with the unshifted `origin_s`, then shifted in beat space by `shift_beats`; a row whose start falls below 0 is clamped to beat 0 and shortened by the same amount, and a row left with a length of at most the beat tolerance is dropped.
     fn requantize(&mut self) {
-        let origin_s = self.origin_s + f64::from(self.shift_beats) * 60.0 / self.bpm;
-        self.rows = quantize_indexed(&self.edited, self.bpm, self.grid, origin_s);
+        let mut rows = quantize_indexed(&self.edited, self.bpm, self.grid, self.origin_s);
+        let shift = f64::from(self.shift_beats);
+        for (_, note) in &mut rows {
+            note.start_beats -= shift;
+            if note.start_beats < 0.0 {
+                note.length_beats += note.start_beats;
+                note.start_beats = 0.0;
+            }
+        }
+        rows.retain(|(_, note)| note.length_beats > BEAT_EPS);
+        self.rows = rows;
         self.notes = self.rows.iter().map(|(_, note)| *note).collect();
+    }
+
+    /// Returns the position in `rows` of the row whose edited index is `index`, if there is one.
+    fn row_position(&self, index: usize) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|(row_index, _)| *row_index == index)
     }
 
     /// Returns the edited notes quantized onto the grid.
@@ -81,44 +110,65 @@ impl Take {
         self.requantize();
     }
 
-    /// Removes the edited note at `index`; an out-of-range index does nothing.
+    /// Removes the row of `rows` whose edited index is `index`, together with the edited notes hidden between that row and the previous row; an `index` that is not the index of a row of `rows` does nothing.
     pub fn delete(&mut self, index: usize) {
-        if index < self.edited.len() {
-            self.edited.remove(index);
-            self.requantize();
-        }
+        let Some(row) = self.row_position(index) else {
+            return;
+        };
+        let from = if row == 0 {
+            0
+        } else {
+            self.rows[row - 1].0 + 1
+        };
+        self.edited.drain(from..=index);
+        self.requantize();
     }
 
-    /// Merges the edited note at `index` into the note before it, which keeps its pitch and covers both; does nothing when `index` is 0 or out of range.
+    /// Merges the row of `rows` whose edited index is `index` into the previous row, which keeps its pitch and covers both, and removes the edited notes hidden between the two rows; does nothing when that row is the first row or `index` is not the index of a row of `rows`.
     pub fn merge_into_previous(&mut self, index: usize) {
-        if index > 0 && index < self.edited.len() {
-            self.edited[index - 1].end_s = self.edited[index].end_s;
-            self.edited.remove(index);
-            self.requantize();
+        let Some(row) = self.row_position(index) else {
+            return;
+        };
+        if row == 0 {
+            return;
         }
+        let previous = self.rows[row - 1].0;
+        self.edited[previous].end_s = self.edited[index].end_s;
+        self.edited.drain(previous + 1..=index);
+        self.requantize();
     }
 
-    /// Merges the edited note at `index` into the note after it, which keeps its pitch and covers both; does nothing when there is no next note.
+    /// Merges the row of `rows` whose edited index is `index` into the next row, which keeps its pitch and covers both, and removes the edited notes hidden between the two rows; does nothing when that row is the last row or `index` is not the index of a row of `rows`.
     pub fn merge_into_next(&mut self, index: usize) {
-        if index + 1 < self.edited.len() {
-            self.edited[index + 1].start_s = self.edited[index].start_s;
-            self.edited.remove(index);
-            self.requantize();
-        }
+        let Some(row) = self.row_position(index) else {
+            return;
+        };
+        let Some(next) = self.rows.get(row + 1).map(|(next, _)| *next) else {
+            return;
+        };
+        self.edited[next].start_s = self.edited[index].start_s;
+        self.edited.drain(index..next);
+        self.requantize();
     }
 
-    /// Moves beat 0 later by whole beats so the first note starts at beat 0; does nothing when the take has no notes.
+    /// Moves beat 0 later by whole beats so the first row starts at beat 0, rounding to the nearest beat when the first row reaches it; does nothing when the take has no rows.
     pub fn start_at_first_note(&mut self) {
         let rows = quantize_indexed(&self.edited, self.bpm, self.grid, self.origin_s);
         let Some((_, first)) = rows.first() else {
             return;
         };
-        let shift = (first.start_beats + 1e-9).floor();
+        let start = first.start_beats;
+        let reached_past_rounded = start + first.length_beats - start.round();
+        let shift = if reached_past_rounded >= grid_step(self.grid) - BEAT_EPS {
+            start.round()
+        } else {
+            start.floor()
+        };
         self.shift_beats = if shift >= 1.0 { shift as u32 } else { 0 };
         self.requantize();
     }
 
-    /// Returns how many whole beats beat 0 has moved later by.
+    /// Returns how many whole beats beat 0 has moved later by; the rows are shifted in beat space by this amount.
     pub fn shift_beats(&self) -> u32 {
         self.shift_beats
     }
@@ -227,6 +277,45 @@ mod tests {
     use super::super::test_support::{three_note_take, tone_frames};
     use super::*;
     use crate::music::assert_close;
+
+    /// Builds frames every 0.01 s from `start_s` to `end_s`, voiced at the frequency of the first span of `tones` that covers the frame time and unvoiced elsewhere.
+    fn span_frames(start_s: f64, end_s: f64, tones: &[(f64, f64, f32)]) -> Vec<PitchFrame> {
+        let count = ((end_s - start_s) / 0.01).round() as usize;
+        (0..count)
+            .map(|i| {
+                let time_s = start_s + i as f64 * 0.01;
+                let tone = tones
+                    .iter()
+                    .find(|(from, to, _)| time_s >= *from && time_s < *to);
+                match tone {
+                    Some((_, _, hz)) => PitchFrame {
+                        time_s,
+                        freq_hz: Some(*hz),
+                        confidence: 0.95,
+                    },
+                    None => PitchFrame {
+                        time_s,
+                        freq_hz: None,
+                        confidence: 0.0,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Builds a take at 120 BPM with beat 0 at 0.0 s on the quarter grid whose raw notes are C5 0.00..0.40 s, D5 0.45..0.57 s and E5 0.60..1.00 s; D5 snaps onto the start of E5 and is trimmed to zero length, so the rows show C5 [0,1) and E5 [1,2) while D5 has no row.
+    fn hidden_middle_note_take() -> Take {
+        let frames = span_frames(
+            0.0,
+            1.0,
+            &[
+                (0.00, 0.40, 523.25),
+                (0.45, 0.57, 587.33),
+                (0.60, 1.00, 659.26),
+            ],
+        );
+        Take::new(frames, 0.0, 120.0, Grid::Quarter)
+    }
 
     #[test]
     fn a_three_note_take_has_three_indexed_notes() {
@@ -398,5 +487,98 @@ mod tests {
         assert!(table.iter().all(|row| matches!(row, Row::Note { .. })));
 
         assert!(table_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn merging_into_the_previous_row_skips_hidden_notes() {
+        let mut take = hidden_middle_note_take();
+        assert_eq!(take.rows().len(), 2);
+        assert_eq!(take.rows()[0].0, 0);
+        assert_eq!(take.rows()[0].1.midi, 72);
+        assert_close(take.rows()[0].1.start_beats, 0.0, 1e-9);
+        assert_close(take.rows()[0].1.length_beats, 1.0, 1e-9);
+        assert_eq!(take.rows()[1].0, 2);
+        assert_eq!(take.rows()[1].1.midi, 76);
+        assert_close(take.rows()[1].1.start_beats, 1.0, 1e-9);
+        assert_close(take.rows()[1].1.length_beats, 1.0, 1e-9);
+
+        take.merge_into_previous(2);
+        assert_eq!(take.rows().len(), 1);
+        let only = take.rows()[0].1;
+        assert_eq!(only.midi, 72);
+        assert_close(only.start_beats, 0.0, 1e-9);
+        assert_close(only.length_beats, 2.0, 1e-9);
+        assert!(take.rows().iter().all(|(_, note)| note.midi != 74));
+        assert!(take.notes().iter().all(|note| note.midi != 74));
+    }
+
+    #[test]
+    fn deleting_a_row_removes_the_hidden_notes_before_it() {
+        let mut take = hidden_middle_note_take();
+        take.delete(2);
+        assert_eq!(take.rows().len(), 1);
+        assert_eq!(take.rows()[0].1.midi, 72);
+        assert_close(take.rows()[0].1.start_beats, 0.0, 1e-9);
+        assert_close(take.rows()[0].1.length_beats, 1.0, 1e-9);
+        assert!(take.notes().iter().all(|note| note.midi != 74));
+    }
+
+    #[test]
+    fn merging_into_the_next_row_skips_hidden_notes() {
+        let mut take = hidden_middle_note_take();
+        take.merge_into_next(0);
+        assert_eq!(take.rows().len(), 1);
+        let only = take.rows()[0].1;
+        assert_eq!(only.midi, 76);
+        assert_close(only.start_beats, 0.0, 1e-9);
+        assert_close(only.length_beats, 2.0, 1e-9);
+        assert!(take.rows().iter().all(|(_, note)| note.midi != 74));
+        assert!(take.notes().iter().all(|note| note.midi != 74));
+    }
+
+    #[test]
+    fn an_index_without_a_row_changes_nothing() {
+        let mut take = hidden_middle_note_take();
+        take.merge_into_previous(1);
+        take.merge_into_next(1);
+        take.delete(1);
+        assert!(!take.is_edited());
+        assert_eq!(take.rows().len(), 2);
+        assert_eq!(take.rows()[0].1.midi, 72);
+        assert_eq!(take.rows()[1].1.midi, 76);
+    }
+
+    #[test]
+    fn start_at_first_note_keeps_a_short_first_note() {
+        let frames = span_frames(1.0, 3.5, &[(2.30, 2.45, 440.0), (2.80, 3.25, 523.25)]);
+        let mut take = Take::new(frames, 1.0, 120.0, Grid::Quarter);
+        assert_eq!(take.rows().len(), 2);
+        assert_eq!(take.rows()[0].1.midi, 69);
+        assert_close(take.rows()[0].1.start_beats, 3.0, 1e-9);
+        assert_close(take.rows()[0].1.length_beats, 1.0, 1e-9);
+
+        take.start_at_first_note();
+        assert_eq!(take.shift_beats(), 3);
+        assert_eq!(take.rows().len(), 2);
+        assert_eq!(take.rows()[0].1.midi, 69);
+        assert_close(take.rows()[0].1.start_beats, 0.0, 1e-9);
+        assert_close(take.rows()[0].1.length_beats, 1.0, 1e-9);
+        assert_eq!(take.rows()[1].1.midi, 72);
+        assert_close(take.rows()[1].1.start_beats, 1.0, 1e-9);
+    }
+
+    #[test]
+    fn start_at_first_note_rounds_a_first_note_that_reaches_its_beat() {
+        let mut frames = tone_frames(2.375, 0.5, 440.0);
+        frames.extend(tone_frames(4.0, 0.5, 523.25));
+        let mut take = Take::new(frames, 1.0, 120.0, Grid::Sixteenth);
+        assert_eq!(take.rows().len(), 2);
+        assert_close(take.rows()[0].1.start_beats, 2.75, 1e-9);
+        assert_close(take.rows()[0].1.length_beats, 1.0, 1e-9);
+
+        take.start_at_first_note();
+        assert_eq!(take.shift_beats(), 3);
+        assert_close(take.rows()[0].1.start_beats, 0.0, 1e-9);
+        assert_close(take.rows()[0].1.length_beats, 0.75, 1e-9);
     }
 }
