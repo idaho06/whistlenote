@@ -6,15 +6,15 @@
 use eframe::egui;
 
 pub use crate::music::bpm::{MAX_BPM, MIN_BPM};
-use crate::music::bpm::{TapTempo, estimate_bpm};
+use crate::music::bpm::{TapTempo, estimate_bpm_in};
 use crate::ui::GOOD_COLOR;
 use crate::ui::centered_row;
 use crate::ui::state::AppState;
 
-/// Most recent onsets the estimate uses.
+/// Default of [`TempoConfig::onset_window`]: most recent onsets the estimate uses.
 pub const ONSET_WINDOW: usize = 12;
 
-/// A longer gap between onsets in seconds starts a new run.
+/// Default of [`TempoConfig::run_gap_s`]: a longer gap between onsets in seconds starts a new run.
 pub const RUN_GAP_S: f64 = 4.0;
 
 /// How long the onset indicator stays lit in seconds.
@@ -23,11 +23,48 @@ pub const FLASH_S: f64 = 0.15;
 /// Tempo in BPM the BPM field starts with.
 pub const DEFAULT_BPM: f64 = 120.0;
 
+/// Settings of the tempo estimate from onsets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TempoConfig {
+    /// Most recent onsets the estimate uses.
+    pub onset_window: usize,
+    /// A longer gap between onsets in seconds starts a new run.
+    pub run_gap_s: f64,
+    /// Lowest estimated tempo.
+    pub min_bpm: f64,
+    /// Highest estimated tempo.
+    pub max_bpm: f64,
+}
+
+impl Default for TempoConfig {
+    fn default() -> Self {
+        Self {
+            onset_window: ONSET_WINDOW,
+            run_gap_s: RUN_GAP_S,
+            min_bpm: MIN_BPM,
+            max_bpm: MAX_BPM,
+        }
+    }
+}
+
+impl From<&crate::settings::Tuning> for TempoConfig {
+    fn from(tuning: &crate::settings::Tuning) -> Self {
+        Self {
+            onset_window: tuning.tempo.onset_window as usize,
+            run_gap_s: tuning.tempo.run_gap_ms / 1000.0,
+            min_bpm: tuning.tempo.min_bpm,
+            max_bpm: tuning.tempo.max_bpm,
+        }
+    }
+}
+
 /// The tempo state of the BPM tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BpmState {
-    /// At most [`ONSET_WINDOW`] onset times of the current run, oldest first.
+    /// At most [`TempoConfig::onset_window`] onset times of the current run, oldest first.
     onsets: Vec<f64>,
+    /// The settings of the tempo estimate from onsets.
+    config: TempoConfig,
     /// Engine-clock time of the latest onset in seconds.
     last_onset_s: Option<f64>,
     /// The tap tempo estimator.
@@ -42,6 +79,7 @@ impl Default for BpmState {
     fn default() -> Self {
         Self {
             onsets: Vec::new(),
+            config: TempoConfig::default(),
             last_onset_s: None,
             taps: TapTempo::new(),
             candidate_bpm: DEFAULT_BPM,
@@ -51,12 +89,31 @@ impl Default for BpmState {
 }
 
 impl BpmState {
+    /// Returns the settings of the tempo estimate from onsets.
+    pub fn config(&self) -> &TempoConfig {
+        &self.config
+    }
+
+    /// Stores `config` as the settings of the tempo estimate, drops the oldest stored onsets until at most [`TempoConfig::onset_window`] remain, and recomputes the candidate when the stored onsets give an estimate.
+    ///
+    /// An [`TempoConfig::onset_window`] of 0 is treated as 1. A `config` equal to the stored one changes nothing, so a tempo typed into the BPM field stays.
+    pub fn set_config(&mut self, config: TempoConfig) {
+        if config == self.config {
+            return;
+        }
+        self.config = config;
+        self.trim_onsets();
+        if let Some(bpm) = self.estimate() {
+            self.set_candidate(bpm);
+        }
+    }
+
     /// Pushes the onset at `time_s` seconds into the current run and updates the candidate.
     ///
     /// A non-finite `time_s` is ignored. When the latest stored onset lies
-    /// more than [`RUN_GAP_S`] before `time_s`, the stored onsets clear
-    /// first. At most [`ONSET_WINDOW`] onsets are kept. When the stored
-    /// onsets estimate a tempo, it becomes the candidate.
+    /// more than [`TempoConfig::run_gap_s`] before `time_s`, the stored onsets
+    /// clear first. At most [`TempoConfig::onset_window`] onsets are kept. When
+    /// the stored onsets estimate a tempo, it becomes the candidate.
     pub fn push_onset(&mut self, time_s: f64) {
         if !time_s.is_finite() {
             return;
@@ -64,23 +121,21 @@ impl BpmState {
         if self
             .onsets
             .last()
-            .is_some_and(|&last| time_s - last > RUN_GAP_S)
+            .is_some_and(|&last| time_s - last > self.config.run_gap_s)
         {
             self.onsets.clear();
         }
         self.onsets.push(time_s);
-        if self.onsets.len() > ONSET_WINDOW {
-            self.onsets.remove(0);
-        }
+        self.trim_onsets();
         self.last_onset_s = Some(time_s);
         if let Some(bpm) = self.estimate() {
             self.set_candidate(bpm);
         }
     }
 
-    /// Returns the tempo estimated from the stored onsets, or `None` when there are too few of them.
+    /// Returns the tempo estimated from the stored onsets within [`TempoConfig::min_bpm`]..=[`TempoConfig::max_bpm`], or `None` when there are too few of them.
     pub fn estimate(&self) -> Option<f64> {
-        estimate_bpm(&self.onsets)
+        estimate_bpm_in(&self.onsets, self.config.min_bpm, self.config.max_bpm)
     }
 
     /// Returns how many onsets the current run stores.
@@ -135,6 +190,14 @@ impl BpmState {
         self.onsets.clear();
         self.last_onset_s = None;
         self.taps.reset();
+    }
+
+    /// Drops the oldest stored onsets until at most [`TempoConfig::onset_window`] remain; an onset window of 0 is treated as 1.
+    fn trim_onsets(&mut self) {
+        let window = self.config.onset_window.max(1);
+        while self.onsets.len() > window {
+            self.onsets.remove(0);
+        }
     }
 }
 
@@ -276,6 +339,81 @@ mod tests {
             state.push_onset(6.5 + i as f64);
         }
         assert_close(state.estimate().expect("a tempo is estimated"), 60.0, 0.5);
+    }
+
+    #[test]
+    fn the_config_from_default_tuning_is_the_default_config() {
+        assert_eq!(
+            TempoConfig::from(&crate::settings::Tuning::default()),
+            TempoConfig::default()
+        );
+    }
+
+    #[test]
+    fn a_smaller_onset_window_keeps_fewer_onsets() {
+        let mut state = BpmState::default();
+        state.set_config(TempoConfig {
+            onset_window: 4,
+            ..TempoConfig::default()
+        });
+        for i in 0..10 {
+            state.push_onset(i as f64 * 0.5);
+        }
+        assert_eq!(state.onset_count(), 4);
+    }
+
+    #[test]
+    fn set_config_trims_the_stored_onsets() {
+        let mut state = BpmState::default();
+        for i in 0..10 {
+            state.push_onset(i as f64 * 0.5);
+        }
+        assert_eq!(state.onset_count(), 10);
+        state.set_config(TempoConfig {
+            onset_window: 5,
+            ..TempoConfig::default()
+        });
+        assert_eq!(state.onset_count(), 5);
+    }
+
+    #[test]
+    fn an_unchanged_config_keeps_the_typed_candidate() {
+        let mut state = BpmState::default();
+        for i in 0..8 {
+            state.push_onset(i as f64 * 0.5);
+        }
+        state.set_candidate(95.0);
+        state.set_config(TempoConfig::default());
+        assert_eq!(state.candidate_bpm(), 95.0);
+    }
+
+    #[test]
+    fn a_shorter_run_gap_starts_a_new_run_sooner() {
+        let mut state = BpmState::default();
+        state.set_config(TempoConfig {
+            run_gap_s: 1.0,
+            ..TempoConfig::default()
+        });
+        state.push_onset(0.0);
+        state.push_onset(0.5);
+        state.push_onset(1.0);
+        state.push_onset(2.5);
+        assert_eq!(state.onset_count(), 1);
+    }
+
+    #[test]
+    fn the_estimate_folds_into_the_configured_range() {
+        let mut state = BpmState::default();
+        state.set_config(TempoConfig {
+            min_bpm: 40.0,
+            max_bpm: 100.0,
+            ..TempoConfig::default()
+        });
+        for i in 0..8 {
+            state.push_onset(i as f64 * 0.5);
+        }
+        assert_close(state.estimate().expect("a tempo is estimated"), 60.0, 0.5);
+        assert_close(state.candidate_bpm(), 60.0, 0.5);
     }
 
     #[test]
