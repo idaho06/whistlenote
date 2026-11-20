@@ -127,8 +127,9 @@ fn voiced_midi(frame: &PitchFrame, cfg: &SegmentConfig) -> Option<i32> {
 /// ends before a hole ends one period after its last voiced frame. Notes
 /// shorter than `merge_note_s` that touch a neighbouring note merge into the
 /// longer neighbour, so a short pitch slide at the edge of a note extends
-/// that note instead of forming a note of its own. The result is sorted by
-/// start time and its notes do not overlap.
+/// that note instead of forming a note of its own. Touching notes of the
+/// same pitch join into one note. The result is sorted by start time and its
+/// notes do not overlap.
 pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
     let period = frame_period(frames);
     // A hole lies between the input frames j - 1 and j when their times
@@ -185,6 +186,7 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
     }
 
     merge_short_notes(&mut notes, cfg);
+    join_equal_neighbours(&mut notes, cfg);
     notes.retain(|note| note.end_s - note.start_s >= cfg.min_note_s - TIME_EPS_S);
     notes.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
     for i in 1..notes.len() {
@@ -233,6 +235,27 @@ fn merge_short_notes(notes: &mut Vec<RawNote>, cfg: &SegmentConfig) {
             notes[i + 1].start_s = notes[i].start_s;
         }
         notes.remove(i);
+    }
+}
+
+/// Joins consecutive notes of equal MIDI that touch into one note.
+///
+/// `notes` must be ordered by start time. Two consecutive notes touch when
+/// the gap between the end of the first and the start of the second is at
+/// most `cfg.max_gap_s`. A touching pair with equal MIDI numbers joins: the
+/// first note takes the end of the second and the second is removed. The
+/// scan repeats at the same position after a join, so a chain of touching
+/// equal notes becomes a single note.
+fn join_equal_neighbours(notes: &mut Vec<RawNote>, cfg: &SegmentConfig) {
+    let mut i = 1;
+    while i < notes.len() {
+        let gap = notes[i].start_s - notes[i - 1].end_s;
+        if notes[i].midi == notes[i - 1].midi && gap <= cfg.max_gap_s + TIME_EPS_S {
+            notes[i - 1].end_s = notes[i - 1].end_s.max(notes[i].end_s);
+            notes.remove(i);
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -460,5 +483,39 @@ mod tests {
     #[test]
     fn default_merge_note_s_is_point_one() {
         assert_eq!(SegmentConfig::default().merge_note_s, 0.1);
+    }
+
+    #[test]
+    fn a_short_wobble_inside_a_held_note_gives_one_note() {
+        let mut frames = run(0, 50, Some(440.0));
+        frames.extend(run(50, 8, Some(466.16)));
+        frames.extend(run(58, 50, Some(440.0)));
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 1.08, 1e-9);
+    }
+
+    #[test]
+    fn vibrato_across_a_semitone_boundary_gives_no_touching_equal_notes() {
+        let frames: Vec<PitchFrame> = (0..300)
+            .map(|i| {
+                let t = i as f64 * 0.01;
+                let m = 69.5 + 0.3 * (2.0 * std::f64::consts::PI * 5.0 * t).sin();
+                frame_at(i, Some(crate::music::note::midi_to_freq(m as f32)), 0.95)
+            })
+            .collect();
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert!(!notes.is_empty());
+        for pair in notes.windows(2) {
+            let (prev, next) = (pair[0], pair[1]);
+            if prev.midi == next.midi {
+                assert!(
+                    next.start_s - prev.end_s > SegmentConfig::default().max_gap_s,
+                    "touching notes of equal pitch: {prev:?} then {next:?}"
+                );
+            }
+        }
     }
 }
