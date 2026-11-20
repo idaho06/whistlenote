@@ -1,4 +1,4 @@
-//! The Record tab, in three parts: the recording state — the phase of a recording, the grid and metronome settings, the latest beat, the live frames and preview of the running recording and the finished take — the finished or preview take of a recording with the rows of its notes table, and the view that draws the tab.
+//! The Record tab, in three parts: the recording state — the phase of a recording, the grid and metronome settings, the segmentation and export settings, the latest beat, the live frames and preview of the running recording and the finished take — the finished or preview take of a recording with the rows of its notes table, and the view that draws the tab.
 
 mod take;
 mod view;
@@ -7,9 +7,10 @@ pub use take::{Row, Take, table_rows};
 pub use view::show;
 
 use crate::engine::{BeatPhase, EngineCommand, EngineEvent, LiveFrame};
+use crate::export::midi::MidiOptions;
 use crate::metronome::BEATS_PER_BAR;
 use crate::music::quantize::Grid;
-use crate::music::segment::PitchFrame;
+use crate::music::segment::{PitchFrame, SegmentConfig};
 
 /// Phase of a recording as the Record tab sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,6 +36,10 @@ pub struct RecordState {
     phase: RecordPhase,
     /// Grid the finished take and the preview are quantized onto.
     grid: Grid,
+    /// Segmentation config takes and the preview are built with.
+    segment: SegmentConfig,
+    /// MIDI export options takes and the preview are exported with.
+    midi: MidiOptions,
     /// Whether recording beats are audible.
     metronome: bool,
     /// Tempo of the running recording, locked at start.
@@ -43,6 +48,8 @@ pub struct RecordState {
     last_beat: Option<(u32, BeatPhase)>,
     /// The latest finished take.
     take: Option<Take>,
+    /// Count of the finished takes.
+    take_generation: u64,
     /// Beat 0 of the running recording, once the engine reports the start.
     origin_s: Option<f64>,
     /// Live frames of the running recording, from its start.
@@ -58,10 +65,13 @@ impl Default for RecordState {
         Self {
             phase: RecordPhase::Idle,
             grid: Grid::default(),
+            segment: SegmentConfig::default(),
+            midi: MidiOptions::default(),
             metronome: true,
             bpm: 0.0,
             last_beat: None,
             take: None,
+            take_generation: 0,
             origin_s: None,
             live_frames: Vec::new(),
             unprocessed: 0,
@@ -96,6 +106,21 @@ impl RecordState {
         self.take.as_mut()
     }
 
+    /// Returns how many takes have been finished.
+    pub fn take_generation(&self) -> u64 {
+        self.take_generation
+    }
+
+    /// Puts back a copy of the finished take taken at `generation`; a take recorded since then is kept.
+    pub fn restore_take(&mut self, generation: u64, take: Take) -> bool {
+        if generation == self.take_generation {
+            self.take = Some(take);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns the preview of the running recording — its notes so far — once one has been built.
     pub fn preview(&self) -> Option<&Take> {
         self.preview.as_ref()
@@ -121,6 +146,35 @@ impl RecordState {
         self.grid = grid;
         for take in [&mut self.take, &mut self.preview].into_iter().flatten() {
             take.set_grid(grid);
+        }
+    }
+
+    /// Returns the segmentation config takes and the preview are built with.
+    pub fn segment_config(&self) -> SegmentConfig {
+        self.segment
+    }
+
+    /// Stores `segment` as the segmentation config and applies it to the finished take and the preview, if there are any, which re-segments them and resets the take's edits; a `segment` equal to the stored config changes nothing, so the take keeps its edits and its own merge threshold.
+    pub fn set_segment_config(&mut self, segment: SegmentConfig) {
+        if segment == self.segment {
+            return;
+        }
+        self.segment = segment;
+        for take in [&mut self.take, &mut self.preview].into_iter().flatten() {
+            take.set_segment_config(segment);
+        }
+    }
+
+    /// Returns the MIDI export options takes and the preview are exported with.
+    pub fn midi_options(&self) -> MidiOptions {
+        self.midi
+    }
+
+    /// Stores `midi` as the MIDI export options and applies them to the finished take and the preview, if there are any; the notes stay unchanged.
+    pub fn set_midi_options(&mut self, midi: MidiOptions) {
+        self.midi = midi;
+        for take in [&mut self.take, &mut self.preview].into_iter().flatten() {
+            take.set_midi_options(midi);
         }
     }
 
@@ -172,7 +226,15 @@ impl RecordState {
                 self.origin_s = Some(*origin_s);
             }
             EngineEvent::RecordingFinished { frames, origin_s } if !self.is_idle() => {
-                self.take = Some(Take::new(frames.clone(), *origin_s, self.bpm, self.grid));
+                self.take = Some(Take::with_config(
+                    frames.clone(),
+                    *origin_s,
+                    self.bpm,
+                    self.grid,
+                    self.segment,
+                    self.midi,
+                ));
+                self.take_generation = self.take_generation.wrapping_add(1);
                 self.end_run();
             }
             EngineEvent::RecordingAborted if !self.is_idle() => self.end_run(),
@@ -194,11 +256,13 @@ impl RecordState {
         if let Some(origin_s) = self.origin_s
             && self.unprocessed >= PREVIEW_EVERY_FRAMES
         {
-            self.preview = Some(Take::new(
+            self.preview = Some(Take::with_config(
                 self.live_frames.clone(),
                 origin_s,
                 self.bpm,
                 self.grid,
+                self.segment,
+                self.midi,
             ));
             self.unprocessed = 0;
         }
@@ -317,7 +381,7 @@ mod tests {
     use super::test_support::{beat, live_frames, recorded_state, tone_frames};
     use super::*;
     use crate::export::csv::to_csv;
-    use crate::export::midi::to_midi_bytes;
+    use crate::export::midi::{MidiOptions, to_midi_bytes};
     use crate::music::assert_close;
     use crate::music::quantize::quantize;
     use crate::music::segment::{SegmentConfig, segment};
@@ -718,5 +782,81 @@ mod tests {
             1.0,
         );
         assert_eq!(preview.notes(), expected.as_slice());
+    }
+
+    #[test]
+    fn a_finished_recording_uses_the_stored_configs() {
+        let mut state = RecordState::default();
+        state.set_segment_config(SegmentConfig {
+            min_note_s: 1.0,
+            ..SegmentConfig::default()
+        });
+        state.set_midi_options(MidiOptions {
+            velocity: 64,
+            channel: 9,
+        });
+        state.start(120.0);
+        for i in 0..4 {
+            state.apply_event(&beat(i, BeatPhase::CountIn));
+        }
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        state.apply_event(&beat(0, BeatPhase::Recording));
+        state.stop();
+        state.apply_event(&EngineEvent::RecordingFinished {
+            frames: tone_frames(1.0, 0.5, 440.0),
+            origin_s: 1.0,
+        });
+        let take = state.take().expect("a take");
+        assert!(take.notes().is_empty());
+        assert_eq!(
+            take.midi_options(),
+            MidiOptions {
+                velocity: 64,
+                channel: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn set_segment_config_resegments_the_take() {
+        let (mut state, _) = recorded_state(tone_frames(1.0, 0.5, 440.0));
+        assert_eq!(state.take().expect("a take").notes().len(), 1);
+        state.set_segment_config(SegmentConfig {
+            min_note_s: 1.0,
+            ..SegmentConfig::default()
+        });
+        assert!(state.take().expect("a take").notes().is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_segment_config_keeps_the_edits() {
+        let (mut state, _) = recorded_state(tone_frames(1.0, 0.5, 440.0));
+        state.take_mut().expect("a take").delete(0);
+        assert!(state.take().expect("a take").is_edited());
+        state.set_segment_config(SegmentConfig::default());
+        assert!(state.take().expect("a take").is_edited());
+    }
+
+    #[test]
+    fn each_finished_take_raises_the_generation() {
+        let state = RecordState::default();
+        assert_eq!(state.take_generation(), 0);
+        let (state, _) = recorded_state(tone_frames(1.0, 0.5, 440.0));
+        assert_eq!(state.take_generation(), 1);
+    }
+
+    #[test]
+    fn restore_take_needs_the_same_generation() {
+        let (mut state, _) = recorded_state(tone_frames(1.0, 0.5, 440.0));
+        assert_eq!(state.take_generation(), 1);
+        let snapshot = state.take().expect("a take").clone();
+        state.set_segment_config(SegmentConfig {
+            min_note_s: 1.0,
+            ..SegmentConfig::default()
+        });
+        assert!(state.take().expect("a take").notes().is_empty());
+        assert!(state.restore_take(1, snapshot.clone()));
+        assert_eq!(state.take().expect("a take").notes().len(), 1);
+        assert!(!state.restore_take(0, snapshot));
     }
 }

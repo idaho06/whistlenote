@@ -1,20 +1,9 @@
 //! The finished or preview take of a recording, editable before export, and the rows of its notes table.
 
-use crate::export::csv::to_csv;
-use crate::export::midi::to_midi_bytes;
+use crate::export::csv::to_csv_at;
+use crate::export::midi::{MidiOptions, to_midi_bytes_with};
 use crate::music::quantize::{Grid, MIN_LENGTH_B, QuantNote, quantize_indexed, step_beats};
 use crate::music::segment::{PitchFrame, RawNote, SegmentConfig, segment};
-
-/// Segments `frames` with the default config and `merge_note_s` as the short-note threshold.
-fn segment_with(frames: &[PitchFrame], merge_note_s: f64) -> Vec<RawNote> {
-    segment(
-        frames,
-        &SegmentConfig {
-            merge_note_s,
-            ..SegmentConfig::default()
-        },
-    )
-}
 
 /// A finished recording: its frames and the notes quantized from them, editable before export.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,9 +16,11 @@ pub struct Take {
     bpm: f64,
     /// Grid the edited notes are quantized onto.
     grid: Grid,
-    /// Short-note threshold used for `raw`.
-    merge_note_s: f64,
-    /// Notes segmented from `frames` with `SegmentConfig { merge_note_s, ..Default::default() }`.
+    /// Config the raw notes are segmented with.
+    segment: SegmentConfig,
+    /// MIDI export options of the take.
+    midi: MidiOptions,
+    /// Notes segmented from `frames` with `segment`.
     raw: Vec<RawNote>,
     /// The raw notes after the user's edits, in time order.
     edited: Vec<RawNote>,
@@ -42,17 +33,24 @@ pub struct Take {
 }
 
 impl Take {
-    /// Segments `frames` with the default config and quantizes the notes onto `grid`, building the take recorded at `bpm` with beat 0 at `origin_s`.
-    pub fn new(frames: Vec<PitchFrame>, origin_s: f64, bpm: f64, grid: Grid) -> Self {
-        let merge_note_s = SegmentConfig::default().merge_note_s;
-        let raw = segment_with(&frames, merge_note_s);
+    /// Segments `frames` with `segment` and quantizes the notes onto `grid`, building the take recorded at `bpm` with beat 0 at `origin_s` and exported with `midi`.
+    pub fn with_config(
+        frames: Vec<PitchFrame>,
+        origin_s: f64,
+        bpm: f64,
+        grid: Grid,
+        segment: SegmentConfig,
+        midi: MidiOptions,
+    ) -> Self {
+        let raw = crate::music::segment::segment(&frames, &segment);
         let edited = raw.clone();
         let mut take = Self {
             frames,
             origin_s,
             bpm,
             grid,
-            merge_note_s,
+            segment,
+            midi,
             raw,
             edited,
             shift_beats: 0,
@@ -61,6 +59,18 @@ impl Take {
         };
         take.requantize();
         take
+    }
+
+    /// Segments `frames` with the default segmentation settings and quantizes the notes onto `grid`, building the take recorded at `bpm` with beat 0 at `origin_s`; the take uses the default export settings.
+    pub fn new(frames: Vec<PitchFrame>, origin_s: f64, bpm: f64, grid: Grid) -> Self {
+        Self::with_config(
+            frames,
+            origin_s,
+            bpm,
+            grid,
+            SegmentConfig::default(),
+            MidiOptions::default(),
+        )
     }
 
     /// Recomputes `rows` and `notes` from the edited notes, the grid and the recorded `origin_s`: the notes are quantized with the unshifted `origin_s`, then shifted in beat space by `shift_beats`; a row whose start falls below 0 is clamped to beat 0 and shortened by the same amount, and a row left with a length of at most the beat tolerance is dropped.
@@ -166,19 +176,47 @@ impl Take {
         self.shift_beats
     }
 
-    /// Stores `s` as the short-note threshold, re-segments `frames` with it, resets the edits and requantizes; a non-finite or negative `s` is ignored.
+    /// Stores `s` as the short-note threshold of the segmentation config, re-segments `frames` with the config, resets the edits and requantizes; a non-finite or negative `s` is ignored.
     pub fn set_merge_note_s(&mut self, s: f64) {
         if !s.is_finite() || s < 0.0 {
             return;
         }
-        self.merge_note_s = s;
-        self.raw = segment_with(&self.frames, s);
+        self.segment.merge_note_s = s;
+        self.raw = segment(&self.frames, &self.segment);
         self.reset_edits();
     }
 
-    /// Returns the short-note threshold used for the raw notes.
+    /// Returns the short-note threshold of the segmentation config.
     pub fn merge_note_s(&self) -> f64 {
-        self.merge_note_s
+        self.segment.merge_note_s
+    }
+
+    /// Returns the segmentation config of the raw notes.
+    pub fn segment_config(&self) -> SegmentConfig {
+        self.segment
+    }
+
+    /// Stores `segment` as the segmentation config, re-segments `frames` with it and resets the edits; a config whose `merge_note_s`, `min_note_s` or `max_gap_s` is not finite or negative, or whose `a4_hz` is not finite or not positive, is ignored.
+    pub fn set_segment_config(&mut self, segment: SegmentConfig) {
+        let seconds_valid = [segment.merge_note_s, segment.min_note_s, segment.max_gap_s]
+            .iter()
+            .all(|s| s.is_finite() && *s >= 0.0);
+        if !seconds_valid || !segment.a4_hz.is_finite() || segment.a4_hz <= 0.0 {
+            return;
+        }
+        self.raw = crate::music::segment::segment(&self.frames, &segment);
+        self.segment = segment;
+        self.reset_edits();
+    }
+
+    /// Returns the MIDI export options of the take.
+    pub fn midi_options(&self) -> MidiOptions {
+        self.midi
+    }
+
+    /// Stores `midi` as the MIDI export options; the notes stay unchanged.
+    pub fn set_midi_options(&mut self, midi: MidiOptions) {
+        self.midi = midi;
     }
 
     /// Resets the edits to the raw notes and beat 0 to its recorded position, and requantizes.
@@ -208,14 +246,14 @@ impl Take {
         self.frames.len()
     }
 
-    /// Returns the edited notes as a Standard MIDI File at the take's tempo.
+    /// Returns the edited notes as a Standard MIDI File at the take's tempo, with the take's MIDI options.
     pub fn midi_bytes(&self) -> Vec<u8> {
-        to_midi_bytes(&self.notes, self.bpm)
+        to_midi_bytes_with(&self.notes, self.bpm, &self.midi)
     }
 
-    /// Returns the edited notes as CSV text.
+    /// Returns the edited notes as CSV text; the frequency column follows the take's A4 reference.
     pub fn csv(&self) -> String {
-        to_csv(&self.notes)
+        to_csv_at(&self.notes, self.segment.a4_hz)
     }
 }
 
@@ -263,6 +301,7 @@ pub fn table_rows(rows: &[(usize, QuantNote)]) -> Vec<Row> {
 mod tests {
     use super::super::test_support::{three_note_take, tone_frames};
     use super::*;
+    use crate::export::midi::to_midi_bytes;
     use crate::music::assert_close;
 
     /// Builds frames every 0.01 s from `start_s` to `end_s`, voiced at the frequency of the first span of `tones` that covers the frame time and unvoiced elsewhere.
@@ -414,6 +453,113 @@ mod tests {
         assert_eq!(take.shift_beats(), 0);
         assert!(!take.is_edited());
         assert_close(take.notes()[0].start_beats, 4.0, 1e-9);
+    }
+
+    #[test]
+    fn with_config_segments_with_the_given_config() {
+        let frames = tone_frames(1.0, 0.5, 440.0);
+        let strict = Take::with_config(
+            frames.clone(),
+            1.0,
+            120.0,
+            Grid::Sixteenth,
+            SegmentConfig {
+                min_note_s: 1.0,
+                ..SegmentConfig::default()
+            },
+            MidiOptions::default(),
+        );
+        assert!(strict.notes().is_empty());
+        let take = Take::with_config(
+            frames,
+            1.0,
+            120.0,
+            Grid::Sixteenth,
+            SegmentConfig::default(),
+            MidiOptions::default(),
+        );
+        assert_eq!(take.notes().len(), 1);
+    }
+
+    #[test]
+    fn set_segment_config_resegments_and_resets_the_edits() {
+        let mut take = three_note_take();
+        take.delete(1);
+        assert!(take.is_edited());
+        assert_eq!(take.notes().len(), 2);
+        take.set_segment_config(SegmentConfig::default());
+        assert!(!take.is_edited());
+        assert_eq!(take.notes().len(), 3);
+        take.set_segment_config(SegmentConfig {
+            min_note_s: 1.0,
+            ..SegmentConfig::default()
+        });
+        assert!(take.notes().is_empty());
+        assert_eq!(take.segment_config().min_note_s, 1.0);
+    }
+
+    #[test]
+    fn an_invalid_segment_config_is_ignored() {
+        let mut take = three_note_take();
+        let before = take.segment_config();
+        take.set_segment_config(SegmentConfig {
+            merge_note_s: f64::NAN,
+            ..SegmentConfig::default()
+        });
+        assert_eq!(take.segment_config(), before);
+        take.set_segment_config(SegmentConfig {
+            a4_hz: 0.0,
+            ..SegmentConfig::default()
+        });
+        assert_eq!(take.segment_config(), before);
+    }
+
+    #[test]
+    fn set_merge_note_s_changes_only_the_merge_threshold() {
+        let mut take = three_note_take();
+        take.set_segment_config(SegmentConfig {
+            min_note_s: 0.2,
+            ..SegmentConfig::default()
+        });
+        take.set_merge_note_s(0.05);
+        assert_eq!(take.segment_config().min_note_s, 0.2);
+        assert_eq!(take.merge_note_s(), 0.05);
+    }
+
+    #[test]
+    fn the_csv_follows_the_a4_reference() {
+        let take = Take::with_config(
+            tone_frames(1.0, 0.5, 432.0),
+            1.0,
+            120.0,
+            Grid::Sixteenth,
+            SegmentConfig {
+                a4_hz: 432.0,
+                ..SegmentConfig::default()
+            },
+            MidiOptions::default(),
+        );
+        assert!(take.csv().contains(",A4,69,432.00"));
+    }
+
+    #[test]
+    fn midi_bytes_use_the_midi_options() {
+        let mut take = three_note_take();
+        take.set_midi_options(MidiOptions {
+            velocity: 64,
+            channel: 9,
+        });
+        assert_eq!(
+            take.midi_bytes(),
+            to_midi_bytes_with(
+                take.notes(),
+                120.0,
+                &MidiOptions {
+                    velocity: 64,
+                    channel: 9,
+                }
+            )
+        );
     }
 
     #[test]
