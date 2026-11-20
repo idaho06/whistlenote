@@ -6,7 +6,7 @@
 
 use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
 use crate::ui::bpm_mode::BpmState;
-use crate::ui::live::{CLEAR_S, NoteSmoother, ShownNote};
+use crate::ui::live::{LiveConfig, NoteSmoother, ShownNote};
 use crate::ui::record_mode::RecordState;
 
 pub(crate) use crate::engine::MAX_LATENCY_MS;
@@ -103,13 +103,14 @@ impl AppState {
         self.record.push_live(&frame);
     }
 
-    /// Advances the live readout to the UI time `now_ui_s`: `received` says whether live frames arrived since the previous tick. When none arrived for more than [`CLEAR_S`] since the last tick that received frames, the shown note and the latest live frame clear.
+    /// Advances the live readout to the UI time `now_ui_s`: `received` says whether live frames arrived since the previous tick. When none arrived for more than the clear time of the live config since the last tick that received frames, the shown note and the latest live frame clear.
     pub fn live_tick(&mut self, now_ui_s: f64, received: bool) {
+        let clear_s = self.live.config().clear_s;
         if received {
             self.last_live_ui_s = Some(now_ui_s);
         } else if self
             .last_live_ui_s
-            .is_some_and(|last_s| now_ui_s - last_s > CLEAR_S)
+            .is_some_and(|last_s| now_ui_s - last_s > clear_s)
         {
             self.live.reset();
             self.latest_live = None;
@@ -226,6 +227,16 @@ impl AppState {
     /// Returns the smoothed live note the live view shows, if one is shown.
     pub fn live_note(&self) -> Option<ShownNote> {
         self.live.shown()
+    }
+
+    /// Returns the config of the live note readout.
+    pub fn live_config(&self) -> &LiveConfig {
+        self.live.config()
+    }
+
+    /// Sets the config of the live note readout; the shown note stays.
+    pub fn set_live_config(&mut self, config: LiveConfig) {
+        self.live.set_config(config);
     }
 
     /// Returns whether the selected input is not in the reported input list; `None` is never missing.
@@ -604,6 +615,26 @@ mod tests {
         state.live_tick(10.2, false);
         assert!(state.live_note().is_some());
         assert!(state.latest_live().is_some());
+    }
+
+    #[test]
+    fn the_live_readout_follows_the_configured_clear_time() {
+        let mut state = AppState::default();
+        state.set_listening(true);
+        state.set_live_config(LiveConfig {
+            clear_s: 1.0,
+            ..Default::default()
+        });
+        feed_three_voiced_frames(&mut state);
+        state.live_tick(10.0, true);
+        assert!(state.live_note().is_some());
+        assert!(state.latest_live().is_some());
+        state.live_tick(10.5, false);
+        assert!(state.live_note().is_some());
+        assert!(state.latest_live().is_some());
+        state.live_tick(11.1, false);
+        assert_eq!(state.live_note(), None);
+        assert_eq!(state.latest_live(), None);
     }
 
     #[test]
