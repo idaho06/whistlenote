@@ -63,6 +63,10 @@ pub struct AppState {
     listening: bool,
     /// Sample rate of the open input in Hz, or `None` when no input is open.
     input_rate_hz: Option<u32>,
+    /// Standard sample rates the selected input supports, from the latest `InputRates` event.
+    input_rates: Vec<u32>,
+    /// Chosen input sample rate in Hz, or `None` for the automatic choice.
+    input_rate_choice: Option<u32>,
     /// Latest error text and how many times in a row it arrived.
     error: Option<(String, u32)>,
     /// Latest live pitch frame.
@@ -95,9 +99,13 @@ impl AppState {
     /// Applies `event`: the recording state of the Record tab folds it first,
     /// a device list replaces the stored lists and keeps the selections — the
     /// first list after a session restore checks the restored devices and
-    /// falls a missing one back to the default device — an input rate
-    /// replaces the stored rate, an onset feeds the tempo state of the BPM
-    /// tab, a repeated error raises its count, other events change nothing.
+    /// falls a missing one back to the default device — the supported input
+    /// rates replace the stored list, and a chosen rate the list does not
+    /// offer falls back to the automatic choice with a queued command and a
+    /// status message, an input rate replaces the stored rate, and a rate
+    /// that differs from the chosen one is reported in the status bar, an
+    /// onset feeds the tempo state of the BPM tab, a repeated error raises
+    /// its count, other events change nothing.
     pub fn apply_event(&mut self, event: EngineEvent) {
         self.record.apply_event(&event);
         match event {
@@ -110,7 +118,31 @@ impl AppState {
                     self.check_restored_devices();
                 }
             }
-            EngineEvent::InputRate(rate) => self.input_rate_hz = rate,
+            EngineEvent::InputRates(rates) => {
+                self.input_rates = rates;
+                if let Some(choice) = self.input_rate_choice
+                    && !self.input_rates.contains(&choice)
+                {
+                    self.input_rate_choice = None;
+                    self.pending.push(EngineCommand::SetInputRate(None));
+                    self.report_error(format!(
+                        "The input does not offer {}; using Auto",
+                        rate_label(choice)
+                    ));
+                }
+            }
+            EngineEvent::InputRate(rate) => {
+                self.input_rate_hz = rate;
+                if let (Some(actual), Some(choice)) = (rate, self.input_rate_choice)
+                    && actual != choice
+                {
+                    self.report_error(format!(
+                        "The input opened at {} instead of {}",
+                        rate_label(actual),
+                        rate_label(choice)
+                    ));
+                }
+            }
             EngineEvent::Error(text) => count_error(&mut self.error, text),
             _ => {}
         }
@@ -138,11 +170,12 @@ impl AppState {
         }
     }
 
-    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop, and clears the saved input name of a restored session, while an unchanged selection keeps it.
+    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop, clears the saved input name of a restored session, and resets the chosen input rate to the automatic choice, since the engine resets its rate on every selection, while an unchanged selection keeps them.
     pub fn select_input(&mut self, name: Option<String>) -> Option<EngineCommand> {
         let command = set_selection(&mut self.input, name).map(EngineCommand::SelectInput);
         if command.is_some() {
             self.saved_input = None;
+            self.input_rate_choice = None;
             self.record.cancel();
         }
         command
@@ -156,6 +189,16 @@ impl AppState {
             self.record.cancel();
         }
         command
+    }
+
+    /// Sets the chosen input sample rate `choice`, `None` for the automatic choice, and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
+    pub fn set_input_rate_choice(&mut self, choice: Option<u32>) -> Option<EngineCommand> {
+        if self.input_rate_choice == choice {
+            return None;
+        }
+        self.input_rate_choice = choice;
+        self.record.cancel();
+        Some(EngineCommand::SetInputRate(choice))
     }
 
     /// Clamps `ms` to the allowed range, stores it and returns the command for the engine; returns `None` when `ms` is not finite or unchanged.
@@ -296,6 +339,16 @@ impl AppState {
         self.input_rate_hz
     }
 
+    /// Returns the standard sample rates the selected input supports, from the latest `InputRates` event.
+    pub fn input_rates(&self) -> &[u32] {
+        &self.input_rates
+    }
+
+    /// Returns the chosen input sample rate in Hz, or `None` for the automatic choice.
+    pub fn input_rate_choice(&self) -> Option<u32> {
+        self.input_rate_choice
+    }
+
     /// Returns the latest error text and how many times in a row it arrived.
     pub fn error(&self) -> Option<(&str, u32)> {
         self.error
@@ -333,13 +386,14 @@ impl AppState {
         missing(&self.output, &self.outputs)
     }
 
-    /// Checks the restored selections against the reported device lists: a selected name missing from its list moves to the saved slot, the selection becomes the default device and the fallback command is queued; the fallbacks are reported as one status message, the input first.
+    /// Checks the restored selections against the reported device lists: a selected name missing from its list moves to the saved slot, the selection becomes the default device, the fallback command is queued and, for the input, the chosen input rate resets to the automatic choice, since the engine resets its rate on every selection; the fallbacks are reported as one status message, the input first.
     fn check_restored_devices(&mut self) {
         let input_missing = missing(&self.input, &self.inputs);
         let output_missing = missing(&self.output, &self.outputs);
         let mut messages = Vec::new();
         if input_missing && let Some(name) = self.input.take() {
             self.saved_input = Some(name.clone());
+            self.input_rate_choice = None;
             self.pending.push(EngineCommand::SelectInput(None));
             messages.push(format!(
                 "Saved input “{name}” is not available; using the default input"
@@ -796,6 +850,97 @@ mod tests {
         assert_eq!(state.input_rate_hz(), Some(8_000));
         state.apply_event(EngineEvent::InputRate(None));
         assert_eq!(state.input_rate_hz(), None);
+    }
+
+    #[test]
+    fn the_rate_choice_is_sent_once() {
+        let mut state = AppState::default();
+        assert_eq!(state.input_rate_choice(), None);
+        assert_eq!(
+            state.set_input_rate_choice(Some(96_000)),
+            Some(EngineCommand::SetInputRate(Some(96_000)))
+        );
+        assert_eq!(state.input_rate_choice(), Some(96_000));
+        assert_eq!(state.set_input_rate_choice(Some(96_000)), None);
+        assert_eq!(
+            state.set_input_rate_choice(None),
+            Some(EngineCommand::SetInputRate(None))
+        );
+        assert_eq!(state.input_rate_choice(), None);
+    }
+
+    #[test]
+    fn changing_the_rate_choice_cancels_a_recording() {
+        let mut state = AppState::default();
+        state.record.start(120.0);
+        assert!(!state.record.is_idle());
+        assert_eq!(
+            state.set_input_rate_choice(Some(96_000)),
+            Some(EngineCommand::SetInputRate(Some(96_000)))
+        );
+        assert!(state.record.is_idle());
+        assert!(state.record.take().is_none());
+    }
+
+    #[test]
+    fn a_rate_list_without_the_choice_falls_back_to_auto() {
+        let mut state = AppState::default();
+        state.set_input_rate_choice(Some(96_000));
+        state.apply_event(EngineEvent::InputRates(vec![48_000]));
+        assert_eq!(state.input_rates(), &[48_000]);
+        assert_eq!(state.input_rate_choice(), None);
+        assert!(
+            state
+                .engine_commands()
+                .contains(&EngineCommand::SetInputRate(None))
+        );
+        let (text, _) = state.error().expect("a status message");
+        assert!(text.contains("does not offer 96 kHz"));
+    }
+
+    #[test]
+    fn a_rate_list_with_the_choice_keeps_it() {
+        let mut state = AppState::default();
+        state.set_input_rate_choice(Some(96_000));
+        state.engine_commands();
+        state.apply_event(EngineEvent::InputRates(vec![48_000, 96_000]));
+        assert_eq!(state.input_rates(), &[48_000, 96_000]);
+        assert_eq!(state.input_rate_choice(), Some(96_000));
+        assert!(state.engine_commands().is_empty());
+        assert_eq!(state.error(), None);
+    }
+
+    #[test]
+    fn a_differing_opened_rate_is_reported() {
+        let mut state = AppState::default();
+        state.set_input_rate_choice(Some(96_000));
+        state.apply_event(EngineEvent::InputRate(Some(48_000)));
+        assert_eq!(state.input_rate_hz(), Some(48_000));
+        assert_eq!(state.input_rate_choice(), Some(96_000));
+        let (text, _) = state.error().expect("a status message");
+        assert!(text.contains("opened at 48 kHz instead of 96 kHz"));
+    }
+
+    #[test]
+    fn the_opened_rate_without_a_choice_reports_nothing() {
+        let mut state = AppState::default();
+        state.apply_event(EngineEvent::InputRate(Some(48_000)));
+        assert_eq!(state.input_rate_hz(), Some(48_000));
+        assert_eq!(state.error(), None);
+    }
+
+    #[test]
+    fn changing_the_input_resets_the_rate_choice() {
+        let mut state = AppState::default();
+        state.set_input_rate_choice(Some(96_000));
+        assert_eq!(
+            state.select_input(Some("X".to_string())),
+            Some(EngineCommand::SelectInput(Some("X".to_string())))
+        );
+        assert_eq!(state.input_rate_choice(), None);
+        state.set_input_rate_choice(Some(96_000));
+        assert_eq!(state.select_input(Some("X".to_string())), None);
+        assert_eq!(state.input_rate_choice(), Some(96_000));
     }
 
     #[test]

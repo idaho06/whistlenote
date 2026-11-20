@@ -4,12 +4,12 @@
 //! closes. It loads the settings file at start, restores the session and
 //! applies the tuning, and shows a load warning in the status bar; on exit it
 //! writes the session and the last saved tuning back. The window has a top
-//! bar with the input and output device combos, the refresh button, the
-//! latency offset, the preferences button that opens the floating
-//! preferences window, the listen toggle and the tab buttons, a status bar at
-//! the bottom that shows whether the engine listens, the input sample rate
-//! and the latest error, and a central panel with the heading of the selected
-//! tab. The views share the [`state::AppState`], which folds the events of
+//! bar with the input device combo, the input rate combo, the output device
+//! combo, the refresh button, the latency offset, the preferences button
+//! that opens the floating preferences window, the listen toggle and the tab
+//! buttons, a status bar at the bottom that shows whether the engine
+//! listens, the input sample rate and the latest error, and a central panel
+//! with the heading of the selected tab. The views share the [`state::AppState`], which folds the events of
 //! the engine into the state and turns user actions into engine commands.
 
 pub mod bpm_mode;
@@ -122,10 +122,11 @@ impl WhistlenoteApp {
         }
     }
 
-    /// Shows the top bar in two rows: the device combos, the refresh button,
-    /// the latency offset and the preferences button, which wrap in a narrow
-    /// window; then the listen toggle, disabled while a recording runs, and
-    /// the tab buttons.
+    /// Shows the top bar in two rows: the input combo with the rate combo
+    /// right after it, the output combo, the refresh button, the latency
+    /// offset and the preferences button, which wrap in a narrow window;
+    /// then the listen toggle, disabled while a recording runs, and the tab
+    /// buttons.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Input");
@@ -137,6 +138,16 @@ impl WhistlenoteApp {
                 self.state.input_missing(),
             );
             let command = self.state.select_input(input);
+            self.send(command);
+
+            ui.label("Rate");
+            let choice = rate_combo(
+                ui,
+                self.state.input_rates(),
+                self.state.input_rate_choice(),
+                self.state.input_rate_hz(),
+            );
+            let command = self.state.set_input_rate_choice(choice);
             self.send(command);
 
             ui.label("Output");
@@ -343,6 +354,45 @@ fn selected_label(selected: Option<&str>, missing: bool) -> String {
     }
 }
 
+/// Shows a combo box with "Auto" and every rate in `rates` and returns the
+/// chosen rate, `None` for the automatic choice. The combo shows
+/// [`rate_choice_label`] as its text.
+fn rate_combo(
+    ui: &mut egui::Ui,
+    rates: &[u32],
+    choice: Option<u32>,
+    open_rate: Option<u32>,
+) -> Option<u32> {
+    let mut choice = choice;
+    let label = rate_choice_label(choice, open_rate);
+    let response = egui::ComboBox::from_id_salt("input_rate")
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut choice, None, "Auto");
+            for rate in rates {
+                ui.selectable_value(&mut choice, Some(*rate), rate_label(*rate));
+            }
+        })
+        .response;
+    response.on_hover_text(
+        "Sample rate of the input; Auto uses the device default, or 48 kHz when the default is below 44.1 kHz",
+    );
+    choice
+}
+
+/// Returns the label of the rate choice in the rate combo: the label of the
+/// chosen rate for `Some`, otherwise "Auto", with the opened rate in
+/// parentheses when an input is open.
+fn rate_choice_label(choice: Option<u32>, open_rate: Option<u32>) -> String {
+    match choice {
+        Some(rate) => rate_label(rate),
+        None => match open_rate {
+            Some(rate) => format!("Auto ({})", rate_label(rate)),
+            None => "Auto".to_string(),
+        },
+    }
+}
+
 /// Returns the error label: `text`, with " (×N)" appended when the error
 /// arrived `count` times in a row.
 fn error_label(text: &str, count: u32) -> String {
@@ -370,6 +420,22 @@ mod tests {
     #[test]
     fn a_missing_device_is_marked_as_missing() {
         assert_eq!(selected_label(Some("a"), true), "a (missing)");
+    }
+
+    #[test]
+    fn an_auto_choice_with_an_open_input_shows_the_opened_rate() {
+        assert_eq!(rate_choice_label(None, Some(48_000)), "Auto (48 kHz)");
+    }
+
+    #[test]
+    fn an_auto_choice_without_an_open_input_is_plain_auto() {
+        assert_eq!(rate_choice_label(None, None), "Auto");
+    }
+
+    #[test]
+    fn a_chosen_rate_is_labelled_with_its_rate() {
+        assert_eq!(rate_choice_label(Some(96_000), Some(48_000)), "96 kHz");
+        assert_eq!(rate_choice_label(Some(44_100), None), "44.1 kHz");
     }
 
     #[test]
