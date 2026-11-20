@@ -44,7 +44,8 @@ fn midi_event(delta: u32, message: MidiMessage) -> TrackEvent<'static> {
 
 /// Serializes notes to a format 0 Standard MIDI File and returns its bytes.
 ///
-/// A `bpm` that is not finite or not positive is treated as 120.
+/// Each note-off lies at the rounded end of its note, at least one tick after
+/// its note-on. A `bpm` that is not finite or not positive is treated as 120.
 pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
     let bpm = if bpm.is_finite() && bpm > 0.0 {
         bpm
@@ -68,11 +69,13 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
 
     let mut note_events: Vec<(u32, bool, u7)> = Vec::with_capacity(notes.len() * 2);
     for note in notes {
-        let start = beats_to_ticks(note.start_beats);
-        let length = beats_to_ticks(note.length_beats).max(1);
+        let on = beats_to_ticks(note.start_beats);
+        // The note-off lies at the rounded end of the note, at least one tick
+        // after its note-on.
+        let off = beats_to_ticks(note.start_beats + note.length_beats).max(on.saturating_add(1));
         let key = u7::from(note.midi.clamp(0, 127));
-        note_events.push((start, true, key));
-        note_events.push((start.saturating_add(length), false, key));
+        note_events.push((on, true, key));
+        note_events.push((off, false, key));
     }
     // A note off (false) sorts before a note on (true) at an equal tick.
     note_events.sort_by_key(|&(tick, is_on, _)| (tick, is_on));
@@ -230,6 +233,64 @@ mod tests {
             })
             .collect();
         assert_eq!(off_ticks, vec![2 * 480 + 1]);
+    }
+
+    #[test]
+    fn a_note_off_lies_at_the_rounded_end_of_the_note() {
+        let bytes = to_midi_bytes(
+            &[
+                note(0.0011531531531531532, 0.8533333333333333, 69),
+                note(0.8544864864864864, 1.2373333333333334, 69),
+            ],
+            120.0,
+        );
+        let smf = parse(&bytes);
+        let note_events: Vec<(u32, TrackEventKind)> = track_events(&smf)
+            .into_iter()
+            .filter(|(_, kind)| {
+                matches!(
+                    kind,
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOn { .. } | MidiMessage::NoteOff { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            note_events,
+            vec![(1, on(69)), (410, off(69)), (410, on(69)), (1004, off(69))]
+        );
+
+        // No note-on arrives for a key whose previous note-on has no note-off yet.
+        let mut sounding: Vec<u8> = Vec::new();
+        for (_, kind) in &note_events {
+            match kind {
+                TrackEventKind::Midi {
+                    message: MidiMessage::NoteOn { key, .. },
+                    ..
+                } => {
+                    let key = key.as_int();
+                    assert!(
+                        !sounding.contains(&key),
+                        "note-on for key {key} while it is still sounding"
+                    );
+                    sounding.push(key);
+                }
+                TrackEventKind::Midi {
+                    message: MidiMessage::NoteOff { key, .. },
+                    ..
+                } => {
+                    let key = key.as_int();
+                    assert!(
+                        sounding.contains(&key),
+                        "note-off for key {key} that is not sounding"
+                    );
+                    sounding.retain(|sounding| *sounding != key);
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
