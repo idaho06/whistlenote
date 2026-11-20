@@ -41,8 +41,6 @@ pub struct RecordState {
     bpm: f64,
     /// Index and phase of the latest beat of the running recording.
     last_beat: Option<(u32, BeatPhase)>,
-    /// Whether a count-in beat arrived for the running recording.
-    count_in_seen: bool,
     /// The latest finished take.
     take: Option<Take>,
     /// Beat 0 of the running recording, once the engine reports the start.
@@ -63,7 +61,6 @@ impl Default for RecordState {
             metronome: true,
             bpm: 0.0,
             last_beat: None,
-            count_in_seen: false,
             take: None,
             origin_s: None,
             live_frames: Vec::new(),
@@ -159,22 +156,19 @@ impl RecordState {
         }
     }
 
-    /// Returns to idle without a take when a recording runs, because the engine discards a recording without an event when listening stops or a device changes; the live frames and the preview are cleared and the finished take is kept.
+    /// Returns to idle without a take when a count-in or recording runs, because the engine discards a recording without an event when listening stops or a device changes; the live frames and the preview are cleared and the finished take is kept. While stopping it does nothing, because the engine still answers the sent stop. While idle it does nothing.
     pub fn cancel(&mut self) {
-        if !self.is_idle() {
+        if matches!(self.phase, RecordPhase::CountIn | RecordPhase::Recording) {
             self.phase = RecordPhase::Idle;
             self.clear_run();
         }
     }
 
-    /// Folds `event` into the state: a beat while a recording runs updates the latest beat and a count-in beat marks the count-in as seen, a start moves the count-in into the recording and stores its origin, a finish stores the take, clears the live frames and the preview and returns to idle, an abort returns to idle like [`Self::cancel`] and keeps the earlier take, an error before the first count-in beat aborts the start. Other events change nothing.
+    /// Folds `event` into the state: a beat while a recording runs updates the latest beat, a start moves the count-in into the recording and stores its origin, a finish stores the take, clears the live frames and the preview and returns to idle, an abort returns to idle and keeps the earlier take, an error changes nothing. Other events change nothing.
     pub fn apply_event(&mut self, event: &EngineEvent) {
         match event {
             EngineEvent::Beat { index, phase, .. } if !self.is_idle() => {
                 self.last_beat = Some((*index, *phase));
-                if *phase == BeatPhase::CountIn {
-                    self.count_in_seen = true;
-                }
             }
             EngineEvent::RecordingStarted { origin_s } if self.phase == RecordPhase::CountIn => {
                 self.phase = RecordPhase::Recording;
@@ -185,9 +179,9 @@ impl RecordState {
                 self.phase = RecordPhase::Idle;
                 self.clear_run();
             }
-            EngineEvent::RecordingAborted => self.cancel(),
-            EngineEvent::Error(_) if self.phase == RecordPhase::CountIn && !self.count_in_seen => {
+            EngineEvent::RecordingAborted if !self.is_idle() => {
                 self.phase = RecordPhase::Idle;
+                self.clear_run();
             }
             _ => {}
         }
@@ -236,10 +230,9 @@ impl RecordState {
         }
     }
 
-    /// Clears the per-recording fields: the latest beat, the count-in flag, the origin, the live frames, the unprocessed count and the preview.
+    /// Clears the per-recording fields: the latest beat, the origin, the live frames, the unprocessed count and the preview.
     fn clear_run(&mut self) {
         self.last_beat = None;
-        self.count_in_seen = false;
         self.origin_s = None;
         self.live_frames.clear();
         self.unprocessed = 0;
@@ -487,13 +480,15 @@ mod tests {
     }
 
     #[test]
-    fn an_error_before_the_first_count_in_beat_aborts_the_start() {
+    fn an_error_during_the_count_in_keeps_the_count_in() {
         let mut state = RecordState::default();
         state.start(120.0);
         state.apply_event(&EngineEvent::Error("device busy".to_string()));
-        assert!(state.is_idle());
-
-        state.start(120.0);
+        assert_eq!(
+            state.phase(),
+            RecordPhase::CountIn,
+            "an error before the first count-in beat changes nothing"
+        );
         state.apply_event(&beat(0, BeatPhase::CountIn));
         state.apply_event(&EngineEvent::Error("device busy".to_string()));
         assert_eq!(
@@ -501,6 +496,51 @@ mod tests {
             RecordPhase::CountIn,
             "an error after a count-in beat changes nothing"
         );
+        assert_eq!(state.stop(), Some(EngineCommand::StopRecording));
+    }
+
+    #[test]
+    fn a_failed_start_returns_to_idle_and_keeps_the_take() {
+        let (mut state, _) = recorded_state(tone_frames(1.0, 0.6, 440.0));
+        let take_before = state.take().cloned();
+        assert!(take_before.is_some());
+        state.start(120.0);
+        state.apply_event(&EngineEvent::Error("no device".to_string()));
+        state.apply_event(&EngineEvent::RecordingAborted);
+        assert!(state.is_idle());
+        assert_eq!(state.take(), take_before.as_ref());
+    }
+
+    #[test]
+    fn a_stop_before_a_start_error_returns_to_idle() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        assert_eq!(state.stop(), Some(EngineCommand::StopRecording));
+        state.apply_event(&EngineEvent::Error("no device".to_string()));
+        state.apply_event(&EngineEvent::RecordingAborted);
+        assert!(state.is_idle());
+    }
+
+    #[test]
+    fn cancel_while_stopping_waits_for_the_engine() {
+        let mut state = RecordState::default();
+        state.start(120.0);
+        state.apply_event(&beat(0, BeatPhase::CountIn));
+        state.apply_event(&EngineEvent::RecordingStarted { origin_s: 1.0 });
+        assert_eq!(state.stop(), Some(EngineCommand::StopRecording));
+        state.cancel();
+        assert_eq!(
+            state.phase(),
+            RecordPhase::Stopping,
+            "a cancel while stopping waits for the answer to the stop"
+        );
+        state.apply_event(&EngineEvent::RecordingFinished {
+            frames: tone_frames(1.0, 0.6, 440.0),
+            origin_s: 1.0,
+        });
+        assert!(state.is_idle());
+        let take = state.take().expect("a take");
+        assert_eq!(take.notes().len(), 1);
     }
 
     #[test]
@@ -555,6 +595,7 @@ mod tests {
             origin_s: 0.0,
         });
         state.apply_event(&EngineEvent::Error("x".to_string()));
+        state.apply_event(&EngineEvent::RecordingAborted);
         assert_eq!(state.last_beat(), None);
         assert!(state.is_idle());
         assert!(state.take().is_none());

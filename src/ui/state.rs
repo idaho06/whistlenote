@@ -89,7 +89,7 @@ impl AppState {
         self.record.push_live(&frame);
     }
 
-    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running recording, since the engine discards it without an event.
+    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
     pub fn select_input(&mut self, name: Option<String>) -> Option<EngineCommand> {
         let command = set_selection(&mut self.input, name).map(EngineCommand::SelectInput);
         if command.is_some() {
@@ -98,7 +98,7 @@ impl AppState {
         command
     }
 
-    /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running recording, since the engine discards it without an event.
+    /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
     pub fn select_output(&mut self, name: Option<String>) -> Option<EngineCommand> {
         let command = set_selection(&mut self.output, name).map(EngineCommand::SelectOutput);
         if command.is_some() {
@@ -120,7 +120,7 @@ impl AppState {
         Some(EngineCommand::SetLatencyMs(clamped))
     }
 
-    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother, since frames stop arriving and its time-based clearing does not run, and cancels a running recording, since the engine discards it without an event.
+    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother, since frames stop arriving and its time-based clearing does not run, and cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
     pub fn set_listening(&mut self, on: bool) -> Option<EngineCommand> {
         if self.listening == on {
             return None;
@@ -233,6 +233,8 @@ mod tests {
     use crate::engine::BeatPhase;
     use crate::music::assert_close;
     use crate::music::segment::PitchFrame;
+    use crate::ui::record_mode::RecordPhase;
+    use crate::ui::record_mode::test_support::tone_frames;
 
     /// Returns a live frame at `time_s`.
     fn frame(time_s: f64) -> LiveFrame {
@@ -443,6 +445,63 @@ mod tests {
         );
         assert!(state.record.is_idle());
         assert!(state.record.take().is_none());
+    }
+
+    /// Runs a recording into the stopping phase: starts it at 120 BPM, reports the start with origin 1.0 and sends the stop.
+    fn stopping_state() -> AppState {
+        let mut state = AppState::default();
+        state.record.start(120.0);
+        state.apply_event(EngineEvent::RecordingStarted { origin_s: 1.0 });
+        assert_eq!(state.record.stop(), Some(EngineCommand::StopRecording));
+        assert_eq!(state.record.phase(), RecordPhase::Stopping);
+        state
+    }
+
+    /// Feeds the finished take of 0.6 s of 440 Hz frames from 1.0 s and asserts that the record tab is idle with a one-note take.
+    fn assert_reported_take(state: &mut AppState) {
+        state.apply_event(EngineEvent::RecordingFinished {
+            frames: tone_frames(1.0, 0.6, 440.0),
+            origin_s: 1.0,
+        });
+        assert!(state.record.is_idle());
+        let take = state.record.take().expect("a take");
+        assert_eq!(take.notes().len(), 1);
+    }
+
+    #[test]
+    fn changing_the_output_while_stopping_keeps_the_reported_take() {
+        let mut state = stopping_state();
+        state.select_output(Some("c".to_string()));
+        assert_eq!(
+            state.select_output(Some("d".to_string())),
+            Some(EngineCommand::SelectOutput(Some("d".to_string())))
+        );
+        assert_eq!(state.record.phase(), RecordPhase::Stopping);
+        assert_reported_take(&mut state);
+    }
+
+    #[test]
+    fn changing_the_input_while_stopping_keeps_the_reported_take() {
+        let mut state = stopping_state();
+        state.select_input(Some("a".to_string()));
+        assert_eq!(
+            state.select_input(Some("b".to_string())),
+            Some(EngineCommand::SelectInput(Some("b".to_string())))
+        );
+        assert_eq!(state.record.phase(), RecordPhase::Stopping);
+        assert_reported_take(&mut state);
+    }
+
+    #[test]
+    fn stopping_listening_while_stopping_keeps_the_reported_take() {
+        let mut state = stopping_state();
+        state.set_listening(true);
+        assert_eq!(
+            state.set_listening(false),
+            Some(EngineCommand::StopListening)
+        );
+        assert_eq!(state.record.phase(), RecordPhase::Stopping);
+        assert_reported_take(&mut state);
     }
 
     #[test]
