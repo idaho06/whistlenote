@@ -4,8 +4,9 @@
 //! [`FakeHandle`], which the test keeps. Nothing runs on its own: every call
 //! to [`FakeHandle::step`] advances the clock by one block, delivers one block
 //! of queued input to the open input stream, and renders one block from the
-//! open output stream into a capture buffer. Input and output share one sample
-//! rate, and the clock starts at 0 seconds.
+//! open output stream into a capture buffer. The clock starts at 0 seconds and
+//! advances at the config's sample rate; the input stream may open at one of
+//! the configured input rates.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -26,16 +27,20 @@ pub struct FakeConfig {
     pub inputs: Vec<String>,
     /// Output device names; the first one is the default.
     pub outputs: Vec<String>,
+    /// Input rates the fake input devices support.
+    pub input_rates: Vec<u32>,
 }
 
 impl Default for FakeConfig {
-    /// 48 kHz, 256-sample blocks, one input and one output device.
+    /// 48 kHz, 256-sample blocks, one input and one output device, and 48 kHz
+    /// input rates.
     fn default() -> Self {
         Self {
             sample_rate: 48_000,
             block_size: 256,
             inputs: vec!["Fake Microphone".to_string()],
             outputs: vec!["Fake Speakers".to_string()],
+            input_rates: vec![48_000],
         }
     }
 }
@@ -58,6 +63,7 @@ struct State {
     next_id: u64,
     input: Option<Slot<InputSink>>,
     output_stream: Option<Slot<OutputSource>>,
+    input_rate: u32,
 }
 
 impl State {
@@ -75,6 +81,7 @@ fn lock(state: &Shared) -> MutexGuard<'_, State> {
 
 /// Creates a fake backend and the handle that drives it.
 pub fn fake_backend(config: FakeConfig) -> (FakeBackend, FakeHandle) {
+    let input_rate = config.sample_rate;
     let state = Arc::new(Mutex::new(State {
         config,
         frames: 0,
@@ -83,6 +90,7 @@ pub fn fake_backend(config: FakeConfig) -> (FakeBackend, FakeHandle) {
         next_id: 0,
         input: None,
         output_stream: None,
+        input_rate,
     }));
     (
         FakeBackend {
@@ -153,9 +161,16 @@ impl AudioBackend for FakeBackend {
         Ok(lock(&self.state).config.outputs.clone())
     }
 
+    fn input_rates(&self, name: Option<&str>) -> Result<Vec<u32>, AudioError> {
+        let state = lock(&self.state);
+        resolve(&state.config.inputs, name)?;
+        Ok(state.config.input_rates.clone())
+    }
+
     fn open_input(
         &self,
         name: Option<&str>,
+        rate: Option<u32>,
         sink: InputSink,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
@@ -164,13 +179,19 @@ impl AudioBackend for FakeBackend {
             config,
             next_id,
             input,
+            input_rate,
             ..
         } = &mut *state;
         let id = open_slot(next_id, &config.inputs, input, name, sink, on_error)?;
+        let sample_rate = match rate {
+            Some(rate) if config.input_rates.contains(&rate) => rate,
+            _ => config.sample_rate,
+        };
+        *input_rate = sample_rate;
         Ok(Box::new(FakeStream {
             state: Arc::clone(&self.state),
             id,
-            sample_rate: config.sample_rate,
+            sample_rate,
         }))
     }
 
@@ -258,14 +279,17 @@ impl FakeHandle {
 
     /// Advances the clock by one block.
     ///
-    /// The next block of queued input, padded with zeros, goes to the open
-    /// input stream; the samples are consumed even when no input stream is
-    /// open. The open output stream renders one block, which is appended to
-    /// the capture buffer.
+    /// The clock advances by `block_size` samples at the config's sample
+    /// rate. The next block of queued input, padded with zeros, goes to the
+    /// open input stream with the open input's rate in its
+    /// [`InputBlockInfo::sample_rate`]; the samples are consumed even when
+    /// no input stream is open. The open output stream renders one block at
+    /// the config's sample rate, which is appended to the capture buffer.
     pub fn step(&self) {
         let mut state = lock(&self.state);
         let block_size = state.config.block_size;
         let sample_rate = state.config.sample_rate;
+        let input_rate = state.input_rate;
         let time_s = state.clock_s();
 
         let available = block_size.min(state.queued_input.len());
@@ -277,7 +301,7 @@ impl FakeHandle {
                 &block,
                 InputBlockInfo {
                     time_s,
-                    sample_rate,
+                    sample_rate: input_rate,
                 },
             );
         }
@@ -331,6 +355,18 @@ impl FakeHandle {
         state.config.outputs = outputs;
     }
 
+    /// Replaces the input rates the fake input devices support.
+    pub fn set_input_rates(&self, rates: Vec<u32>) {
+        lock(&self.state).config.input_rates = rates;
+    }
+
+    /// Returns the rate of the open input stream in Hz, or `None` when no
+    /// input is open.
+    pub fn input_rate(&self) -> Option<u32> {
+        let state = lock(&self.state);
+        state.input.as_ref().map(|_| state.input_rate)
+    }
+
     /// Fails the open input stream: it reports `error` through its error
     /// sink and [`AudioStream::is_failed`] returns true from then on.
     pub fn fail_input(&self, error: AudioError) {
@@ -381,7 +417,7 @@ mod tests {
             tx.send((block.to_vec(), info)).expect("receiver alive");
         });
         let stream = backend
-            .open_input(None, sink, no_errors())
+            .open_input(None, None, sink, no_errors())
             .expect("default input opens");
         assert_eq!(stream.sample_rate(), 1000);
         assert_eq!(handle.input_device().as_deref(), Some("Fake Microphone"));
@@ -422,7 +458,7 @@ mod tests {
             let _ = tx.send(block.to_vec());
         });
         let stream = backend
-            .open_input(None, sink, no_errors())
+            .open_input(None, None, sink, no_errors())
             .expect("input opens");
         drop(stream);
         assert_eq!(handle.input_device(), None);
@@ -436,7 +472,7 @@ mod tests {
     #[test]
     fn device_selection_and_errors() {
         let (backend, handle) = fake_backend(small_config());
-        let open = |name| backend.open_input(name, Box::new(|_, _| {}), no_errors());
+        let open = |name| backend.open_input(name, None, Box::new(|_, _| {}), no_errors());
         assert_eq!(
             open(Some("Nope")).err(),
             Some(AudioError::UnknownDevice("Nope".to_string()))
@@ -464,6 +500,7 @@ mod tests {
         let _stream = backend
             .open_input(
                 None,
+                None,
                 Box::new(|_, _| {}),
                 Box::new(move |error| {
                     let _ = tx.send(error);
@@ -474,6 +511,68 @@ mod tests {
         assert_eq!(
             rx.recv().expect("error delivered"),
             AudioError::Backend("unplugged".to_string())
+        );
+    }
+
+    #[test]
+    fn opening_at_a_supported_rate_opens_and_reports_that_rate() {
+        let (backend, handle) = fake_backend(FakeConfig {
+            sample_rate: 1000,
+            block_size: 4,
+            input_rates: vec![48_000, 96_000],
+            ..FakeConfig::default()
+        });
+        let (tx, rx) = mpsc::channel();
+        let sink: InputSink = Box::new(move |block, info| {
+            tx.send((block.to_vec(), info)).expect("receiver alive");
+        });
+        let stream = backend
+            .open_input(None, Some(96_000), sink, no_errors())
+            .expect("input opens");
+        assert_eq!(stream.sample_rate(), 96_000);
+        assert_eq!(handle.input_rate(), Some(96_000));
+
+        handle.push_input(&[1.0, 2.0, 3.0, 4.0]);
+        handle.step();
+        let (_block, info) = rx.recv().expect("block delivered");
+        assert_eq!(info.sample_rate, 96_000);
+        assert_eq!(handle.time_s(), 0.004);
+    }
+
+    #[test]
+    fn opening_at_an_unsupported_rate_opens_at_the_config_rate() {
+        let (backend, handle) = fake_backend(FakeConfig {
+            sample_rate: 1000,
+            block_size: 4,
+            input_rates: vec![48_000, 96_000],
+            ..FakeConfig::default()
+        });
+        let stream = backend
+            .open_input(None, Some(44_100), Box::new(|_, _| {}), no_errors())
+            .expect("input opens");
+        assert_eq!(stream.sample_rate(), 1000);
+        assert_eq!(handle.input_rate(), Some(1000));
+    }
+
+    #[test]
+    fn input_rates_returns_the_configured_list_for_a_known_device() {
+        let (backend, _handle) = fake_backend(FakeConfig {
+            input_rates: vec![48_000, 96_000],
+            ..FakeConfig::default()
+        });
+        assert_eq!(backend.input_rates(None), Ok(vec![48_000, 96_000]));
+        assert_eq!(
+            backend.input_rates(Some("Fake Microphone")),
+            Ok(vec![48_000, 96_000])
+        );
+    }
+
+    #[test]
+    fn input_rates_of_an_unknown_device_is_an_unknown_device_error() {
+        let (backend, _handle) = fake_backend(small_config());
+        assert_eq!(
+            backend.input_rates(Some("Nope")),
+            Err(AudioError::UnknownDevice("Nope".to_string()))
         );
     }
 }

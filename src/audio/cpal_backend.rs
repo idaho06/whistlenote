@@ -26,6 +26,7 @@ use cpal::{
 use super::AudioError;
 use super::backend::{
     AudioBackend, AudioStream, ErrorSink, InputBlockInfo, InputSink, OutputBlockInfo, OutputSource,
+    STANDARD_INPUT_RATES_HZ,
 };
 
 /// Largest number of frames handed to a sink or source in one call; longer
@@ -77,19 +78,22 @@ impl CpalBackend {
     /// Opens and starts a stream on the device `name`, with the data
     /// callback `callback`, whose kind sets the stream's direction.
     ///
-    /// Output uses the device's default configuration. Input uses the
-    /// default too, unless its sample rate is below 44.1 kHz; then a
-    /// supported input configuration at 44.1 kHz or higher is chosen.
+    /// Output uses the device's default configuration and ignores `rate`.
+    /// Input uses the default too, unless its sample rate is below 44.1 kHz;
+    /// then a supported input configuration at 44.1 kHz or higher is chosen.
+    /// `rate` `Some(rate)` asks for that input rate instead when the device
+    /// supports it.
     fn open(
         &self,
         name: Option<&str>,
+        rate: Option<u32>,
         callback: StreamCallback,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
         let direction = callback.direction();
         let device = find_device(direction, name)?;
         let supported = match direction {
-            Direction::Input => input_config(&device)?,
+            Direction::Input => input_config(&device, rate)?,
             Direction::Output => device.default_output_config()?,
         };
         let config = supported.config();
@@ -242,9 +246,31 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
 
 /// Returns the config to open the input of `device` with: its default
 /// config, or, when the default rate is below `MIN_INPUT_RATE_HZ`, the one
-/// [`choose_input_config`] picks from the supported configs.
-fn input_config(device: &Device) -> Result<SupportedStreamConfig, AudioError> {
+/// [`choose_input_config`] picks from the supported configs. With
+/// `Some(rate)`, [`choose_rate_config`] picks a supported config at that
+/// rate when a range covers it; otherwise the rate is refused and the
+/// choice falls back to the `None` behaviour.
+fn input_config(device: &Device, rate: Option<u32>) -> Result<SupportedStreamConfig, AudioError> {
     let default = device.default_input_config()?;
+    if let Some(rate) = rate {
+        let chosen = match device.supported_input_configs() {
+            Ok(ranges) => {
+                let ranges: Vec<_> = ranges.collect();
+                choose_rate_config(default, &ranges, rate)
+            }
+            Err(error) => {
+                log::debug!("supported input configs unavailable: {error}");
+                None
+            }
+        };
+        match chosen {
+            Some(config) => {
+                log::debug!("input at {rate} Hz: {config:?}");
+                return Ok(config);
+            }
+            None => log::warn!("input does not support {rate} Hz; choosing the rate automatically"),
+        }
+    }
     if default.sample_rate() >= MIN_INPUT_RATE_HZ {
         return Ok(default);
     }
@@ -266,6 +292,47 @@ fn input_config(device: &Device) -> Result<SupportedStreamConfig, AudioError> {
     Ok(chosen)
 }
 
+/// Ranks `range` against the `default` config: 0 for the default's sample
+/// format and channel count, 1 for the same sample format, 2 otherwise.
+fn rank(range: &SupportedStreamConfigRange, default: &SupportedStreamConfig) -> u8 {
+    if range.sample_format() != default.sample_format() {
+        2
+    } else if range.channels() != default.channels() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Returns the rates of [`STANDARD_INPUT_RATES_HZ`] that at least one range
+/// of `ranges` covers, ascending.
+fn supported_rates(ranges: &[SupportedStreamConfigRange]) -> Vec<u32> {
+    STANDARD_INPUT_RATES_HZ
+        .iter()
+        .copied()
+        .filter(|&rate| {
+            ranges
+                .iter()
+                .any(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
+        })
+        .collect()
+}
+
+/// Returns the config at `rate` from the best-ranked range of `ranges` that
+/// covers it: the lowest [`rank`] wins, with ties going to the earliest
+/// range; `None` when no range covers `rate`.
+fn choose_rate_config(
+    default: SupportedStreamConfig,
+    ranges: &[SupportedStreamConfigRange],
+    rate: u32,
+) -> Option<SupportedStreamConfig> {
+    ranges
+        .iter()
+        .filter(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
+        .min_by_key(|range| rank(range, &default))
+        .map(|range| range.with_sample_rate(rate))
+}
+
 /// Chooses the input config from the device's supported `ranges` when the
 /// `default` config's sample rate is below `MIN_INPUT_RATE_HZ`.
 ///
@@ -284,20 +351,11 @@ fn choose_input_config(
     if default.sample_rate() >= MIN_INPUT_RATE_HZ {
         return default;
     }
-    let rank = |range: &SupportedStreamConfigRange| {
-        if range.sample_format() != default.sample_format() {
-            2
-        } else if range.channels() != default.channels() {
-            1
-        } else {
-            0
-        }
-    };
     let preferred = (0..3).find_map(|best| {
         PREFERRED_INPUT_RATES_HZ.iter().find_map(|&rate| {
             ranges
                 .iter()
-                .filter(|range| rank(range) == best)
+                .filter(|range| rank(range, &default) == best)
                 .find_map(|range| range.try_with_sample_rate(rate))
         })
     });
@@ -308,7 +366,7 @@ fn choose_input_config(
             .map(|range| {
                 (
                     range.min_sample_rate().max(MIN_INPUT_RATE_HZ),
-                    rank(range),
+                    rank(range, &default),
                     range,
                 )
             })
@@ -381,13 +439,20 @@ impl AudioBackend for CpalBackend {
             .collect())
     }
 
+    fn input_rates(&self, name: Option<&str>) -> Result<Vec<u32>, AudioError> {
+        let device = find_device(Direction::Input, name)?;
+        let ranges: Vec<_> = device.supported_input_configs()?.collect();
+        Ok(supported_rates(&ranges))
+    }
+
     fn open_input(
         &self,
         name: Option<&str>,
+        rate: Option<u32>,
         sink: InputSink,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        self.open(name, StreamCallback::Input(sink), on_error)
+        self.open(name, rate, StreamCallback::Input(sink), on_error)
     }
 
     fn open_output(
@@ -396,7 +461,7 @@ impl AudioBackend for CpalBackend {
         source: OutputSource,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        self.open(name, StreamCallback::Output(source), on_error)
+        self.open(name, None, StreamCallback::Output(source), on_error)
     }
 }
 
@@ -880,5 +945,50 @@ mod tests {
         let default = config(1, 8_000, SampleFormat::I16);
         let ranges = [range(1, 8_000, 16_000, SampleFormat::I16)];
         assert_eq!(choose_input_config(default, &ranges), default);
+    }
+
+    #[test]
+    fn supported_rates_lists_the_standard_rates_that_some_range_covers() {
+        let ranges = [
+            range(2, 8_000, 48_000, SampleFormat::F32),
+            range(1, 88_200, 96_000, SampleFormat::F32),
+        ];
+        assert_eq!(supported_rates(&ranges), [44_100, 48_000, 88_200, 96_000]);
+        assert!(supported_rates(&[]).is_empty());
+        assert!(supported_rates(&[range(2, 8_000, 22_050, SampleFormat::F32)]).is_empty());
+    }
+
+    #[test]
+    fn choose_rate_config_prefers_the_default_format_and_channels() {
+        let default = config(2, 48_000, SampleFormat::F32);
+        let ranges = [
+            range(1, 8_000, 192_000, SampleFormat::I16),
+            range(1, 8_000, 192_000, SampleFormat::F32),
+            range(2, 8_000, 192_000, SampleFormat::F32),
+        ];
+        let chosen = choose_rate_config(default, &ranges, 96_000).expect("a range covers 96 kHz");
+        assert_eq!(chosen.sample_rate(), 96_000);
+        assert_eq!(chosen.channels(), 2);
+        assert_eq!(chosen.sample_format(), SampleFormat::F32);
+    }
+
+    #[test]
+    fn choose_rate_config_prefers_the_same_format_over_another_format() {
+        let default = config(2, 48_000, SampleFormat::F32);
+        let ranges = [
+            range(1, 8_000, 192_000, SampleFormat::I16),
+            range(1, 8_000, 192_000, SampleFormat::F32),
+        ];
+        let chosen = choose_rate_config(default, &ranges, 96_000).expect("a range covers 96 kHz");
+        assert_eq!(chosen.sample_rate(), 96_000);
+        assert_eq!(chosen.channels(), 1);
+        assert_eq!(chosen.sample_format(), SampleFormat::F32);
+    }
+
+    #[test]
+    fn choose_rate_config_returns_none_for_an_uncovered_rate() {
+        let default = config(2, 48_000, SampleFormat::F32);
+        let ranges = [range(2, 8_000, 48_000, SampleFormat::F32)];
+        assert_eq!(choose_rate_config(default, &ranges, 96_000), None);
     }
 }

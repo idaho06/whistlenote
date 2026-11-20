@@ -6,6 +6,9 @@
 
 use super::AudioError;
 
+/// Standard input sample rates in Hz that a rate choice offers, ascending.
+pub const STANDARD_INPUT_RATES_HZ: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
 /// Timing of one block of input samples.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InputBlockInfo {
@@ -66,10 +69,19 @@ pub trait AudioBackend: Send + 'static {
     /// Returns the names of the output devices.
     fn list_outputs(&self) -> Result<Vec<String>, AudioError>;
 
+    /// Returns the rates of [`STANDARD_INPUT_RATES_HZ`] that the named input device (the default device for `None`) supports, ascending.
+    fn input_rates(&self, name: Option<&str>) -> Result<Vec<u32>, AudioError>;
+
     /// Opens and starts an input stream on the named device.
+    ///
+    /// `rate` `None` lets the backend choose the rate; `Some(rate)` asks for
+    /// that rate, and when the device does not support it the backend
+    /// chooses as for `None`. The stream's [`AudioStream::sample_rate`]
+    /// reports the rate that opened.
     fn open_input(
         &self,
         name: Option<&str>,
+        rate: Option<u32>,
         sink: InputSink,
         on_error: ErrorSink,
     ) -> Result<Box<dyn AudioStream>, AudioError>;

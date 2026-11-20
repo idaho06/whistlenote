@@ -29,6 +29,7 @@ fn main() {
     );
     let stream = match backend.open_input(
         device.as_deref(),
+        None,
         writer.into_sink(),
         Box::new(|error| eprintln!("stream error: {error}")),
     ) {

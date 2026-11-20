@@ -571,9 +571,12 @@ impl Worker {
             std::thread::current(),
         );
         let on_error = error_sink(self.events.clone());
-        let stream =
-            self.backend
-                .open_input(self.input_name.as_deref(), writer.into_sink(), on_error);
+        let stream = self.backend.open_input(
+            self.input_name.as_deref(),
+            None,
+            writer.into_sink(),
+            on_error,
+        );
         match stream {
             Ok(stream) => {
                 log::info!(
