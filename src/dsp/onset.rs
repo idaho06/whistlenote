@@ -17,32 +17,53 @@ pub const WINDOW: usize = 512;
 /// Distance in samples between the starts of consecutive windows.
 pub const HOP: usize = 128;
 
-/// Cutoff of the high-pass in Hz.
+/// Default cutoff of the high-pass in Hz.
 const HIGH_PASS_HZ: f32 = 1000.0;
 /// Floor added to the window energy before taking its logarithm.
 const LOG_FLOOR: f64 = 1e-9;
-/// Length of the flux history in seconds.
+/// Default length of the flux history in seconds.
 const FLUX_HISTORY_S: f64 = 0.5;
-/// Offset added to the median flux to form the detection threshold.
+/// Default offset added to the median flux to form the detection threshold.
 const THRESHOLD_OFFSET: f64 = 1.0;
-/// Minimum spacing between reported onsets in seconds.
+/// Default minimum spacing between reported onsets in seconds.
 const REFRACTORY_S: f64 = 0.1;
 
 /// Samples from the last sample of a full window back to its centre, the
 /// sample at index `WINDOW / 2`.
 const CENTRE_OFFSET: usize = WINDOW - 1 - WINDOW / 2;
 
-/// Settings of an [`OnsetDetector`].
+/// Returns the number of flux values that a history of `flux_history_s`
+/// seconds holds at `sample_rate` Hz.
+fn history_len(flux_history_s: f64, sample_rate: u32) -> usize {
+    (flux_history_s * f64::from(sample_rate) / HOP as f64).round() as usize
+}
+
+/// Settings of an [`OnsetDetector`]. The caller keeps the values sensible.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OnsetConfig {
     /// Window RMS, after high-passing, below which no onset is reported.
     pub gate_rms: f32,
+    /// Offset added to the median flux to form the detection threshold.
+    pub threshold_offset: f64,
+    /// Minimum spacing between reported onsets in seconds.
+    pub refractory_s: f64,
+    /// Cutoff of the high-pass in Hz.
+    pub high_pass_hz: f32,
+    /// Length of the flux history in seconds.
+    pub flux_history_s: f64,
 }
 
 impl Default for OnsetConfig {
-    /// A gate of 0.01 RMS.
+    /// A gate of 0.01 RMS, a threshold offset of 1.0, a refractory period of
+    /// 0.1 s, a high-pass cutoff of 1000 Hz and a flux history of 0.5 s.
     fn default() -> Self {
-        Self { gate_rms: 0.01 }
+        Self {
+            gate_rms: 0.01,
+            threshold_offset: THRESHOLD_OFFSET,
+            refractory_s: REFRACTORY_S,
+            high_pass_hz: HIGH_PASS_HZ,
+            flux_history_s: FLUX_HISTORY_S,
+        }
     }
 }
 
@@ -61,17 +82,42 @@ pub struct OnsetDetector {
 impl OnsetDetector {
     /// Creates a detector for input at `sample_rate` Hz.
     pub fn new(sample_rate: u32, config: OnsetConfig) -> Self {
-        let history_len = (FLUX_HISTORY_S * f64::from(sample_rate) / HOP as f64).round() as usize;
+        let len = history_len(config.flux_history_s, sample_rate);
         Self {
             config,
             sample_rate,
-            filter: Butterworth::new(FilterKind::HighPass, sample_rate, HIGH_PASS_HZ),
+            filter: Butterworth::new(FilterKind::HighPass, sample_rate, config.high_pass_hz),
             window: Vec::with_capacity(WINDOW),
-            flux_history: VecDeque::with_capacity(history_len),
-            history_len,
+            flux_history: VecDeque::with_capacity(len),
+            history_len: len,
             prev_log_e: None,
             last_onset_s: None,
         }
+    }
+
+    /// Returns the detector's current configuration.
+    pub fn config(&self) -> OnsetConfig {
+        self.config
+    }
+
+    /// Applies `config` in place. The partial window, the flux history, the
+    /// stored log energy and the last onset time are kept. When `high_pass_hz`
+    /// differs from the current value, the filter is replaced with a fresh
+    /// one and its state is lost; when the history length changes, the oldest
+    /// flux values are dropped until the history fits the new length.
+    pub fn set_config(&mut self, config: OnsetConfig) {
+        if config.high_pass_hz != self.config.high_pass_hz {
+            self.filter =
+                Butterworth::new(FilterKind::HighPass, self.sample_rate, config.high_pass_hz);
+        }
+        let len = history_len(config.flux_history_s, self.sample_rate);
+        if len != self.history_len {
+            self.history_len = len;
+            while self.flux_history.len() > self.history_len {
+                self.flux_history.pop_front();
+            }
+        }
+        self.config = config;
     }
 
     /// Analyses `block`, whose first sample has engine-clock time
@@ -118,16 +164,17 @@ impl OnsetDetector {
         if let Some(prev_log_e) = self.prev_log_e {
             let flux = (log_e - prev_log_e).max(0.0);
             // The flux values are never negative, so their median is at
-            // least 0 and a flux up to THRESHOLD_OFFSET never qualifies; the
-            // cheap tests run first and the median only when they pass.
-            let is_onset = flux > THRESHOLD_OFFSET
+            // least 0 and a flux up to the configured threshold offset never
+            // qualifies; the cheap tests run first and the median only when
+            // they pass.
+            let is_onset = flux > self.config.threshold_offset
                 && self
                     .last_onset_s
-                    .is_none_or(|last| time_s - last >= REFRACTORY_S)
+                    .is_none_or(|last| time_s - last >= self.config.refractory_s)
                 && rms(&self.window) >= self.config.gate_rms
                 && flux
                     > median(self.flux_history.iter().copied().collect()).unwrap_or(0.0)
-                        + THRESHOLD_OFFSET;
+                        + self.config.threshold_offset;
             if is_onset {
                 out.push(time_s);
                 self.last_onset_s = Some(time_s);
@@ -277,5 +324,130 @@ mod tests {
         for (k, &onset) in after.iter().enumerate() {
             assert_close(onset, 0.75 + 0.5 * k as f64, 0.015);
         }
+    }
+
+    #[test]
+    fn a_threshold_above_any_flux_hides_every_click() {
+        let rate = 48_000;
+        let mut detector = OnsetDetector::new(
+            rate,
+            OnsetConfig {
+                threshold_offset: 50.0,
+                ..Default::default()
+            },
+        );
+        let mut onsets = Vec::new();
+        run(
+            &mut detector,
+            &click_track(rate, 0x2545_F491),
+            rate,
+            0.0,
+            &mut onsets,
+        );
+        assert!(onsets.is_empty(), "onsets: {onsets:?}");
+    }
+
+    #[test]
+    fn a_long_refractory_period_skips_every_other_click() {
+        let rate = 48_000;
+        let mut detector = OnsetDetector::new(
+            rate,
+            OnsetConfig {
+                refractory_s: 0.6,
+                ..Default::default()
+            },
+        );
+        let mut onsets = Vec::new();
+        run(
+            &mut detector,
+            &click_track(rate, 0x2545_F491),
+            rate,
+            0.0,
+            &mut onsets,
+        );
+        assert_eq!(onsets.len(), 4, "onsets: {onsets:?}");
+        for (k, &onset) in onsets.iter().enumerate() {
+            assert_close(onset, 0.25 + k as f64, 0.015);
+        }
+    }
+
+    #[test]
+    fn a_gate_above_the_click_level_hides_every_click() {
+        let rate = 48_000;
+        let mut detector = OnsetDetector::new(
+            rate,
+            OnsetConfig {
+                gate_rms: 0.6,
+                ..Default::default()
+            },
+        );
+        let mut onsets = Vec::new();
+        run(
+            &mut detector,
+            &click_track(rate, 0x2545_F491),
+            rate,
+            0.0,
+            &mut onsets,
+        );
+        assert!(onsets.is_empty(), "onsets: {onsets:?}");
+    }
+
+    #[test]
+    fn set_config_with_the_same_values_changes_nothing() {
+        let rate = 48_000;
+        let signal = click_track(rate, 0x2545_F491);
+        let all = detect(&signal, rate);
+
+        let mut detector = OnsetDetector::new(rate, OnsetConfig::default());
+        let mut onsets = Vec::new();
+        run(&mut detector, &signal[..96_000], rate, 0.0, &mut onsets);
+        detector.set_config(OnsetConfig::default());
+        run(&mut detector, &signal[96_000..], rate, 2.0, &mut onsets);
+
+        assert_eq!(onsets.len(), all.len(), "onsets: {onsets:?} vs {all:?}");
+        for (&applied, &expected) in onsets.iter().zip(&all) {
+            assert!(
+                (applied - expected).abs() <= 1e-9,
+                "{applied} and {expected} differ by more than 1e-9"
+            );
+        }
+    }
+
+    #[test]
+    fn set_config_with_a_longer_history_keeps_detecting() {
+        let rate = 48_000;
+        let signal = click_track(rate, 0x2545_F491);
+        let mut detector = OnsetDetector::new(rate, OnsetConfig::default());
+        let mut onsets = Vec::new();
+        run(&mut detector, &signal[..96_000], rate, 0.0, &mut onsets);
+        detector.set_config(OnsetConfig {
+            flux_history_s: 1.0,
+            ..Default::default()
+        });
+        run(&mut detector, &signal[96_000..], rate, 2.0, &mut onsets);
+        assert_eq!(onsets.len(), 8, "onsets: {onsets:?}");
+        for (k, &onset) in onsets.iter().enumerate() {
+            assert_close(onset, 0.25 + 0.5 * k as f64, 0.015);
+        }
+    }
+
+    #[test]
+    fn config_returns_the_applied_config() {
+        let rate = 48_000;
+        let config = OnsetConfig {
+            gate_rms: 0.02,
+            threshold_offset: 2.0,
+            refractory_s: 0.2,
+            high_pass_hz: 500.0,
+            flux_history_s: 0.25,
+        };
+        let mut detector = OnsetDetector::new(rate, config);
+        assert_eq!(detector.config(), config);
+        let changed = OnsetConfig {
+            refractory_s: 0.3,
+            ..config
+        };
+        detector.set_config(changed);
+        assert_eq!(detector.config(), changed);
     }
 }
