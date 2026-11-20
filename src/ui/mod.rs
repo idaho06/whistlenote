@@ -3,11 +3,11 @@
 //! [`run`] opens the main window and runs the application until the window
 //! closes. The window has a top bar with the input and output device combos,
 //! the refresh button, the latency offset, the listen toggle and the tab
-//! buttons, a status bar at the bottom that shows whether the engine listens
-//! and the latest error, and a central panel with the heading of the
-//! selected tab. The views share the [`state::AppState`], which folds the
-//! events of the engine into the state and turns user actions into engine
-//! commands.
+//! buttons, a status bar at the bottom that shows whether the engine listens,
+//! the input sample rate and the latest error, and a central panel with the
+//! heading of the selected tab. The views share the [`state::AppState`],
+//! which folds the events of the engine into the state and turns user
+//! actions into engine commands.
 
 pub mod bpm_mode;
 pub mod live;
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use self::state::{AppState, MAX_LATENCY_MS, Tab};
+use self::state::{AppState, LOW_INPUT_RATE_HZ, MAX_LATENCY_MS, Tab, rate_label};
 use crate::audio::cpal_backend::CpalBackend;
 use crate::engine::{Engine, EngineCommand};
 
@@ -131,8 +131,9 @@ impl WhistlenoteApp {
         });
     }
 
-    /// Shows the status bar: whether the engine listens, and the latest
-    /// error with a dismiss button.
+    /// Shows the status bar: whether the engine listens, the sample rate of
+    /// the open input with a warning below [`LOW_INPUT_RATE_HZ`], and the
+    /// latest error with a dismiss button.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(if self.state.listening() {
@@ -140,6 +141,17 @@ impl WhistlenoteApp {
             } else {
                 "Idle"
             });
+            if let Some(rate) = self.state.input_rate_hz() {
+                ui.separator();
+                let label = format!("Input {}", rate_label(rate));
+                if rate < LOW_INPUT_RATE_HZ {
+                    ui.colored_label(ui.visuals().warn_fg_color, label).on_hover_text(
+                        "Low input rate: whistles above a quarter of it are not tracked and some read an octave low. Choose another input, or a higher-quality profile for a Bluetooth headset.",
+                    );
+                } else {
+                    ui.label(label);
+                }
+            }
             let error = self
                 .state
                 .error()

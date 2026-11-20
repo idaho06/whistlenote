@@ -12,6 +12,18 @@ use crate::ui::record_mode::RecordState;
 /// The largest absolute latency offset in milliseconds.
 pub(crate) const MAX_LATENCY_MS: f64 = 200.0;
 
+/// Below this input rate in Hz, whistles above a quarter of the rate are not tracked and some read an octave low.
+pub const LOW_INPUT_RATE_HZ: u32 = 16_000;
+
+/// Returns the label of an input rate in Hz: whole kHz without decimals, otherwise one decimal rounded, for example "48 kHz" for 48_000 and "44.1 kHz" for 44_100.
+pub fn rate_label(rate_hz: u32) -> String {
+    if rate_hz.is_multiple_of(1_000) {
+        format!("{} kHz", rate_hz / 1_000)
+    } else {
+        format!("{:.1} kHz", f64::from(rate_hz) / 1_000.0)
+    }
+}
+
 /// Tab shown in the main window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -52,6 +64,8 @@ pub struct AppState {
     latency_ms: f64,
     /// Whether the engine listens.
     listening: bool,
+    /// Sample rate of the open input in Hz, or `None` when no input is open.
+    input_rate_hz: Option<u32>,
     /// Latest error text and how many times in a row it arrived.
     error: Option<(String, u32)>,
     /// Latest live pitch frame.
@@ -69,8 +83,9 @@ pub struct AppState {
 impl AppState {
     /// Applies `event`: the recording state of the Record tab folds it first,
     /// a device list replaces the stored list and keeps the selections, an
-    /// onset feeds the tempo state of the BPM tab, a repeated error raises
-    /// its count, other events change nothing.
+    /// input rate replaces the stored rate, an onset feeds the tempo state of
+    /// the BPM tab, a repeated error raises its count, other events change
+    /// nothing.
     pub fn apply_event(&mut self, event: EngineEvent) {
         self.record.apply_event(&event);
         match event {
@@ -79,6 +94,7 @@ impl AppState {
                 self.inputs = inputs;
                 self.outputs = outputs;
             }
+            EngineEvent::InputRate(rate) => self.input_rate_hz = rate,
             EngineEvent::Error(text) => count_error(&mut self.error, text),
             _ => {}
         }
@@ -192,6 +208,11 @@ impl AppState {
     /// Returns whether the engine listens.
     pub fn listening(&self) -> bool {
         self.listening
+    }
+
+    /// Returns the sample rate of the open input in Hz, or `None` when no input is open.
+    pub fn input_rate_hz(&self) -> Option<u32> {
+        self.input_rate_hz
     }
 
     /// Returns the latest error text and how many times in a row it arrived.
@@ -635,6 +656,24 @@ mod tests {
             state.apply_event(event);
         }
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn the_input_rate_follows_the_engine() {
+        let mut state = AppState::default();
+        assert_eq!(state.input_rate_hz(), None);
+        state.apply_event(EngineEvent::InputRate(Some(8_000)));
+        assert_eq!(state.input_rate_hz(), Some(8_000));
+        state.apply_event(EngineEvent::InputRate(None));
+        assert_eq!(state.input_rate_hz(), None);
+    }
+
+    #[test]
+    fn rate_labels_use_khz() {
+        assert_eq!(rate_label(48_000), "48 kHz");
+        assert_eq!(rate_label(44_100), "44.1 kHz");
+        assert_eq!(rate_label(8_000), "8 kHz");
+        assert_eq!(rate_label(22_050), "22.1 kHz");
     }
 
     #[test]

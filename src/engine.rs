@@ -66,6 +66,8 @@ pub enum EngineEvent {
         /// Names of the output devices.
         outputs: Vec<String>,
     },
+    /// The sample rate of the input stream in Hz, or `None` when no input is open; sent whenever it changes.
+    InputRate(Option<u32>),
     /// A metronome beat starts playing on the output stream at `time_s`.
     Beat {
         /// Index of the beat within its sequence, starting at 0.
@@ -182,6 +184,7 @@ impl Engine {
                     input_name: None,
                     listening: false,
                     input: None,
+                    reported_input_rate: None,
                     output_name: None,
                     free_bpm: 120.0,
                     free_enabled: false,
@@ -241,6 +244,8 @@ struct Worker {
     input_name: Option<String>,
     listening: bool,
     input: Option<Input>,
+    /// The input rate last sent as an event.
+    reported_input_rate: Option<u32>,
     output_name: Option<String>,
     free_bpm: f64,
     free_enabled: bool,
@@ -356,7 +361,9 @@ impl Worker {
     /// disconnected command channel.
     ///
     /// The input blocks and beats delivered before a command are processed
-    /// before it, and failed streams are dropped after them. While no stream
+    /// before it, and failed streams are dropped after them. Once the
+    /// streams settle, the input rate is reported when it changed, before
+    /// the command is handled. While no stream
     /// is open the worker waits for the next command; otherwise it parks
     /// between input blocks.
     fn run(mut self) {
@@ -371,6 +378,7 @@ impl Worker {
             self.drain_beats();
             self.drop_failed_streams();
             self.close_unwanted_input();
+            self.report_input_rate();
             match command {
                 Ok(command) => {
                     if self.handle(command) {
@@ -450,6 +458,7 @@ impl Worker {
             EngineCommand::Shutdown => return true,
         }
         self.close_unwanted_input();
+        self.report_input_rate();
         false
     }
 
@@ -457,6 +466,17 @@ impl Worker {
     fn close_unwanted_input(&mut self) {
         if !self.listening && self.recording.is_none() && self.input.take().is_some() {
             log::debug!("input closed");
+        }
+    }
+
+    /// Sends the sample rate of the open input as an [`EngineEvent::InputRate`]
+    /// event when it differs from the last reported one, storing it as the
+    /// reported rate; a send error is ignored because the receiver is gone.
+    fn report_input_rate(&mut self) {
+        let rate = self.input.as_ref().map(|input| input.pitch.sample_rate());
+        if rate != self.reported_input_rate {
+            self.reported_input_rate = rate;
+            let _ = self.events.send(EngineEvent::InputRate(rate));
         }
     }
 
@@ -1021,6 +1041,32 @@ mod tests {
         }));
         engine.send(EngineCommand::StopListening);
         sync(&engine);
+    }
+
+    #[test]
+    fn the_input_rate_is_reported_when_the_input_opens_and_closes() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartListening);
+        wait_input_open(&handle);
+        let opened = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::InputRate(_))
+        });
+        assert_eq!(opened, Some(EngineEvent::InputRate(Some(48_000))));
+
+        engine.send(EngineCommand::StopListening);
+        wait_input_closed(&handle);
+        let closed = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            matches!(event, EngineEvent::InputRate(_))
+        });
+        assert_eq!(closed, Some(EngineEvent::InputRate(None)));
+
+        let seen = sync(&engine);
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, EngineEvent::InputRate(_))),
+            "an InputRate event arrived without a rate change: {seen:?}"
+        );
     }
 
     #[test]
