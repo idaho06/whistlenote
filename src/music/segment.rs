@@ -105,26 +105,44 @@ fn median_filter(values: &[i32], window: usize) -> Vec<i32> {
         .collect()
 }
 
+/// Returns the MIDI note number of `frame` when it counts as voiced under `cfg`.
+fn voiced_midi(frame: &PitchFrame, cfg: &SegmentConfig) -> Option<i32> {
+    if frame.confidence < cfg.min_confidence {
+        return None;
+    }
+    let hz = frame.freq_hz?;
+    crate::music::note::from_freq(hz).map(|reading| reading.midi)
+}
+
 /// Groups pitch frames into notes.
 ///
-/// The frames must be ordered by `time_s`. Notes shorter than
-/// `merge_note_s` that touch a neighbouring note merge into the longer
-/// neighbour, so a short pitch slide at the edge of a note extends that note
-/// instead of forming a note of its own. The result is sorted by start time
-/// and its notes do not overlap.
+/// The frames must be ordered by `time_s`. A *hole* lies between two
+/// consecutive input frames when their times differ by more than 1.5 times
+/// the median frame period; input frames that are missing, such as the
+/// frames an audible metronome click covered, leave a hole. Equal notes join
+/// across a hole, because consecutive input frames keep adjacent indices
+/// across it. A note whose first voiced frame directly follows a hole that
+/// comes after an unvoiced input frame starts one period after that unvoiced
+/// frame, so a note that begins on a click starts at the click; a note that
+/// ends before a hole ends one period after its last voiced frame. Notes
+/// shorter than `merge_note_s` that touch a neighbouring note merge into the
+/// longer neighbour, so a short pitch slide at the edge of a note extends
+/// that note instead of forming a note of its own. The result is sorted by
+/// start time and its notes do not overlap.
 pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
     let period = frame_period(frames);
+    // A hole lies between the input frames j - 1 and j when their times
+    // differ by more than one and a half periods.
+    let hole_before = |j: usize| j > 0 && frames[j].time_s - frames[j - 1].time_s > 1.5 * period;
     let voiced: Vec<VoicedFrame> = frames
         .iter()
         .enumerate()
-        .filter(|(_, frame)| frame.confidence >= cfg.min_confidence)
         .filter_map(|(index, frame)| {
-            let hz = frame.freq_hz?;
-            let reading = crate::music::note::from_freq(hz)?;
+            let midi = voiced_midi(frame, cfg)?;
             Some(VoicedFrame {
                 index,
                 time_s: frame.time_s,
-                midi: reading.midi,
+                midi,
             })
         })
         .collect();
@@ -146,8 +164,19 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
                 && (curr.index == prev.index + 1 || gap <= cfg.max_gap_s + TIME_EPS_S)
         };
         if !joins {
+            let first = &voiced[group_start];
+            // A hole directly before the first voiced frame of a note that
+            // begins in an unvoiced stretch pulls the start back to one
+            // period after the input frame before the hole.
+            let start_s = if hole_before(first.index)
+                && voiced_midi(&frames[first.index - 1], cfg).is_none()
+            {
+                frames[first.index - 1].time_s + period
+            } else {
+                first.time_s
+            };
             notes.push(RawNote {
-                start_s: voiced[group_start].time_s,
+                start_s,
                 end_s: voiced[k - 1].time_s + period,
                 midi: filtered[group_start],
             });
@@ -287,6 +316,28 @@ mod tests {
         assert!(notes.iter().all(|note| note.midi == 69));
         assert_close(notes[0].end_s, 0.3, 1e-9);
         assert_close(notes[1].start_s, 0.4, 1e-9);
+    }
+
+    #[test]
+    fn a_held_tone_across_a_hole_is_one_note() {
+        let mut frames = run(0, 100, Some(440.0));
+        frames.drain(40..46); // frames 40..46 are missing: a hole of 0.07 s
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 1.0, 1e-9);
+    }
+
+    #[test]
+    fn a_note_after_a_hole_starts_one_period_after_the_frame_before_the_hole() {
+        let mut frames: Vec<PitchFrame> = (0..30).map(|i| frame_at(i, None, 0.0)).collect();
+        frames.extend(run(36, 50, Some(440.0))); // frames 30..36 are missing: a hole
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.30, 1e-9);
+        assert_close(notes[0].end_s, 0.86, 1e-9);
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub enum EngineEvent {
     /// are reported.
     RecordingFinished {
         /// Pitch frames of the recording, from [`PRE_ROLL_S`] before the
-        /// origin; frames that overlap an audible click are unvoiced.
+        /// origin; frames that overlap an audible click are left out.
         frames: Vec<PitchFrame>,
         /// Engine-clock time of the recording origin in seconds.
         origin_s: f64,
@@ -289,7 +289,7 @@ struct Recording {
     frames: Vec<PitchFrame>,
 }
 
-/// Keeps the frames from [`PRE_ROLL_S`] before `origin_s` and unvoices
+/// Keeps the frames from [`PRE_ROLL_S`] before `origin_s` and leaves out
 /// every kept frame whose analysis window overlaps a click of `clicks`.
 fn finish_frames(
     frames: Vec<PitchFrame>,
@@ -300,16 +300,11 @@ fn finish_frames(
     frames
         .into_iter()
         .filter(|frame| frame.time_s >= origin_s - PRE_ROLL_S)
-        .map(|mut frame| {
-            let masked = clicks.iter().any(|&click| {
+        .filter(|frame| {
+            !clicks.iter().any(|&click| {
                 click - window_s / 2.0 <= frame.time_s
                     && frame.time_s <= click + CLICK_S + window_s / 2.0
-            });
-            if masked {
-                frame.freq_hz = None;
-                frame.confidence = 0.0;
-            }
-            frame
+            })
         })
         .collect()
 }
@@ -1169,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_reports_the_origin_and_masks_clicks() {
+    fn recording_reports_the_origin_and_leaves_out_clicks() {
         let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
@@ -1194,13 +1189,11 @@ mod tests {
         let clicks = [2.0, 2.5, 3.0, 3.5];
         for frame in &frames {
             for &click in &clicks {
-                if (click - 0.0214..=click + 0.0414).contains(&frame.time_s) {
-                    assert!(
-                        frame.freq_hz.is_none(),
-                        "frame at {} is voiced over the click at {click}",
-                        frame.time_s
-                    );
-                }
+                assert!(
+                    !(click - 0.0214..=click + 0.0414).contains(&frame.time_s),
+                    "a frame at {} lies over the click at {click}",
+                    frame.time_s
+                );
             }
         }
         let voiced: Vec<&PitchFrame> = frames
@@ -1219,6 +1212,67 @@ mod tests {
                 "{freq_hz} Hz instead of 1046.5 Hz"
             );
         }
+    }
+
+    #[test]
+    fn a_held_tone_over_audible_clicks_is_one_note() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartRecording {
+            bpm: 120.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+
+        handle.push_input(&vec![0.0_f32; 96_000]); // 2 s of silence, the count-in
+        handle.push_input(&sine(1046.5, 0.3, 48_000, 96_000)); // 2 s of tone from the origin
+        handle.step_n(750); // 4 s
+
+        assert_close(wait_started(&engine), 2.0, 1e-9);
+
+        engine.send(EngineCommand::StopRecording);
+        let (frames, origin_s) = wait_finished(&engine);
+        assert_close(origin_s, 2.0, 1e-9);
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1, "one note over the clicks, got {notes:?}");
+        assert_eq!(notes[0].midi, 84);
+        assert!(
+            (notes[0].start_s - 2.0).abs() <= 0.05,
+            "the note starts at {} s",
+            notes[0].start_s
+        );
+        assert!(
+            notes[0].end_s - notes[0].start_s >= 1.9,
+            "the note lasts {} s",
+            notes[0].end_s - notes[0].start_s
+        );
+    }
+
+    #[test]
+    fn a_note_entering_on_beat_zero_quantizes_to_beat_zero() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartRecording {
+            bpm: 200.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+
+        handle.push_input(&vec![0.0_f32; 57_600]); // 1.2 s of silence, the count-in
+        handle.push_input(&sine(1046.5, 0.3, 48_000, 57_600)); // 1.2 s of tone from the origin
+        handle.step_n(460); // (1.2 + 1.2) s * 48000 / 256 = 450 blocks, plus a few
+
+        assert_close(wait_started(&engine), 1.2, 1e-9);
+
+        engine.send(EngineCommand::StopRecording);
+        let (frames, origin_s) = wait_finished(&engine);
+        assert_close(origin_s, 1.2, 1e-9);
+        let notes = quantize(
+            &segment(&frames, &SegmentConfig::default()),
+            200.0,
+            Grid::Sixteenth,
+            origin_s,
+        );
+        assert_eq!(notes.len(), 1, "one quantized note, got {notes:?}");
+        assert_close(notes[0].start_beats, 0.0, 1e-9);
     }
 
     #[test]
@@ -1354,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_frames_keeps_the_pre_roll_and_masks_clicks() {
+    fn finish_frames_keeps_the_pre_roll_and_leaves_out_clicks() {
         let frames: Vec<PitchFrame> = (0..=300)
             .map(|i| PitchFrame {
                 time_s: i as f64 * 0.01,
@@ -1364,17 +1418,18 @@ mod tests {
             .collect();
         let finished = finish_frames(frames, 2.0, &[2.0, 2.5], 0.04);
         assert_close(finished[0].time_s, 1.9, 1e-9);
+        for t in [1.99, 2.0, 2.03, 2.5] {
+            assert!(
+                !finished.iter().any(|frame| (frame.time_s - t).abs() < 1e-9),
+                "a frame at {t} lies over a click"
+            );
+        }
         let frame_at = |t: f64| {
             finished
                 .iter()
                 .find(|frame| (frame.time_s - t).abs() < 1e-9)
                 .unwrap_or_else(|| panic!("a frame at {t}"))
         };
-        for t in [1.99, 2.0, 2.03, 2.5] {
-            let frame = frame_at(t);
-            assert!(frame.freq_hz.is_none(), "the frame at {t} is unvoiced");
-            assert_eq!(frame.confidence, 0.0);
-        }
         for t in [1.97, 2.05, 2.2, 2.45] {
             let frame = frame_at(t);
             assert_eq!(frame.freq_hz, Some(1000.0), "the frame at {t} is voiced");
