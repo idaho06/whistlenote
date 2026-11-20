@@ -6,7 +6,7 @@
 
 use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
 use crate::ui::bpm_mode::BpmState;
-use crate::ui::live::{NoteSmoother, ShownNote};
+use crate::ui::live::{CLEAR_S, NoteSmoother, ShownNote};
 use crate::ui::record_mode::RecordState;
 
 /// The largest absolute latency offset in milliseconds.
@@ -58,6 +58,8 @@ pub struct AppState {
     latest_live: Option<LiveFrame>,
     /// The smoother of the live note.
     live: NoteSmoother,
+    /// UI time in seconds of the latest tick that received live frames.
+    last_live_ui_s: Option<f64>,
     /// The tempo state of the BPM tab, including the tempo used for recordings.
     pub bpm: BpmState,
     /// The recording state of the Record tab.
@@ -87,6 +89,20 @@ impl AppState {
         self.live.push(&frame);
         self.latest_live = Some(frame);
         self.record.push_live(&frame);
+    }
+
+    /// Advances the live readout to the UI time `now_ui_s`: `received` says whether live frames arrived since the previous tick. When none arrived for more than [`CLEAR_S`] since the last tick that received frames, the shown note and the latest live frame clear.
+    pub fn live_tick(&mut self, now_ui_s: f64, received: bool) {
+        if received {
+            self.last_live_ui_s = Some(now_ui_s);
+        } else if self
+            .last_live_ui_s
+            .is_some_and(|last_s| now_ui_s - last_s > CLEAR_S)
+        {
+            self.live.reset();
+            self.latest_live = None;
+            self.last_live_ui_s = None;
+        }
     }
 
     /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
@@ -120,7 +136,7 @@ impl AppState {
         Some(EngineCommand::SetLatencyMs(clamped))
     }
 
-    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother, since frames stop arriving and its time-based clearing does not run, and cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
+    /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother and drops the UI time of the last tick that received frames, since frames stop arriving and the tick-based clearing does not run, and cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
     pub fn set_listening(&mut self, on: bool) -> Option<EngineCommand> {
         if self.listening == on {
             return None;
@@ -128,6 +144,7 @@ impl AppState {
         self.listening = on;
         if !on {
             self.live.reset();
+            self.last_live_ui_s = None;
             self.record.cancel();
         }
         Some(if on {
@@ -544,6 +561,47 @@ mod tests {
         assert!(state.live_note().is_some());
         state.set_listening(false);
         assert_eq!(state.live_note(), None);
+    }
+
+    /// Feeds `state` three voiced `frame`s at 10 ms intervals, which shows A4 as the live note.
+    fn feed_three_frames(state: &mut AppState) {
+        for time_s in [0.0, 0.01, 0.02] {
+            state.apply_live(frame(time_s));
+        }
+    }
+
+    #[test]
+    fn the_live_readout_clears_when_frames_stop() {
+        let mut state = AppState::default();
+        state.set_listening(true);
+        feed_three_frames(&mut state);
+        state.live_tick(10.0, true);
+        assert!(state.live_note().is_some());
+        assert!(state.latest_live().is_some());
+        state.live_tick(10.5, false);
+        assert_eq!(state.live_note(), None);
+        assert_eq!(state.latest_live(), None);
+    }
+
+    #[test]
+    fn the_live_readout_stays_within_the_clear_time() {
+        let mut state = AppState::default();
+        state.set_listening(true);
+        feed_three_frames(&mut state);
+        state.live_tick(10.0, true);
+        assert!(state.live_note().is_some());
+        assert!(state.latest_live().is_some());
+        state.live_tick(10.2, false);
+        assert!(state.live_note().is_some());
+        assert!(state.latest_live().is_some());
+    }
+
+    #[test]
+    fn a_tick_without_any_frames_changes_nothing() {
+        let mut state = AppState::default();
+        let before = state.clone();
+        state.live_tick(5.0, false);
+        assert_eq!(state, before);
     }
 
     #[test]

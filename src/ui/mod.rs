@@ -157,9 +157,12 @@ impl WhistlenoteApp {
 
 impl eframe::App for WhistlenoteApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut received = false;
         for frame in self.engine.live().try_iter() {
             self.state.apply_live(frame);
+            received = true;
         }
+        self.state.live_tick(ctx.input(|i| i.time), received);
         for event in self.engine.events().try_iter() {
             log::trace!("event: {event:?}");
             self.state.apply_event(event);
