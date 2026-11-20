@@ -1,13 +1,16 @@
 //! Desktop application: window, views and the state they share.
 //!
 //! [`run`] opens the main window and runs the application until the window
-//! closes. The window has a top bar with the input and output device combos,
-//! the refresh button, the latency offset, the listen toggle and the tab
-//! buttons, a status bar at the bottom that shows whether the engine listens,
-//! the input sample rate and the latest error, and a central panel with the
-//! heading of the selected tab. The views share the [`state::AppState`],
-//! which folds the events of the engine into the state and turns user
-//! actions into engine commands.
+//! closes. It loads the settings file at start, restores the session and
+//! applies the tuning, and shows a load warning in the status bar; on exit it
+//! writes the session and the last saved tuning back. The window has a top
+//! bar with the input and output device combos, the refresh button, the
+//! latency offset, the preferences button that opens the floating
+//! preferences window, the listen toggle and the tab buttons, a status bar at
+//! the bottom that shows whether the engine listens, the input sample rate
+//! and the latest error, and a central panel with the heading of the selected
+//! tab. The views share the [`state::AppState`], which folds the events of
+//! the engine into the state and turns user actions into engine commands.
 
 pub mod bpm_mode;
 pub mod live;
@@ -15,14 +18,17 @@ pub mod prefs;
 pub mod record_mode;
 pub mod state;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
 
+use self::prefs::PrefsWindow;
 use self::state::{AppState, MAX_LATENCY_MS, Tab, rate_label};
 use crate::audio::cpal_backend::CpalBackend;
 use crate::dsp::pitch::LOW_RATE_HZ;
 use crate::engine::{Engine, EngineCommand};
+use crate::settings::{Settings, Tuning, VERSION};
 
 /// Repaint interval while the engine listens.
 const REPAINT_LISTENING: Duration = Duration::from_millis(16);
@@ -38,12 +44,30 @@ const DEVICE_COMBO_WIDTH: f32 = 220.0;
 pub(crate) const GOOD_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 180, 75);
 
 /// Opens the main window and runs the application until the window closes.
+///
+/// The settings file in the user's configuration directory is loaded at start,
+/// its session is restored and its tuning applied, and a load warning is shown
+/// in the status bar.
 pub fn run() -> eframe::Result {
     log::info!("whistlenote {} starting", env!("CARGO_PKG_VERSION"));
     let engine = Engine::spawn(CpalBackend::new());
+    let settings_path = crate::settings::default_path();
+    let (settings, warning) = match settings_path.as_deref() {
+        Some(path) => Settings::load_from(path),
+        None => {
+            log::warn!(
+                "no configuration directory is available; the settings are not loaded or saved"
+            );
+            (Settings::default(), None)
+        }
+    };
+    let state = initial_state(&settings, warning);
     let app = WhistlenoteApp {
         engine,
-        state: AppState::default(),
+        state,
+        prefs: PrefsWindow::default(),
+        saved_tuning: settings.tuning.clone(),
+        settings_path,
     };
     eframe::run_native(
         "whistlenote",
@@ -57,12 +81,42 @@ pub fn run() -> eframe::Result {
     )
 }
 
+/// Builds the initial state from the loaded `settings`: restores the session,
+/// applies the tuning and reports `warning` in the status bar when it is
+/// `Some`.
+fn initial_state(settings: &Settings, warning: Option<String>) -> AppState {
+    let mut state = AppState::default();
+    state.restore_session(&settings.session);
+    state.apply_tuning(&settings.tuning);
+    if let Some(warning) = warning {
+        state.report_error(warning);
+    }
+    state
+}
+
+/// Returns the settings written on exit: the session of `state` and the tuning
+/// last loaded or saved, sanitized.
+fn exit_settings(state: &AppState, saved_tuning: &Tuning) -> Settings {
+    Settings {
+        version: VERSION,
+        session: state.session(),
+        tuning: saved_tuning.clone(),
+    }
+    .sanitized()
+}
+
 /// The application: the engine handle and the state the views share.
 struct WhistlenoteApp {
     /// The engine thread; dropping the app stops the engine.
     engine: Engine,
     /// The state shared by the views.
     state: AppState,
+    /// The floating preferences window.
+    prefs: PrefsWindow,
+    /// The tuning last loaded or saved, written to the settings file on exit; a tuning changed in the window but not saved is not written.
+    saved_tuning: Tuning,
+    /// Path of the settings file in the user's configuration directory, or `None` when there is no configuration directory.
+    settings_path: Option<PathBuf>,
 }
 
 impl WhistlenoteApp {
@@ -73,9 +127,10 @@ impl WhistlenoteApp {
         }
     }
 
-    /// Shows the top bar in two rows: the device combos, the refresh button
-    /// and the latency offset, which wrap in a narrow window; then the listen
-    /// toggle, disabled while a recording runs, and the tab buttons.
+    /// Shows the top bar in two rows: the device combos, the refresh button,
+    /// the latency offset and the preferences button, which wrap in a narrow
+    /// window; then the listen toggle, disabled while a recording runs, and
+    /// the tab buttons.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Input");
@@ -117,6 +172,17 @@ impl WhistlenoteApp {
             );
             let command = self.state.set_latency_ms(ms);
             self.send(command);
+
+            ui.separator();
+            if ui
+                .button("⚙ Preferences")
+                .on_hover_text(
+                    "Fine-tune sound capture, note detection, timing, the metronome and export",
+                )
+                .clicked()
+            {
+                self.prefs.open(&self.state);
+            }
         });
         ui.horizontal(|ui| {
             ui.add_enabled_ui(self.state.record.is_idle(), |ui| {
@@ -199,6 +265,23 @@ impl eframe::App for WhistlenoteApp {
                 self.send(command);
             }
         });
+        if let Some(tuning) =
+            self.prefs
+                .show(ui.ctx(), &mut self.state, self.settings_path.as_deref())
+        {
+            self.saved_tuning = tuning;
+        }
+        for command in self.state.engine_commands() {
+            self.engine.send(command);
+        }
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(path) = &self.settings_path
+            && let Err(error) = exit_settings(&self.state, &self.saved_tuning).save_to(path)
+        {
+            log::warn!("cannot save the settings to {}: {error}", path.display());
+        }
     }
 }
 
@@ -302,5 +385,33 @@ mod tests {
     #[test]
     fn a_repeated_error_is_counted() {
         assert_eq!(error_label("x", 3), "x (×3)");
+    }
+
+    #[test]
+    fn initial_state_restores_the_session_and_applies_the_tuning() {
+        let mut settings = Settings::default();
+        settings.session.latency_ms = 25.0;
+        settings.tuning.voicing.a4_hz = 432.0;
+        let state = initial_state(&settings, None);
+        assert_eq!(state.latency_ms(), 25.0);
+        assert_eq!(state.tuning().voicing.a4_hz, 432.0);
+        assert_eq!(state.error(), None);
+    }
+
+    #[test]
+    fn initial_state_reports_the_load_warning() {
+        let state = initial_state(&Settings::default(), Some("w".into()));
+        assert_eq!(state.error().map(|(text, _)| text), Some("w"));
+    }
+
+    #[test]
+    fn exit_settings_writes_the_session_and_the_saved_tuning() {
+        let mut state = initial_state(&Settings::default(), None);
+        let mut applied = Tuning::default();
+        applied.voicing.a4_hz = 432.0;
+        state.apply_tuning(&applied);
+        let settings = exit_settings(&state, &Tuning::default());
+        assert_eq!(settings.tuning, Tuning::default());
+        assert_eq!(settings.session, state.session());
     }
 }
