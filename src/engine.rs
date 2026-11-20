@@ -1276,6 +1276,47 @@ mod tests {
     }
 
     #[test]
+    fn a_pitch_change_on_a_click_keeps_its_beat() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartRecording {
+            bpm: 200.0,
+            metronome: true,
+        });
+        wait_both_streams(&handle);
+
+        // 1.2 s of silence, the count-in; one beat of 1046.5 Hz from the
+        // origin; then, phase-continuous, two beats of 1174.66 Hz; then
+        // 0.5 s of silence.
+        let mut signal = vec![0.0_f32; 57_600];
+        signal.extend(sine(1046.5, 0.3, 48_000, 14_400));
+        let second: Vec<f32> = (14_400..14_400 + 28_800)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 1174.66 * i as f32 / 48_000.0).sin())
+            .collect();
+        signal.extend(second);
+        signal.extend(vec![0.0_f32; 24_000]);
+        let len = signal.len();
+        handle.push_input(&signal);
+        handle.step_n(len.div_ceil(256) + 4);
+
+        assert_close(wait_started(&engine), 1.2, 1e-9);
+
+        engine.send(EngineCommand::StopRecording);
+        let (frames, origin_s) = wait_finished(&engine);
+        assert_close(origin_s, 1.2, 1e-9);
+        let notes = quantize(
+            &segment(&frames, &SegmentConfig::default()),
+            200.0,
+            Grid::Sixteenth,
+            origin_s,
+        );
+        assert_eq!(notes.len(), 2, "two quantized notes, got {notes:?}");
+        assert_eq!(notes[0].midi, 84);
+        assert_close(notes[0].start_beats, 0.0, 1e-9);
+        assert_eq!(notes[1].midi, 86);
+        assert_close(notes[1].start_beats, 1.0, 1e-9);
+    }
+
+    #[test]
     fn the_latency_offset_shifts_the_origin() {
         let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::SetLatencyMs(50.0));

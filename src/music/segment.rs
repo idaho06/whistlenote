@@ -54,6 +54,9 @@ pub struct RawNote {
 /// Tolerance in seconds for comparing sums and differences of frame times.
 const TIME_EPS_S: f64 = 1e-9;
 
+/// Longest hole, in frame periods, that the note after it reaches back across; a hole that an audible click leaves spans about 4 to 7 periods at every sample rate.
+const MAX_HOLE_PERIODS: f64 = 8.0;
+
 /// A frame that counts as voiced, with its MIDI note number.
 struct VoicedFrame {
     /// Index of the frame in the input slice.
@@ -121,11 +124,11 @@ fn voiced_midi(frame: &PitchFrame, cfg: &SegmentConfig) -> Option<i32> {
 /// the median frame period; input frames that are missing, such as the
 /// frames an audible metronome click covered, leave a hole. Equal notes join
 /// across a hole, because consecutive input frames keep adjacent indices
-/// across it. A note whose first voiced frame directly follows a hole that
-/// comes after an unvoiced input frame starts one period after that unvoiced
-/// frame, so a note that begins on a click starts at the click; a note that
-/// ends before a hole ends one period after its last voiced frame. Notes
-/// shorter than `merge_note_s` that touch a neighbouring note merge into the
+/// across it. A note whose first voiced frame directly follows a hole of at
+/// most 8 frame periods starts one period after the input frame before the
+/// hole, so a note that begins on a click, from silence or from another
+/// note, starts at the click; a note that ends before a hole ends one period
+/// after its last voiced frame. Notes shorter than `merge_note_s` that touch a neighbouring note merge into the
 /// longer neighbour, so a short pitch slide at the edge of a note extends
 /// that note instead of forming a note of its own. Touching notes of the
 /// same pitch join into one note. The result is sorted by start time and its
@@ -166,11 +169,12 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
         };
         if !joins {
             let first = &voiced[group_start];
-            // A hole directly before the first voiced frame of a note that
-            // begins in an unvoiced stretch pulls the start back to one
-            // period after the input frame before the hole.
+            // A hole of at most MAX_HOLE_PERIODS directly before the first
+            // voiced frame of a note pulls the start back to one period
+            // after the input frame before the hole.
             let start_s = if hole_before(first.index)
-                && voiced_midi(&frames[first.index - 1], cfg).is_none()
+                && frames[first.index].time_s - frames[first.index - 1].time_s
+                    <= MAX_HOLE_PERIODS * period + TIME_EPS_S
             {
                 frames[first.index - 1].time_s + period
             } else {
@@ -361,6 +365,30 @@ mod tests {
         assert_eq!(notes[0].midi, 69);
         assert_close(notes[0].start_s, 0.30, 1e-9);
         assert_close(notes[0].end_s, 0.86, 1e-9);
+    }
+
+    #[test]
+    fn a_pitch_change_after_a_short_hole_starts_at_the_hole() {
+        let mut frames = run(0, 40, Some(440.0));
+        frames.extend(run(46, 50, Some(493.88))); // frames 40..46 are missing: a hole of 0.07 s
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 2, "two notes, got {notes:?}");
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.0, 1e-9);
+        assert_close(notes[0].end_s, 0.40, 1e-9);
+        assert_eq!(notes[1].midi, 71);
+        assert_close(notes[1].start_s, 0.40, 1e-9);
+    }
+
+    #[test]
+    fn a_note_after_a_long_gap_without_frames_starts_at_its_first_frame() {
+        let mut frames: Vec<PitchFrame> = (0..30).map(|i| frame_at(i, None, 0.0)).collect();
+        frames.extend(run(50, 50, Some(440.0))); // frames 30..50 are missing: a 0.21 s gap
+        let notes = segment(&frames, &SegmentConfig::default());
+        assert_eq!(notes.len(), 1, "one note, got {notes:?}");
+        assert_eq!(notes[0].midi, 69);
+        assert_close(notes[0].start_s, 0.50, 1e-9);
+        assert_close(notes[0].end_s, 1.0, 1e-9);
     }
 
     #[test]
