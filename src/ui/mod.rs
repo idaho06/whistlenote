@@ -360,10 +360,9 @@ fn selected_label(selected: Option<&str>, missing: bool) -> String {
 fn rate_combo(
     ui: &mut egui::Ui,
     rates: &[u32],
-    choice: Option<u32>,
+    mut choice: Option<u32>,
     open_rate: Option<u32>,
 ) -> Option<u32> {
-    let mut choice = choice;
     let label = rate_choice_label(choice, open_rate);
     let response = egui::ComboBox::from_id_salt("input_rate")
         .selected_text(label)
@@ -384,12 +383,10 @@ fn rate_combo(
 /// chosen rate for `Some`, otherwise "Auto", with the opened rate in
 /// parentheses when an input is open.
 fn rate_choice_label(choice: Option<u32>, open_rate: Option<u32>) -> String {
-    match choice {
-        Some(rate) => rate_label(rate),
-        None => match open_rate {
-            Some(rate) => format!("Auto ({})", rate_label(rate)),
-            None => "Auto".to_string(),
-        },
+    match (choice, open_rate) {
+        (Some(rate), _) => rate_label(rate),
+        (None, Some(open)) => format!("Auto ({})", rate_label(open)),
+        (None, None) => "Auto".to_string(),
     }
 }
 

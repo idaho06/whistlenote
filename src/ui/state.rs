@@ -101,8 +101,8 @@ impl AppState {
     /// first list after a session restore checks the restored devices and
     /// falls a missing one back to the default device — the supported input
     /// rates replace the stored list, and a chosen rate the list does not
-    /// offer falls back to the automatic choice with a queued command and a
-    /// status message, an input rate replaces the stored rate, and a rate
+    /// offer falls back to the automatic choice, as it does in the engine,
+    /// with a status message, an input rate replaces the stored rate, and a rate
     /// that differs from the chosen one is reported in the status bar, an
     /// onset feeds the tempo state of the BPM tab, a repeated error raises
     /// its count, other events change nothing.
@@ -123,8 +123,8 @@ impl AppState {
                 if let Some(choice) = self.input_rate_choice
                     && !self.input_rates.contains(&choice)
                 {
+                    // The engine applies the same fallback to its own choice.
                     self.input_rate_choice = None;
-                    self.pending.push(EngineCommand::SetInputRate(None));
                     self.report_error(format!(
                         "The input does not offer {}; using Auto",
                         rate_label(choice)
@@ -193,12 +193,12 @@ impl AppState {
 
     /// Sets the chosen input sample rate `choice`, `None` for the automatic choice, and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
     pub fn set_input_rate_choice(&mut self, choice: Option<u32>) -> Option<EngineCommand> {
-        if self.input_rate_choice == choice {
-            return None;
+        let command =
+            set_selection(&mut self.input_rate_choice, choice).map(EngineCommand::SetInputRate);
+        if command.is_some() {
+            self.record.cancel();
         }
-        self.input_rate_choice = choice;
-        self.record.cancel();
-        Some(EngineCommand::SetInputRate(choice))
+        command
     }
 
     /// Clamps `ms` to the allowed range, stores it and returns the command for the engine; returns `None` when `ms` is not finite or unchanged.
@@ -420,13 +420,13 @@ fn count_error(slot: &mut Option<(String, u32)>, text: String) {
     }
 }
 
-/// Stores `name` in `slot` and returns it when the selection changed.
-fn set_selection(slot: &mut Option<String>, name: Option<String>) -> Option<Option<String>> {
-    if *slot == name {
+/// Stores `value` in `slot` and returns it when the selection changed.
+fn set_selection<T: PartialEq + Clone>(slot: &mut T, value: T) -> Option<T> {
+    if *slot == value {
         return None;
     }
-    *slot = name.clone();
-    Some(name)
+    *slot = value.clone();
+    Some(value)
 }
 
 /// Returns whether `selection` names a device that is missing from `names`.
@@ -890,9 +890,10 @@ mod tests {
         assert_eq!(state.input_rates(), &[48_000]);
         assert_eq!(state.input_rate_choice(), None);
         assert!(
-            state
+            !state
                 .engine_commands()
-                .contains(&EngineCommand::SetInputRate(None))
+                .contains(&EngineCommand::SetInputRate(None)),
+            "the engine falls back on its own"
         );
         let (text, _) = state.error().expect("a status message");
         assert!(text.contains("does not offer 96 kHz"));

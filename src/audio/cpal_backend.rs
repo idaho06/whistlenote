@@ -252,35 +252,23 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
 /// choice falls back to the `None` behaviour.
 fn input_config(device: &Device, rate: Option<u32>) -> Result<SupportedStreamConfig, AudioError> {
     let default = device.default_input_config()?;
-    if let Some(rate) = rate {
-        let chosen = match device.supported_input_configs() {
-            Ok(ranges) => {
-                let ranges: Vec<_> = ranges.collect();
-                choose_rate_config(default, &ranges, rate)
-            }
-            Err(error) => {
-                log::debug!("supported input configs unavailable: {error}");
-                None
-            }
-        };
-        match chosen {
-            Some(config) => {
-                log::debug!("input at {rate} Hz: {config:?}");
-                return Ok(config);
-            }
-            None => log::warn!("input does not support {rate} Hz; choosing the rate automatically"),
-        }
-    }
-    if default.sample_rate() >= MIN_INPUT_RATE_HZ {
+    if rate.is_none() && default.sample_rate() >= MIN_INPUT_RATE_HZ {
         return Ok(default);
     }
     let ranges: Vec<_> = match device.supported_input_configs() {
         Ok(ranges) => ranges.collect(),
         Err(error) => {
             log::debug!("supported input configs unavailable: {error}");
-            return Ok(default);
+            Vec::new()
         }
     };
+    if let Some(rate) = rate {
+        if let Some(config) = choose_rate_config(&default, &ranges, rate) {
+            log::debug!("input at {rate} Hz: {config:?}");
+            return Ok(config);
+        }
+        log::warn!("input does not support {rate} Hz; choosing the rate automatically");
+    }
     let chosen = choose_input_config(default, &ranges);
     if chosen != default {
         log::info!(
@@ -313,7 +301,7 @@ fn supported_rates(ranges: &[SupportedStreamConfigRange]) -> Vec<u32> {
         .filter(|&rate| {
             ranges
                 .iter()
-                .any(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
+                .any(|range| range.try_with_sample_rate(rate).is_some())
         })
         .collect()
 }
@@ -322,15 +310,15 @@ fn supported_rates(ranges: &[SupportedStreamConfigRange]) -> Vec<u32> {
 /// covers it: the lowest [`rank`] wins, with ties going to the earliest
 /// range; `None` when no range covers `rate`.
 fn choose_rate_config(
-    default: SupportedStreamConfig,
+    default: &SupportedStreamConfig,
     ranges: &[SupportedStreamConfigRange],
     rate: u32,
 ) -> Option<SupportedStreamConfig> {
     ranges
         .iter()
-        .filter(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
-        .min_by_key(|range| rank(range, &default))
-        .map(|range| range.with_sample_rate(rate))
+        .filter_map(|range| Some((rank(range, default), range.try_with_sample_rate(rate)?)))
+        .min_by_key(|&(rank, _)| rank)
+        .map(|(_, config)| config)
 }
 
 /// Chooses the input config from the device's supported `ranges` when the
@@ -966,7 +954,7 @@ mod tests {
             range(1, 8_000, 192_000, SampleFormat::F32),
             range(2, 8_000, 192_000, SampleFormat::F32),
         ];
-        let chosen = choose_rate_config(default, &ranges, 96_000).expect("a range covers 96 kHz");
+        let chosen = choose_rate_config(&default, &ranges, 96_000).expect("a range covers 96 kHz");
         assert_eq!(chosen.sample_rate(), 96_000);
         assert_eq!(chosen.channels(), 2);
         assert_eq!(chosen.sample_format(), SampleFormat::F32);
@@ -979,7 +967,7 @@ mod tests {
             range(1, 8_000, 192_000, SampleFormat::I16),
             range(1, 8_000, 192_000, SampleFormat::F32),
         ];
-        let chosen = choose_rate_config(default, &ranges, 96_000).expect("a range covers 96 kHz");
+        let chosen = choose_rate_config(&default, &ranges, 96_000).expect("a range covers 96 kHz");
         assert_eq!(chosen.sample_rate(), 96_000);
         assert_eq!(chosen.channels(), 1);
         assert_eq!(chosen.sample_format(), SampleFormat::F32);
@@ -989,6 +977,6 @@ mod tests {
     fn choose_rate_config_returns_none_for_an_uncovered_rate() {
         let default = config(2, 48_000, SampleFormat::F32);
         let ranges = [range(2, 8_000, 48_000, SampleFormat::F32)];
-        assert_eq!(choose_rate_config(default, &ranges, 96_000), None);
+        assert_eq!(choose_rate_config(&default, &ranges, 96_000), None);
     }
 }

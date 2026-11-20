@@ -99,7 +99,7 @@ pub enum EngineEvent {
     },
     /// The sample rate of the input stream in Hz, or `None` when no input is open; sent whenever it changes.
     InputRate(Option<u32>),
-    /// The standard sample rates the selected input supports, ascending; sent after each `Devices` event and after an input selection, empty when they cannot be read.
+    /// The standard sample rates the selected input supports, ascending; sent after each `Devices` event and after an input selection, empty when they cannot be read. A chosen rate the list does not contain becomes the automatic choice.
     InputRates(Vec<u32>),
     /// A metronome beat starts playing on the output stream at `time_s`.
     Beat {
@@ -154,8 +154,7 @@ pub enum EngineCommand {
     /// `None`; a change cancels and discards a running recording and reopens
     /// an open input.
     SetInputRate(
-        /// The requested sample rate in Hz, or `None` for the backend's
-        /// automatic choice.
+        /// The sample rate in Hz.
         Option<u32>,
     ),
     /// Sets the tempo and the on/off state of the free-running metronome.
@@ -477,24 +476,16 @@ impl Worker {
                 self.cancel_recording();
             }
             EngineCommand::SelectInput(name) => {
-                self.cancel_recording();
                 self.input_name = name;
                 // A rate chosen for one device may not exist on another.
                 self.input_rate = None;
-                self.input = None;
-                if self.listening {
-                    self.open_input();
-                }
+                self.reopen_input();
                 self.emit_input_rates();
             }
             EngineCommand::SetInputRate(rate) => {
                 if rate != self.input_rate {
-                    self.cancel_recording();
                     self.input_rate = rate;
-                    self.input = None;
-                    if self.listening {
-                        self.open_input();
-                    }
+                    self.reopen_input();
                 }
             }
             EngineCommand::SetMetronome { bpm, enabled } => {
@@ -556,6 +547,16 @@ impl Worker {
         false
     }
 
+    /// Cancels and discards a running recording, closes the input and opens
+    /// it again while listening, so a new device or rate takes effect.
+    fn reopen_input(&mut self) {
+        self.cancel_recording();
+        self.input = None;
+        if self.listening {
+            self.open_input();
+        }
+    }
+
     /// Closes the input when neither listening nor recording needs it.
     fn close_unwanted_input(&mut self) {
         if !self.listening && self.recording.is_none() && self.input.take().is_some() {
@@ -577,7 +578,7 @@ impl Worker {
     /// Sends the current device lists as a `Devices` event followed by the
     /// supported input rates as an `InputRates` event, or the first listing
     /// error as an `Error` event.
-    fn emit_devices(&self) {
+    fn emit_devices(&mut self) {
         match (self.backend.list_inputs(), self.backend.list_outputs()) {
             (Ok(inputs), Ok(outputs)) => {
                 log::debug!(
@@ -596,20 +597,21 @@ impl Worker {
 
     /// Sends the standard sample rates the selected input supports as an
     /// [`EngineEvent::InputRates`] event, ascending; a listing error is
-    /// logged and reported as an empty list. A send error is ignored because
-    /// the receiver is gone.
-    fn emit_input_rates(&self) {
+    /// logged and reported as an empty list. A chosen rate the list does not
+    /// offer becomes the automatic choice without reopening the input, since
+    /// the backend already opened it automatically. A send error is ignored
+    /// because the receiver is gone.
+    fn emit_input_rates(&mut self) {
         let name = self.input_name.as_deref();
-        match self.backend.input_rates(name) {
-            Ok(rates) => {
-                log::debug!("input rates of {}: {rates:?}", device_label(name));
-                let _ = self.events.send(EngineEvent::InputRates(rates));
-            }
-            Err(error) => {
-                log::debug!("input rates of {} unavailable: {error}", device_label(name));
-                let _ = self.events.send(EngineEvent::InputRates(Vec::new()));
-            }
+        let rates = self.backend.input_rates(name).unwrap_or_else(|error| {
+            log::debug!("input rates of {} unavailable: {error}", device_label(name));
+            Vec::new()
+        });
+        log::debug!("input rates of {}: {rates:?}", device_label(name));
+        if self.input_rate.is_some_and(|rate| !rates.contains(&rate)) {
+            self.input_rate = None;
         }
+        let _ = self.events.send(EngineEvent::InputRates(rates));
     }
 
     /// Opens the input stream on the selected device at the chosen rate and
@@ -1197,87 +1199,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_input_rates_follow_the_devices_event() {
-        let (engine, _handle) = spawn_engine_on(FakeConfig {
-            input_rates: vec![48_000, 96_000],
-            ..FakeConfig::default()
-        });
-        engine.send(EngineCommand::RefreshDevices);
-        let devices = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::Devices { .. })
-        });
-        assert!(devices.is_some(), "the engine answers RefreshDevices");
-        let rates = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRates(_))
-        });
-        assert_eq!(rates, Some(EngineEvent::InputRates(vec![48_000, 96_000])));
-    }
-
-    #[test]
-    fn set_input_rate_reopens_the_input_at_that_rate() {
-        let (engine, handle) = spawn_engine_on(FakeConfig {
-            input_rates: vec![48_000, 96_000],
-            ..FakeConfig::default()
-        });
-        engine.send(EngineCommand::StartListening);
-        wait_input_open(&handle);
-        let opened = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(_))
-        });
-        assert_eq!(opened, Some(EngineEvent::InputRate(Some(48_000))));
-        assert_eq!(handle.input_rate(), Some(48_000));
-
-        engine.send(EngineCommand::SetInputRate(Some(96_000)));
-        let changed = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(Some(96_000)))
-        });
-        assert_eq!(changed, Some(EngineEvent::InputRate(Some(96_000))));
-        assert_eq!(handle.input_rate(), Some(96_000));
-    }
-
-    #[test]
-    fn an_unchanged_input_rate_does_not_reopen() {
-        let (engine, handle) = spawn_engine_on(FakeConfig {
-            input_rates: vec![48_000, 96_000],
-            ..FakeConfig::default()
-        });
-        engine.send(EngineCommand::StartListening);
-        wait_input_open(&handle);
-        let opened = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(_))
-        });
-        assert_eq!(opened, Some(EngineEvent::InputRate(Some(48_000))));
-
-        engine.send(EngineCommand::SetInputRate(Some(96_000)));
-        let changed = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(Some(96_000)))
-        });
-        assert_eq!(changed, Some(EngineEvent::InputRate(Some(96_000))));
-        assert_eq!(handle.input_rate(), Some(96_000));
-        let applied = sync(&engine);
-
-        engine.send(EngineCommand::SetInputRate(Some(96_000)));
-        let seen = sync(&engine);
-        assert!(
-            handle.input_device().is_some(),
-            "the input stream stays open"
-        );
-        assert_eq!(handle.input_rate(), Some(96_000));
-        assert_no_event(
-            &applied,
-            |event| matches!(event, EngineEvent::InputRate(_)),
-            "an InputRate event arrived although the rate did not change",
-        );
-        assert_no_event(
-            &seen,
-            |event| matches!(event, EngineEvent::InputRate(_)),
-            "an InputRate(None) or other rate event arrived between the two syncs",
-        );
-    }
-
-    #[test]
-    fn selecting_an_input_resets_the_rate_and_reports_its_rates() {
+    /// Spawns an engine whose fake input offers 48 and 96 kHz, starts
+    /// listening and waits until the input reports 48 kHz.
+    fn listening_at_48_khz() -> (Engine, FakeHandle) {
         let (engine, handle) = spawn_engine_on(FakeConfig {
             inputs: vec!["A".to_string(), "B".to_string()],
             input_rates: vec![48_000, 96_000],
@@ -1285,47 +1209,88 @@ mod tests {
         });
         engine.send(EngineCommand::StartListening);
         wait_input_open(&handle);
-        let opened = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(_))
-        });
-        assert_eq!(opened, Some(EngineEvent::InputRate(Some(48_000))));
-        assert_eq!(handle.input_device().as_deref(), Some("A"));
+        expect_event(&engine, EngineEvent::InputRate(Some(48_000)));
+        (engine, handle)
+    }
 
+    /// Waits until `engine` sends `expected`, failing the test after 2 s.
+    fn expect_event(engine: &Engine, expected: EngineEvent) {
+        let found = wait_for(engine.events(), Duration::from_secs(2), |event| {
+            *event == expected
+        });
+        assert!(found.is_some(), "the event {expected:?}");
+    }
+
+    /// Sets the input rate of `engine` to `rate` and waits until the input
+    /// reports it.
+    fn set_rate(engine: &Engine, handle: &FakeHandle, rate: u32) {
+        engine.send(EngineCommand::SetInputRate(Some(rate)));
+        expect_event(engine, EngineEvent::InputRate(Some(rate)));
+        assert_eq!(handle.input_rate(), Some(rate));
+    }
+
+    #[test]
+    fn the_input_rates_follow_the_devices_event() {
+        let (engine, _handle) = spawn_engine_on(FakeConfig {
+            input_rates: vec![48_000, 96_000],
+            ..FakeConfig::default()
+        });
+        engine.send(EngineCommand::RefreshDevices);
+        expect_event(&engine, EngineEvent::InputRates(vec![48_000, 96_000]));
+    }
+
+    #[test]
+    fn set_input_rate_reopens_the_input_at_that_rate() {
+        let (engine, handle) = listening_at_48_khz();
+        set_rate(&engine, &handle, 96_000);
+    }
+
+    #[test]
+    fn an_unchanged_input_rate_does_not_reopen() {
+        let (engine, handle) = listening_at_48_khz();
+        set_rate(&engine, &handle, 96_000);
         engine.send(EngineCommand::SetInputRate(Some(96_000)));
-        let changed = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(Some(96_000)))
-        });
-        assert_eq!(changed, Some(EngineEvent::InputRate(Some(96_000))));
+        assert_no_event(
+            &sync(&engine),
+            |event| matches!(event, EngineEvent::InputRate(_)),
+            "the input reopened for an unchanged rate",
+        );
         assert_eq!(handle.input_rate(), Some(96_000));
+    }
 
+    #[test]
+    fn a_rate_the_input_stops_offering_becomes_auto_without_reopening() {
+        let (engine, handle) = listening_at_48_khz();
+        set_rate(&engine, &handle, 96_000);
+        handle.set_input_rates(vec![48_000]);
+        engine.send(EngineCommand::RefreshDevices);
+        expect_event(&engine, EngineEvent::InputRates(vec![48_000]));
+        // The engine already holds Auto, so choosing it changes nothing.
+        engine.send(EngineCommand::SetInputRate(None));
+        assert_no_event(
+            &sync(&engine),
+            |event| matches!(event, EngineEvent::InputRate(_)),
+            "the input reopened",
+        );
+        assert_eq!(handle.input_rate(), Some(96_000));
+    }
+
+    #[test]
+    fn selecting_an_input_resets_the_rate_and_reports_its_rates() {
+        let (engine, handle) = listening_at_48_khz();
+        set_rate(&engine, &handle, 96_000);
         engine.send(EngineCommand::SelectInput(Some("B".to_string())));
-        // The selection resets the rate, so the input reopens on B at the
-        // automatic choice, and the supported rates of B are reported.
-        let rates = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRates(_))
-        });
-        assert_eq!(rates, Some(EngineEvent::InputRates(vec![48_000, 96_000])));
-        let reset = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(Some(48_000)))
-        });
-        assert_eq!(reset, Some(EngineEvent::InputRate(Some(48_000))));
+        // The rates are sent while the command is handled, before the
+        // reopened input reports its rate.
+        expect_event(&engine, EngineEvent::InputRates(vec![48_000, 96_000]));
+        expect_event(&engine, EngineEvent::InputRate(Some(48_000)));
         assert_eq!(handle.input_device().as_deref(), Some("B"));
         assert_eq!(handle.input_rate(), Some(48_000));
     }
 
     #[test]
-    fn a_rate_change_during_a_recording_aborts_it() {
-        let (engine, handle) = spawn_engine_on(FakeConfig {
-            input_rates: vec![48_000, 96_000],
-            ..FakeConfig::default()
-        });
-        engine.send(EngineCommand::StartListening);
-        wait_input_open(&handle);
-        let opened = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(_))
-        });
-        assert_eq!(opened, Some(EngineEvent::InputRate(Some(48_000))));
-
+    fn a_rate_change_during_a_recording_discards_it() {
+        let (engine, handle) = listening_at_48_khz();
         engine.send(EngineCommand::StartRecording {
             bpm: 120.0,
             metronome: true,
@@ -1334,26 +1299,17 @@ mod tests {
         handle.step_n(470); // 2.507 s: past the count-in
         wait_started(&engine);
 
-        engine.send(EngineCommand::SetInputRate(Some(96_000)));
-        let changed = wait_for(engine.events(), Duration::from_secs(2), |event| {
-            matches!(event, EngineEvent::InputRate(Some(96_000)))
-        });
-        assert_eq!(changed, Some(EngineEvent::InputRate(Some(96_000))));
-        assert_eq!(handle.input_rate(), Some(96_000));
-
-        // The rate change discarded the running recording without finishing
-        // or aborting it with an event.
+        set_rate(&engine, &handle, 96_000);
         handle.step_n(100);
-        let seen = sync(&engine);
         assert_no_event(
-            &seen,
-            |event| matches!(event, EngineEvent::RecordingFinished { .. }),
-            "a RecordingFinished arrived after the rate change",
-        );
-        assert_no_event(
-            &seen,
-            |event| matches!(event, EngineEvent::RecordingAborted),
-            "a RecordingAborted arrived after the rate change",
+            &sync(&engine),
+            |event| {
+                matches!(
+                    event,
+                    EngineEvent::RecordingFinished { .. } | EngineEvent::RecordingAborted
+                )
+            },
+            "the discarded recording sent an event",
         );
     }
 

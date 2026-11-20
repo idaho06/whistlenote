@@ -45,11 +45,12 @@ impl Default for FakeConfig {
     }
 }
 
-/// An open stream slot: its id, the device name, the callbacks and whether
-/// the stream failed.
+/// An open stream slot: its id, the device name, its sample rate, the
+/// callbacks and whether the stream failed.
 struct Slot<F> {
     id: u64,
     device: String,
+    sample_rate: u32,
     callback: F,
     on_error: ErrorSink,
     failed: bool,
@@ -63,7 +64,6 @@ struct State {
     next_id: u64,
     input: Option<Slot<InputSink>>,
     output_stream: Option<Slot<OutputSource>>,
-    input_rate: u32,
 }
 
 impl State {
@@ -81,7 +81,6 @@ fn lock(state: &Shared) -> MutexGuard<'_, State> {
 
 /// Creates a fake backend and the handle that drives it.
 pub fn fake_backend(config: FakeConfig) -> (FakeBackend, FakeHandle) {
-    let input_rate = config.sample_rate;
     let state = Arc::new(Mutex::new(State {
         config,
         frames: 0,
@@ -90,7 +89,6 @@ pub fn fake_backend(config: FakeConfig) -> (FakeBackend, FakeHandle) {
         next_id: 0,
         input: None,
         output_stream: None,
-        input_rate,
     }));
     (
         FakeBackend {
@@ -112,12 +110,14 @@ fn resolve(devices: &[String], name: Option<&str>) -> Result<String, AudioError>
     }
 }
 
-/// Resolves the device, takes the next stream id and installs the slot.
+/// Resolves the device, takes the next stream id and installs the slot at
+/// `sample_rate`.
 fn open_slot<F>(
     next_id: &mut u64,
     devices: &[String],
     slot: &mut Option<Slot<F>>,
     name: Option<&str>,
+    sample_rate: u32,
     callback: F,
     on_error: ErrorSink,
 ) -> Result<u64, AudioError> {
@@ -127,6 +127,7 @@ fn open_slot<F>(
     *slot = Some(Slot {
         id,
         device,
+        sample_rate,
         callback,
         on_error,
         failed: false,
@@ -179,15 +180,21 @@ impl AudioBackend for FakeBackend {
             config,
             next_id,
             input,
-            input_rate,
             ..
         } = &mut *state;
-        let id = open_slot(next_id, &config.inputs, input, name, sink, on_error)?;
         let sample_rate = match rate {
             Some(rate) if config.input_rates.contains(&rate) => rate,
             _ => config.sample_rate,
         };
-        *input_rate = sample_rate;
+        let id = open_slot(
+            next_id,
+            &config.inputs,
+            input,
+            name,
+            sample_rate,
+            sink,
+            on_error,
+        )?;
         Ok(Box::new(FakeStream {
             state: Arc::clone(&self.state),
             id,
@@ -213,6 +220,7 @@ impl AudioBackend for FakeBackend {
             &config.outputs,
             output_stream,
             name,
+            config.sample_rate,
             source,
             on_error,
         )?;
@@ -289,7 +297,6 @@ impl FakeHandle {
         let mut state = lock(&self.state);
         let block_size = state.config.block_size;
         let sample_rate = state.config.sample_rate;
-        let input_rate = state.input_rate;
         let time_s = state.clock_s();
 
         let available = block_size.min(state.queued_input.len());
@@ -301,7 +308,7 @@ impl FakeHandle {
                 &block,
                 InputBlockInfo {
                     time_s,
-                    sample_rate: input_rate,
+                    sample_rate: slot.sample_rate,
                 },
             );
         }
@@ -363,8 +370,10 @@ impl FakeHandle {
     /// Returns the rate of the open input stream in Hz, or `None` when no
     /// input is open.
     pub fn input_rate(&self) -> Option<u32> {
-        let state = lock(&self.state);
-        state.input.as_ref().map(|_| state.input_rate)
+        lock(&self.state)
+            .input
+            .as_ref()
+            .map(|slot| slot.sample_rate)
     }
 
     /// Fails the open input stream: it reports `error` through its error
@@ -517,10 +526,8 @@ mod tests {
     #[test]
     fn opening_at_a_supported_rate_opens_and_reports_that_rate() {
         let (backend, handle) = fake_backend(FakeConfig {
-            sample_rate: 1000,
-            block_size: 4,
             input_rates: vec![48_000, 96_000],
-            ..FakeConfig::default()
+            ..small_config()
         });
         let (tx, rx) = mpsc::channel();
         let sink: InputSink = Box::new(move |block, info| {
@@ -542,10 +549,8 @@ mod tests {
     #[test]
     fn opening_at_an_unsupported_rate_opens_at_the_config_rate() {
         let (backend, handle) = fake_backend(FakeConfig {
-            sample_rate: 1000,
-            block_size: 4,
             input_rates: vec![48_000, 96_000],
-            ..FakeConfig::default()
+            ..small_config()
         });
         let stream = backend
             .open_input(None, Some(44_100), Box::new(|_, _| {}), no_errors())
