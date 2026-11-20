@@ -81,6 +81,9 @@ pub struct PrefsWindow {
     save_error: Option<String>,
 }
 
+/// Space between the section list and the values of the section, in points.
+const SECTION_GAP: f32 = 16.0;
+
 /// A button of the preferences window clicked in one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -252,8 +255,10 @@ impl PrefsWindow {
                             }
                         }
                     });
-                    ui.separator();
-                    self.section_ui(ui, recording);
+                    // A vertical separator here would take the window's full
+                    // height and make the resizable window grow every frame.
+                    ui.add_space(SECTION_GAP);
+                    ui.vertical(|ui| self.section_ui(ui, recording));
                 });
                 ui.separator();
                 ui.horizontal_top(|ui| {
@@ -271,7 +276,11 @@ impl PrefsWindow {
                     {
                         action = Action::RestoreAll;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // One button high: a layout that takes the window's full
+                    // height makes the resizable window grow every frame.
+                    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                    let layout = egui::Layout::right_to_left(egui::Align::Center);
+                    ui.allocate_ui_with_layout(size, layout, |ui| {
                         if ui
                             .button("Save")
                             .on_hover_text("Saves the values and closes the window")
@@ -1033,5 +1042,63 @@ mod tests {
         output.drop_without_applying_deltas();
         assert!(!prefs.is_open(), "Esc closes the window");
         assert_eq!(state.tuning().voicing.a4_hz, 440.0);
+    }
+
+    #[test]
+    fn the_window_keeps_its_size_over_frames() {
+        let ctx = egui::Context::default();
+        let mut state = AppState::default();
+        state.apply_tuning(&Tuning::default());
+        let mut prefs = PrefsWindow::default();
+        prefs.open(&state);
+        let window_rect = |ctx: &egui::Context| {
+            ctx.memory(|m| {
+                m.layer_ids()
+                    .filter(|layer| layer.order == egui::Order::Middle)
+                    .find_map(|layer| m.area_rect(layer.id))
+            })
+            .expect("the window is drawn")
+        };
+        let mut sizes = Vec::new();
+        for &section in &Section::ALL {
+            prefs.set_section(section);
+            for _ in 0..20 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    let _ = prefs.show(ui.ctx(), &mut state, None);
+                });
+                output.drop_without_applying_deltas();
+            }
+            let first = window_rect(&ctx).size();
+            for _ in 0..20 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    let _ = prefs.show(ui.ctx(), &mut state, None);
+                });
+                output.drop_without_applying_deltas();
+            }
+            let last = window_rect(&ctx).size();
+            assert_eq!(
+                first, last,
+                "{section:?}: the window changes size between frames"
+            );
+            sizes.push(last);
+        }
+        assert!(
+            sizes.iter().all(|size| size.y < 600.0),
+            "the window fills the screen: {sizes:?}"
+        );
     }
 }
