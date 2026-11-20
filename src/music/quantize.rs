@@ -1,6 +1,6 @@
 //! Quantization of notes to a beat grid.
 
-use super::segment::RawNote;
+use super::segment::{RawNote, SegmentConfig};
 
 /// Smallest length in beats that survives filtering.
 const MIN_LENGTH_B: f64 = 1e-9;
@@ -48,8 +48,10 @@ fn snap(x: f64, step: f64) -> f64 {
 /// Converts notes in seconds to notes in beats snapped to `grid`, keeping the index of each note in `notes`.
 ///
 /// Like [`quantize`], and each returned pair carries the index of the note in
-/// `notes` it comes from. `origin_s` is the time of beat 0. Returns an empty
-/// vector when `bpm` is not finite or not positive.
+/// `notes` it comes from. `origin_s` is the time of beat 0. A note that starts
+/// before `origin_s` is kept only when at least the minimum note duration of
+/// [`SegmentConfig::default`] lies at or after `origin_s`; its start is clamped
+/// to beat 0. Returns an empty vector when `bpm` is not finite or not positive.
 pub fn quantize_indexed(
     notes: &[RawNote],
     bpm: f64,
@@ -59,6 +61,7 @@ pub fn quantize_indexed(
     if !bpm.is_finite() || bpm <= 0.0 {
         return Vec::new();
     }
+    let min_tail_s = SegmentConfig::default().min_note_s;
     let mut sorted: Vec<(usize, RawNote)> = notes.iter().copied().enumerate().collect();
     sorted.sort_by(|a, b| a.1.start_s.total_cmp(&b.1.start_s));
 
@@ -66,6 +69,9 @@ pub fn quantize_indexed(
     let to_beats = |t_s: f64| (t_s - origin_s) * bpm / 60.0;
     let mut quant: Vec<(usize, QuantNote)> = Vec::with_capacity(sorted.len());
     for (index, note) in &sorted {
+        if note.start_s < origin_s && note.end_s - origin_s < min_tail_s {
+            continue;
+        }
         let start_b = to_beats(note.start_s);
         let end_b = to_beats(note.end_s);
         if end_b <= 0.0 {
@@ -107,8 +113,10 @@ pub fn quantize_indexed(
 
 /// Converts notes in seconds to notes in beats snapped to `grid`.
 ///
-/// `origin_s` is the time of beat 0. Returns an empty vector when `bpm` is not
-/// finite or not positive.
+/// `origin_s` is the time of beat 0. A note that starts before `origin_s` is
+/// kept only when at least the minimum note duration of [`SegmentConfig::default`]
+/// lies at or after `origin_s`; its start is clamped to beat 0. Returns an
+/// empty vector when `bpm` is not finite or not positive.
 pub fn quantize(notes: &[RawNote], bpm: f64, grid: Grid, origin_s: f64) -> Vec<QuantNote> {
     quantize_indexed(notes, bpm, grid, origin_s)
         .into_iter()
@@ -181,6 +189,20 @@ mod tests {
     fn note_ending_before_origin_is_dropped() {
         let notes = quantize(&[raw(-1.0, -0.5)], 120.0, Grid::Sixteenth, 0.0);
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn a_tail_shorter_than_the_minimum_after_beat_0_is_dropped() {
+        let input = [raw_midi(0.902, 1.009, 69), raw_midi(1.972, 2.507, 72)];
+        for grid in [Grid::Sixteenth, Grid::Quarter] {
+            let notes = quantize(&input, 120.0, grid, 1.0);
+            assert_eq!(notes.len(), 1, "grid {grid:?}");
+            assert_note(&notes[0], 2.0, 1.0);
+            assert_eq!(notes[0].midi, 72);
+        }
+        let notes = quantize(&input, 120.0, Grid::Off, 1.0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 72);
     }
 
     #[test]
