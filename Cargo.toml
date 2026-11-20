@@ -20,3 +20,5 @@ midly = "0.5.3"
 pitch-detection = "0.3.0"
 rfd = "0.18.0"
 rtrb = "0.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"

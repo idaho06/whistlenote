@@ -8,6 +8,7 @@
 //! are detected, and a metronome renders beat clicks. An engine thread runs
 //! the audio streams and the analysis and reports to the GUI through
 //! channels. The `ui` module holds the desktop application and its state.
+//! The `settings` module holds the user's session and tuning settings.
 
 #![deny(missing_docs)]
 
@@ -17,4 +18,5 @@ pub mod engine;
 pub mod export;
 pub mod metronome;
 pub mod music;
+pub mod settings;
 pub mod ui;
