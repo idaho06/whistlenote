@@ -4,8 +4,9 @@
 //! reports into the state, and the setter methods turn user actions into
 //! the commands the engine expects.
 
-use crate::engine::{EngineCommand, EngineEvent, LiveFrame};
-use crate::ui::bpm_mode::BpmState;
+use crate::engine::{AnalysisConfig, ClickSound, EngineCommand, EngineEvent, LiveFrame};
+use crate::settings::{Session, Tuning};
+use crate::ui::bpm_mode::{BpmState, TempoConfig};
 use crate::ui::live::{LiveConfig, NoteSmoother, ShownNote};
 use crate::ui::record_mode::RecordState;
 
@@ -74,14 +75,29 @@ pub struct AppState {
     pub bpm: BpmState,
     /// The recording state of the Record tab.
     pub record: RecordState,
+    /// The applied tuning values.
+    tuning: Tuning,
+    /// The analysis config last sent to the engine, if any.
+    sent_analysis: Option<AnalysisConfig>,
+    /// The click sound last sent to the engine, if any.
+    sent_click: Option<ClickSound>,
+    /// Commands the state queued itself, from a session restore and a device fallback; [`AppState::engine_commands`] drains them.
+    pending: Vec<EngineCommand>,
+    /// Whether the next device list checks the restored devices against it.
+    check_restored: bool,
+    /// A restored input device name kept for the session after the selection fell back to the default device, until the user selects a device.
+    saved_input: Option<String>,
+    /// A restored output device name kept for the session after the selection fell back to the default device, until the user selects a device.
+    saved_output: Option<String>,
 }
 
 impl AppState {
     /// Applies `event`: the recording state of the Record tab folds it first,
-    /// a device list replaces the stored list and keeps the selections, an
-    /// input rate replaces the stored rate, an onset feeds the tempo state of
-    /// the BPM tab, a repeated error raises its count, other events change
-    /// nothing.
+    /// a device list replaces the stored lists and keeps the selections — the
+    /// first list after a session restore checks the restored devices and
+    /// falls a missing one back to the default device — an input rate
+    /// replaces the stored rate, an onset feeds the tempo state of the BPM
+    /// tab, a repeated error raises its count, other events change nothing.
     pub fn apply_event(&mut self, event: EngineEvent) {
         self.record.apply_event(&event);
         match event {
@@ -89,6 +105,10 @@ impl AppState {
             EngineEvent::Devices { inputs, outputs } => {
                 self.inputs = inputs;
                 self.outputs = outputs;
+                if self.check_restored {
+                    self.check_restored = false;
+                    self.check_restored_devices();
+                }
             }
             EngineEvent::InputRate(rate) => self.input_rate_hz = rate,
             EngineEvent::Error(text) => count_error(&mut self.error, text),
@@ -118,19 +138,21 @@ impl AppState {
         }
     }
 
-    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
+    /// Selects the input device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop, and clears the saved input name of a restored session, while an unchanged selection keeps it.
     pub fn select_input(&mut self, name: Option<String>) -> Option<EngineCommand> {
         let command = set_selection(&mut self.input, name).map(EngineCommand::SelectInput);
         if command.is_some() {
+            self.saved_input = None;
             self.record.cancel();
         }
         command
     }
 
-    /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
+    /// Selects the output device `name` and returns the command for the engine, or `None` when unchanged; a change cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop, and clears the saved output name of a restored session, while an unchanged selection keeps it.
     pub fn select_output(&mut self, name: Option<String>) -> Option<EngineCommand> {
         let command = set_selection(&mut self.output, name).map(EngineCommand::SelectOutput);
         if command.is_some() {
+            self.saved_output = None;
             self.record.cancel();
         }
         command
@@ -147,6 +169,74 @@ impl AppState {
         }
         self.latency_ms = clamped;
         Some(EngineCommand::SetLatencyMs(clamped))
+    }
+
+    /// Applies `tuning` to the views and stores it as the applied tuning: the live readout, the tempo estimate of the BPM tab, and the segmentation and MIDI options of the Record tab. A changed segmentation re-segments the shown take and resets its edits.
+    pub fn apply_tuning(&mut self, tuning: &Tuning) {
+        self.tuning = tuning.clone();
+        self.live.set_config(LiveConfig::from(tuning));
+        self.bpm.set_config(TempoConfig::from(tuning));
+        self.record.set_segment_config(tuning.segment());
+        self.record.set_midi_options(tuning.midi());
+    }
+
+    /// Returns the applied tuning values.
+    pub fn tuning(&self) -> &Tuning {
+        &self.tuning
+    }
+
+    /// Drains and returns the commands the UI sends to the engine this frame: the queued commands first, then the click sound when it differs from the one last sent, then the analysis config when it differs from the one last sent and no recording runs. An analysis change made while a recording runs is held and sent when the recording ends. On the first call, both config commands are sent.
+    pub fn engine_commands(&mut self) -> Vec<EngineCommand> {
+        let mut commands = std::mem::take(&mut self.pending);
+        let click = self.tuning.click_sound();
+        if self.sent_click != Some(click) {
+            self.sent_click = Some(click);
+            commands.push(EngineCommand::SetClickSound(click));
+        }
+        let analysis = self.tuning.analysis();
+        if self.sent_analysis != Some(analysis) && self.record.is_idle() {
+            self.sent_analysis = Some(analysis);
+            commands.push(EngineCommand::SetAnalysis(analysis));
+        }
+        commands
+    }
+
+    /// Restores `session`: queues the latency command, sets the recording tempo, the grid and the metronome of the Record tab, and selects a saved device directly, queuing its command; the queued commands go out through [`AppState::engine_commands`]. When a device was restored, the next device list checks the restored devices against it.
+    pub fn restore_session(&mut self, session: &Session) {
+        if let Some(command) = self.set_latency_ms(session.latency_ms) {
+            self.pending.push(command);
+        }
+        self.bpm.set_record_bpm(session.record_bpm);
+        self.record.set_grid(session.grid.into());
+        self.record.set_metronome(session.metronome);
+        let mut restored_device = false;
+        if let Some(input) = &session.input {
+            self.input = Some(input.clone());
+            self.pending
+                .push(EngineCommand::SelectInput(Some(input.clone())));
+            restored_device = true;
+        }
+        if let Some(output) = &session.output {
+            self.output = Some(output.clone());
+            self.pending
+                .push(EngineCommand::SelectOutput(Some(output.clone())));
+            restored_device = true;
+        }
+        if restored_device {
+            self.check_restored = true;
+        }
+    }
+
+    /// Returns the session values to save: a restored device name that fell back to the default device, otherwise the selected device, together with the latency offset, the recording tempo, the grid and the metronome.
+    pub fn session(&self) -> Session {
+        Session {
+            input: self.saved_input.clone().or_else(|| self.input.clone()),
+            output: self.saved_output.clone().or_else(|| self.output.clone()),
+            latency_ms: self.latency_ms,
+            record_bpm: self.bpm.record_bpm(),
+            grid: self.record.grid().into(),
+            metronome: self.record.metronome(),
+        }
     }
 
     /// Sets whether the engine listens and returns the command for it, or `None` when unchanged; stopping also resets the live note smoother and drops the UI time of the last tick that received frames, since frames stop arriving and the tick-based clearing does not run, and cancels a running count-in or recording, since the engine discards it without an event, while stopping the tab waits for the engine's answer to the sent stop.
@@ -248,6 +338,30 @@ impl AppState {
     pub fn output_missing(&self) -> bool {
         missing(&self.output, &self.outputs)
     }
+
+    /// Checks the restored selections against the reported device lists: a selected name missing from its list moves to the saved slot, the selection becomes the default device and the fallback command is queued; the fallbacks are reported as one status message, the input first.
+    fn check_restored_devices(&mut self) {
+        let input_missing = missing(&self.input, &self.inputs);
+        let output_missing = missing(&self.output, &self.outputs);
+        let mut messages = Vec::new();
+        if input_missing && let Some(name) = self.input.take() {
+            self.saved_input = Some(name.clone());
+            self.pending.push(EngineCommand::SelectInput(None));
+            messages.push(format!(
+                "Saved input “{name}” is not available; using the default input"
+            ));
+        }
+        if output_missing && let Some(name) = self.output.take() {
+            self.saved_output = Some(name.clone());
+            self.pending.push(EngineCommand::SelectOutput(None));
+            messages.push(format!(
+                "Saved output “{name}” is not available; using the default output"
+            ));
+        }
+        if !messages.is_empty() {
+            count_error(&mut self.error, messages.join(" "));
+        }
+    }
 }
 
 /// Counts `text` in `slot`: the same text as the stored one raises its count, any other text starts at one.
@@ -277,7 +391,9 @@ mod tests {
     use super::*;
     use crate::engine::BeatPhase;
     use crate::music::assert_close;
+    use crate::music::quantize::Grid;
     use crate::music::segment::PitchFrame;
+    use crate::settings::GridSetting;
     use crate::ui::record_mode::RecordPhase;
     use crate::ui::record_mode::test_support::tone_frames;
 
@@ -730,5 +846,172 @@ mod tests {
             .expect("a preview after 30 live frames");
         assert_eq!(preview.notes().len(), 1);
         assert_eq!(preview.notes()[0].midi, 69);
+    }
+
+    #[test]
+    fn apply_tuning_configures_the_views() {
+        let mut state = AppState::default();
+        let mut tuning = Tuning::default();
+        tuning.voicing.a4_hz = 432.0;
+        tuning.live.agree_frames = 1;
+        tuning.tempo.onset_window = 4;
+        tuning.notes.min_note_ms = 200.0;
+        tuning.export.channel = 10;
+        state.apply_tuning(&tuning);
+        assert_eq!(state.live_config().a4_hz, 432.0);
+        assert_eq!(state.live_config().agree_frames, 1);
+        assert_eq!(state.bpm.config().onset_window, 4);
+        assert_close(state.record.segment_config().min_note_s, 0.2, 1e-9);
+        assert_eq!(state.record.midi_options().channel, 9);
+        assert_eq!(state.tuning(), &tuning);
+    }
+
+    #[test]
+    fn engine_commands_send_the_tuning_once() {
+        let mut state = AppState::default();
+        let first = state.engine_commands();
+        assert!(first.contains(&EngineCommand::SetAnalysis(Tuning::default().analysis())));
+        assert!(first.contains(&EngineCommand::SetClickSound(
+            Tuning::default().click_sound()
+        )));
+        assert!(state.engine_commands().is_empty());
+    }
+
+    #[test]
+    fn a_changed_click_sound_is_sent_alone() {
+        let mut state = AppState::default();
+        state.engine_commands();
+        let mut tuning = Tuning::default();
+        tuning.metronome.volume_percent = 25.0;
+        state.apply_tuning(&tuning);
+        assert_eq!(
+            state.engine_commands(),
+            vec![EngineCommand::SetClickSound(tuning.click_sound())]
+        );
+    }
+
+    #[test]
+    fn analysis_changes_wait_for_the_recording_to_end() {
+        let mut state = AppState::default();
+        state.engine_commands();
+        state.record.start(120.0);
+        assert!(!state.record.is_idle());
+        let mut tuning = Tuning::default();
+        tuning.pitch.clarity = 0.7;
+        tuning.metronome.volume_percent = 30.0;
+        state.apply_tuning(&tuning);
+        let commands = state.engine_commands();
+        assert!(commands.contains(&EngineCommand::SetClickSound(tuning.click_sound())));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, EngineCommand::SetAnalysis(_)))
+        );
+        state.apply_event(EngineEvent::RecordingAborted);
+        assert!(state.record.is_idle());
+        assert_eq!(
+            state.engine_commands(),
+            vec![EngineCommand::SetAnalysis(tuning.analysis())]
+        );
+    }
+
+    #[test]
+    fn restore_session_selects_the_saved_devices() {
+        let mut state = AppState::default();
+        let session = Session {
+            input: Some("USB Mic".to_string()),
+            output: Some("Speakers".to_string()),
+            latency_ms: 30.0,
+            record_bpm: 90.0,
+            grid: GridSetting::Eighth,
+            metronome: false,
+        };
+        state.restore_session(&session);
+        let commands = state.engine_commands();
+        assert!(commands.contains(&EngineCommand::SetLatencyMs(30.0)));
+        assert!(commands.contains(&EngineCommand::SelectInput(Some("USB Mic".to_string()))));
+        assert!(commands.contains(&EngineCommand::SelectOutput(Some("Speakers".to_string()))));
+        assert_eq!(state.input(), Some("USB Mic"));
+        assert_eq!(state.bpm.record_bpm(), 90.0);
+        assert_eq!(state.record.grid(), Grid::Eighth);
+        assert!(!state.record.metronome());
+        assert_eq!(state.session(), session);
+    }
+
+    #[test]
+    fn a_missing_saved_input_falls_back_to_the_default() {
+        let mut state = AppState::default();
+        state.restore_session(&Session {
+            input: Some("USB Mic".to_string()),
+            ..Default::default()
+        });
+        state.engine_commands();
+        state.apply_event(devices(&["Built-in"], &["Out"]));
+        assert_eq!(state.input(), None);
+        assert!(
+            state
+                .engine_commands()
+                .contains(&EngineCommand::SelectInput(None))
+        );
+        let (text, _) = state.error().expect("a status message");
+        assert!(text.contains("USB Mic"));
+        assert_eq!(state.session().input, Some("USB Mic".to_string()));
+        assert_eq!(state.select_input(None), None);
+        assert_eq!(state.session().input, Some("USB Mic".to_string()));
+        state.select_input(Some("Built-in".to_string()));
+        assert_eq!(state.session().input, Some("Built-in".to_string()));
+    }
+
+    #[test]
+    fn a_present_saved_input_is_kept() {
+        let mut state = AppState::default();
+        state.restore_session(&Session {
+            input: Some("USB Mic".to_string()),
+            ..Default::default()
+        });
+        state.engine_commands();
+        state.apply_event(devices(&["USB Mic", "Built-in"], &["Out"]));
+        assert_eq!(state.input(), Some("USB Mic"));
+        assert_eq!(state.error(), None);
+        assert!(state.engine_commands().is_empty());
+    }
+
+    #[test]
+    fn only_the_first_device_list_checks_the_saved_devices() {
+        let mut state = AppState::default();
+        state.restore_session(&Session {
+            input: Some("USB Mic".to_string()),
+            ..Default::default()
+        });
+        state.engine_commands();
+        state.apply_event(devices(&["USB Mic"], &["Out"]));
+        state.apply_event(devices(&["Built-in"], &["Out"]));
+        assert_eq!(state.input(), Some("USB Mic"));
+        assert!(state.engine_commands().is_empty());
+    }
+
+    #[test]
+    fn a_missing_saved_output_falls_back_too() {
+        let mut state = AppState::default();
+        state.restore_session(&Session {
+            output: Some("Speakers".to_string()),
+            ..Default::default()
+        });
+        state.engine_commands();
+        state.apply_event(devices(&["In"], &["Built-in"]));
+        assert_eq!(state.output(), None);
+        assert!(
+            state
+                .engine_commands()
+                .contains(&EngineCommand::SelectOutput(None))
+        );
+        let (text, _) = state.error().expect("a status message");
+        assert!(text.contains("Saved output"));
+        assert_eq!(state.session().output, Some("Speakers".to_string()));
+    }
+
+    #[test]
+    fn the_default_session_is_the_default() {
+        assert_eq!(AppState::default().session(), Session::default());
     }
 }
