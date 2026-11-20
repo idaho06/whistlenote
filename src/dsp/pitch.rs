@@ -8,7 +8,7 @@
 use pitch_detection::detector::PitchDetector;
 use pitch_detection::detector::mcleod::McLeodDetector;
 
-use super::filter::{BAND_HIGH_HZ, BandPass};
+use super::filter::{BAND_HIGH_HZ, BAND_LOW_HZ, BandPass};
 use crate::audio::rms;
 use crate::music::segment::PitchFrame;
 
@@ -31,7 +31,8 @@ pub const MAX_FREQ_HZ: f32 = BAND_HIGH_HZ;
 pub const LOW_RATE_HZ: u32 = 16_000;
 
 /// Clarity a peak of the normalized square difference function needs to be
-/// considered by the detector.
+/// considered by the detector; the default of
+/// [`PitchConfig::clarity`].
 const CLARITY_THRESHOLD: f32 = 0.5;
 
 /// Returns the factor by which a tracker at `sample_rate` Hz scales
@@ -46,17 +47,39 @@ fn scale_for(sample_rate: u32) -> usize {
     }
 }
 
-/// Settings of a [`PitchTracker`].
+/// Settings of a [`PitchTracker`]. The values are used as given; the caller
+/// keeps them sensible.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PitchConfig {
     /// Window RMS, after band-passing, below which a window is silent.
     pub silence_rms: f32,
+    /// Clarity a peak of the normalized square difference function needs to
+    /// be considered by the detector.
+    pub clarity: f32,
+    /// Lowest reported frequency in Hz.
+    pub min_freq_hz: f32,
+    /// Highest reported frequency in Hz; the tracker also caps it at a
+    /// quarter of the sample rate.
+    pub max_freq_hz: f32,
+    /// Lower edge of the band-pass in Hz.
+    pub band_low_hz: f32,
+    /// Upper edge of the band-pass in Hz.
+    pub band_high_hz: f32,
 }
 
 impl Default for PitchConfig {
-    /// A silence level of 0.002 RMS.
+    /// A silence level of 0.002 RMS, a clarity of 0.5, a reported range of
+    /// [`MIN_FREQ_HZ`] to [`MAX_FREQ_HZ`], and a band-pass from
+    /// [`BAND_LOW_HZ`] to [`BAND_HIGH_HZ`].
     fn default() -> Self {
-        Self { silence_rms: 0.002 }
+        Self {
+            silence_rms: 0.002,
+            clarity: CLARITY_THRESHOLD,
+            min_freq_hz: MIN_FREQ_HZ,
+            max_freq_hz: MAX_FREQ_HZ,
+            band_low_hz: BAND_LOW_HZ,
+            band_high_hz: BAND_HIGH_HZ,
+        }
     }
 }
 
@@ -90,15 +113,38 @@ impl PitchTracker {
         let scale = scale_for(sample_rate);
         let window_len = WINDOW * scale;
         Self {
+            max_freq_hz: config.max_freq_hz.min(sample_rate as f32 / 4.0),
+            filter: BandPass::new(sample_rate, config.band_low_hz, config.band_high_hz),
             config,
             sample_rate,
             window_len,
             hop: HOP * scale,
-            max_freq_hz: MAX_FREQ_HZ.min(sample_rate as f32 / 4.0),
-            filter: BandPass::new(sample_rate),
             detector: McLeodDetector::new(window_len, Self::padding(window_len)),
             window: Vec::with_capacity(window_len),
         }
+    }
+
+    /// Returns the current settings.
+    pub fn config(&self) -> PitchConfig {
+        self.config
+    }
+
+    /// Applies `config` without discarding the partial analysis window, so
+    /// frames keep coming at the same times.
+    ///
+    /// The filter and its state are kept unless `band_low_hz` or
+    /// `band_high_hz` changes, in which case the filter is replaced with a
+    /// fresh band-pass for the stored sample rate. The highest reported
+    /// frequency is capped at a quarter of the sample rate, as in
+    /// [`new`](Self::new).
+    pub fn set_config(&mut self, config: PitchConfig) {
+        if config.band_low_hz != self.config.band_low_hz
+            || config.band_high_hz != self.config.band_high_hz
+        {
+            self.filter = BandPass::new(self.sample_rate, config.band_low_hz, config.band_high_hz);
+        }
+        self.max_freq_hz = config.max_freq_hz.min(self.sample_rate as f32 / 4.0);
+        self.config = config;
     }
 
     /// Returns the sample rate in Hz.
@@ -168,11 +214,11 @@ impl PitchTracker {
             &self.window,
             self.sample_rate as usize,
             power_threshold,
-            CLARITY_THRESHOLD,
+            self.config.clarity,
         ) {
             Some(pitch)
                 if pitch.frequency.is_finite()
-                    && (MIN_FREQ_HZ..=self.max_freq_hz).contains(&pitch.frequency) =>
+                    && (self.config.min_freq_hz..=self.max_freq_hz).contains(&pitch.frequency) =>
             {
                 PitchFrame {
                     time_s,
@@ -362,5 +408,105 @@ mod tests {
     fn window_s_scales_the_window_with_the_sample_rate() {
         let tracker = PitchTracker::new(96_000, PitchConfig::default());
         assert_eq!(tracker.window_s(), 2048.0 * 2.0 / 96_000.0);
+    }
+
+    #[test]
+    fn a_raised_lowest_pitch_leaves_a_500_hz_tone_unvoiced() {
+        let rate = 48_000;
+        let signal = sine(500.0, 0.5, rate, 24_000);
+        assert_all_near(&track(&signal, rate, 0.0), 500.0);
+
+        let config = PitchConfig {
+            min_freq_hz: 600.0,
+            ..PitchConfig::default()
+        };
+        let mut tracker = PitchTracker::new(rate, config);
+        let mut frames = Vec::new();
+        for (index, block) in signal.chunks(300).enumerate() {
+            let time_s = (index * 300) as f64 / f64::from(rate);
+            tracker.process(block, time_s, &mut frames);
+        }
+        assert!(!frames.is_empty());
+        assert!(
+            frames.iter().all(|f| f.freq_hz.is_none()),
+            "500 Hz is reported with min_freq_hz 600"
+        );
+    }
+
+    #[test]
+    fn set_config_keeps_the_partial_window() {
+        let rate = 48_000;
+        let signal = sine(1000.0, 0.5, rate, 24_000);
+        let reference = track(&signal, rate, 0.0);
+
+        let mut tracker = PitchTracker::new(rate, PitchConfig::default());
+        let mut frames = Vec::new();
+        for (index, block) in signal.chunks(300).enumerate() {
+            // Four blocks are 1200 samples, before the first window of 2048
+            // samples completes.
+            if index == 4 {
+                tracker.set_config(PitchConfig {
+                    silence_rms: 0.001,
+                    band_low_hz: 250.0,
+                    ..PitchConfig::default()
+                });
+            }
+            let time_s = (index * 300) as f64 / f64::from(rate);
+            tracker.process(block, time_s, &mut frames);
+        }
+        assert_eq!(reference.len(), frames.len());
+        for (expected, frame) in reference.iter().zip(&frames) {
+            assert_eq!(expected.time_s, frame.time_s);
+        }
+        assert_all_near(&frames, 1000.0);
+    }
+
+    #[test]
+    fn set_config_applies_a_new_silence_level() {
+        let rate = 48_000;
+        let signal = sine(1000.0, 0.01, rate, 48_000);
+        let mut tracker = PitchTracker::new(rate, PitchConfig::default());
+        let mut frames = Vec::new();
+        let mut first_half = 0;
+        for (index, block) in signal.chunks(300).enumerate() {
+            if index * 300 == signal.len() / 2 {
+                first_half = frames.len();
+                tracker.set_config(PitchConfig {
+                    silence_rms: 0.05,
+                    ..PitchConfig::default()
+                });
+            }
+            let time_s = (index * 300) as f64 / f64::from(rate);
+            tracker.process(block, time_s, &mut frames);
+        }
+        assert!(first_half > 0);
+        assert!(
+            frames[..first_half].iter().all(|f| f.freq_hz.is_some()),
+            "a frame from the first half is unvoiced"
+        );
+        let window_s = tracker.window_s();
+        assert!(frames.iter().any(|f| f.time_s > 0.5 + window_s));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.time_s <= 0.5 + window_s || f.freq_hz.is_none()),
+            "a frame after the half is voiced"
+        );
+    }
+
+    #[test]
+    fn config_returns_the_applied_config() {
+        let mut tracker = PitchTracker::new(48_000, PitchConfig::default());
+        assert_eq!(tracker.config(), PitchConfig::default());
+        let config = PitchConfig {
+            silence_rms: 0.01,
+            clarity: 0.7,
+            min_freq_hz: 500.0,
+            max_freq_hz: 3000.0,
+            band_low_hz: 350.0,
+            band_high_hz: 3500.0,
+        };
+        tracker.set_config(config);
+        assert_eq!(tracker.config(), config);
     }
 }

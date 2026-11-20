@@ -85,8 +85,9 @@ fn section_coefficients(
     Coefficients::from_params(filter_type, sample_rate, cutoff, Q_BUTTERWORTH_F32).ok()
 }
 
-/// A band-pass from [`BAND_LOW_HZ`] to [`BAND_HIGH_HZ`]: a Butterworth
-/// high-pass followed by a Butterworth low-pass.
+/// A band-pass from `low_hz` to `high_hz`: a Butterworth high-pass at
+/// `low_hz` followed by a Butterworth low-pass at `high_hz`. The pitch
+/// tracker's defaults are [`BAND_LOW_HZ`] and [`BAND_HIGH_HZ`].
 #[derive(Debug, Clone, Copy)]
 pub struct BandPass {
     high_pass: Butterworth,
@@ -94,11 +95,14 @@ pub struct BandPass {
 }
 
 impl BandPass {
-    /// Creates the band-pass for `sample_rate` Hz.
-    pub fn new(sample_rate: u32) -> Self {
+    /// Creates the band-pass from `low_hz` to `high_hz` for `sample_rate`
+    /// Hz.
+    ///
+    /// A cutoff above 0.45 times the sample rate is lowered to that value.
+    pub fn new(sample_rate: u32, low_hz: f32, high_hz: f32) -> Self {
         Self {
-            high_pass: Butterworth::new(FilterKind::HighPass, sample_rate, BAND_LOW_HZ),
-            low_pass: Butterworth::new(FilterKind::LowPass, sample_rate, BAND_HIGH_HZ),
+            high_pass: Butterworth::new(FilterKind::HighPass, sample_rate, low_hz),
+            low_pass: Butterworth::new(FilterKind::LowPass, sample_rate, high_hz),
         }
     }
 
@@ -158,7 +162,7 @@ pub(crate) mod tests {
     #[test]
     fn band_passes_whistle_range_and_rejects_rumble_and_hiss() {
         for rate in [44_100, 48_000] {
-            let filter = BandPass::new(rate);
+            let filter = BandPass::new(rate, BAND_LOW_HZ, BAND_HIGH_HZ);
             for freq in [800.0, 1500.0, 2000.0] {
                 let g = gain(filter, freq, rate);
                 assert!(g > 0.9, "{freq} Hz at {rate} Hz has gain {g}");
@@ -172,10 +176,10 @@ pub(crate) mod tests {
     fn state_persists_across_blocks() {
         let signal = sine(1000.0, 0.5, 48_000, 4800);
         let mut whole = signal.clone();
-        BandPass::new(48_000).process(&mut whole);
+        BandPass::new(48_000, BAND_LOW_HZ, BAND_HIGH_HZ).process(&mut whole);
 
         let mut split = signal;
-        let mut filter = BandPass::new(48_000);
+        let mut filter = BandPass::new(48_000, BAND_LOW_HZ, BAND_HIGH_HZ);
         let (first, second) = split.split_at_mut(1234);
         filter.process(first);
         filter.process(second);
@@ -184,7 +188,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reset_clears_the_state() {
-        let mut filter = BandPass::new(48_000);
+        let mut filter = BandPass::new(48_000, BAND_LOW_HZ, BAND_HIGH_HZ);
         let mut fresh = filter;
         let mut warm_up = sine(1000.0, 0.5, 48_000, 100);
         filter.process(&mut warm_up);
