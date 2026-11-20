@@ -31,6 +31,10 @@ use crate::music::segment::PitchFrame;
 /// What a metronome beat belongs to, as reported in [`EngineEvent::Beat`].
 pub use crate::metronome::BeatPhase;
 
+/// The sound of the metronome clicks, set with
+/// [`EngineCommand::SetClickSound`].
+pub use crate::metronome::ClickSound;
+
 /// Capacity of the live frame channel; frames are dropped when it is full.
 pub const LIVE_CAPACITY: usize = 256;
 
@@ -148,6 +152,12 @@ pub enum EngineCommand {
         /// Whether the metronome runs.
         enabled: bool,
     },
+    /// Sets the sound of the metronome clicks; it applies to the open
+    /// output and to every output opened later.
+    SetClickSound(
+        /// The click sound.
+        ClickSound,
+    ),
     /// Selects the output device by name, or the default device for `None`;
     /// an open output stream is reopened on the new device.
     SelectOutput(Option<String>),
@@ -222,6 +232,7 @@ impl Engine {
                     output_name: None,
                     free_bpm: 120.0,
                     free_enabled: false,
+                    click_sound: ClickSound::default(),
                     output: None,
                     latency_s: 0.0,
                     recording: None,
@@ -285,6 +296,8 @@ struct Worker {
     output_name: Option<String>,
     free_bpm: f64,
     free_enabled: bool,
+    /// The sound of the metronome clicks, queued on every opened output.
+    click_sound: ClickSound,
     output: Option<Output>,
     /// Latency offset added to the origin of a recording, in seconds.
     latency_s: f64,
@@ -468,6 +481,10 @@ impl Worker {
                     }
                 }
             }
+            EngineCommand::SetClickSound(sound) => {
+                self.click_sound = sound;
+                self.send_metronome(MetronomeCommand::SetClick(sound));
+            }
             EngineCommand::SelectOutput(name) => {
                 self.cancel_recording();
                 self.output_name = name;
@@ -581,12 +598,13 @@ impl Worker {
     }
 
     /// Opens the output stream with the metronome on the selected device,
-    /// with `first` queued after the free-running setting; an error becomes
-    /// an event.
+    /// with the click sound and the free-running setting queued before
+    /// `first`; an error becomes an event.
     fn open_output(&mut self, first: Option<MetronomeCommand>) {
         let (mut control, source) = metronome();
         // Queue the commands before the stream starts, so the metronome
         // applies them with its first rendered block.
+        let _ = control.send(MetronomeCommand::SetClick(self.click_sound));
         let _ = control.send(MetronomeCommand::SetFree {
             bpm: self.free_bpm,
             enabled: self.free_enabled,
@@ -616,7 +634,8 @@ impl Worker {
     }
 
     /// Sends `command` to the metronome of the open output and returns
-    /// whether it is queued; a full queue becomes an error event.
+    /// whether it is queued; without an open output it does nothing, and a
+    /// full queue becomes an error event.
     fn send_metronome(&mut self, command: MetronomeCommand) -> bool {
         let Some(output) = &mut self.output else {
             return false;
@@ -2004,6 +2023,46 @@ mod tests {
             &seen,
             |event| matches!(event, EngineEvent::RecordingAborted),
             "a RecordingAborted arrived after the RecordingFinished",
+        );
+    }
+
+    #[test]
+    fn the_click_sound_applies_to_an_output_opened_later() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::SetClickSound(ClickSound {
+            volume: 0.0,
+            ..Default::default()
+        }));
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        sync(&engine);
+        handle.step_n(200);
+        sync(&engine);
+        let output = handle.take_output();
+        assert!(!output.is_empty(), "the output rendered blocks");
+        assert!(
+            output.iter().all(|&sample| sample == 0.0),
+            "a zero volume renders silence, got {} non-zero samples",
+            output.iter().filter(|&&sample| sample != 0.0).count()
+        );
+
+        // A contrasting engine with the default click sound renders audible
+        // clicks in the same steps.
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::SetMetronome {
+            bpm: 120.0,
+            enabled: true,
+        });
+        sync(&engine);
+        handle.step_n(200);
+        sync(&engine);
+        let output = handle.take_output();
+        assert!(!output.is_empty(), "the output rendered blocks");
+        assert!(
+            output.iter().any(|&sample| sample != 0.0),
+            "the default click sound renders audible clicks"
         );
     }
 }

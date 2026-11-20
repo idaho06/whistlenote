@@ -3,7 +3,9 @@
 //! [`Metronome`] synthesizes clicks whose amplitude decays exponentially,
 //! accents the first beat of every bar with a higher frequency, schedules
 //! the beats sample-accurately inside the output render callback and
-//! reports each beat with its engine-clock time.
+//! reports each beat with its engine-clock time. The volume and the two
+//! frequencies of the clicks come from a [`ClickSound`], which the control
+//! sets with [`MetronomeCommand::SetClick`].
 //!
 //! Two sequences share the renderer. The free-running sequence plays a
 //! click every `60 / bpm` seconds. A recording starts with one count-in
@@ -25,19 +27,42 @@ use crate::audio::backend::{OutputBlockInfo, OutputSource};
 pub const BEATS_PER_BAR: u32 = 4;
 /// Click length in seconds.
 pub const CLICK_S: f64 = 0.020;
-/// Frequency of accented clicks in Hz.
+/// Default of [`ClickSound::accent_hz`]: frequency of accented clicks in Hz.
 pub const ACCENT_HZ: f32 = 1500.0;
-/// Frequency of other clicks in Hz.
+/// Default of [`ClickSound::beat_hz`]: frequency of other clicks in Hz.
 pub const BEAT_HZ: f32 = 1000.0;
 /// Lowest accepted tempo in BPM.
 pub const MIN_BPM: f64 = 20.0;
 /// Highest accepted tempo in BPM.
 pub const MAX_BPM: f64 = 300.0;
 
-/// Peak amplitude of a click.
+/// Default of [`ClickSound::volume`]: peak amplitude of a click.
 const CLICK_AMPLITUDE: f32 = 0.5;
 /// Tolerance in samples when a beat position is rounded up to a sample.
 const POSITION_EPSILON: f64 = 1e-6;
+
+/// The sound of the metronome clicks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClickSound {
+    /// Peak amplitude of a click in 0.0..=1.0.
+    pub volume: f32,
+    /// Frequency of accented clicks in Hz.
+    pub accent_hz: f32,
+    /// Frequency of other clicks in Hz.
+    pub beat_hz: f32,
+}
+
+impl Default for ClickSound {
+    /// A volume of `CLICK_AMPLITUDE` (0.5), an accent of [`ACCENT_HZ`]
+    /// (1500 Hz) and a beat of [`BEAT_HZ`] (1000 Hz).
+    fn default() -> Self {
+        Self {
+            volume: CLICK_AMPLITUDE,
+            accent_hz: ACCENT_HZ,
+            beat_hz: BEAT_HZ,
+        }
+    }
+}
 
 /// What a reported beat belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +107,8 @@ pub enum MetronomeCommand {
         /// Whether the recording beats are audible.
         clicks: bool,
     },
+    /// Sets the click sound; a ringing click keeps its frequency.
+    SetClick(ClickSound),
     /// Ends a count-in or recording.
     StopRecording,
 }
@@ -116,6 +143,8 @@ pub struct Metronome {
     last_beat: f64,
     /// Absolute sample index of the next block's first sample, starting at 0.
     position: u64,
+    /// The sound of the clicks.
+    sound: ClickSound,
     /// The ringing click.
     click: Option<Click>,
 }
@@ -139,11 +168,15 @@ impl Metronome {
             index: 0,
             last_beat: f64::NEG_INFINITY,
             position: 0,
+            sound: ClickSound::default(),
             click: None,
         }
     }
 
-    /// Applies `command`; a tempo that is not finite is ignored.
+    /// Applies `command`; a tempo that is not finite is ignored, a click
+    /// volume that is not finite is ignored and an accepted one is clamped
+    /// into 0.0..=1.0, and a click frequency that is not finite or not
+    /// positive keeps the old value.
     pub fn apply(&mut self, command: MetronomeCommand) {
         match command {
             MetronomeCommand::SetFree { bpm, enabled } => {
@@ -167,6 +200,17 @@ impl Metronome {
                 self.record_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                 self.clicks = clicks;
                 self.start(BeatPhase::CountIn);
+            }
+            MetronomeCommand::SetClick(sound) => {
+                if sound.volume.is_finite() {
+                    self.sound.volume = sound.volume.clamp(0.0, 1.0);
+                }
+                if sound.accent_hz.is_finite() && sound.accent_hz > 0.0 {
+                    self.sound.accent_hz = sound.accent_hz;
+                }
+                if sound.beat_hz.is_finite() && sound.beat_hz > 0.0 {
+                    self.sound.beat_hz = sound.beat_hz;
+                }
             }
             MetronomeCommand::StopRecording => {
                 // The free sequence continues the grid from the last beat.
@@ -213,7 +257,11 @@ impl Metronome {
                 });
                 if audible {
                     self.click = Some(Click {
-                        freq_hz: if accent { ACCENT_HZ } else { BEAT_HZ },
+                        freq_hz: if accent {
+                            self.sound.accent_hz
+                        } else {
+                            self.sound.beat_hz
+                        },
                         n: 0,
                     });
                 }
@@ -222,7 +270,7 @@ impl Metronome {
                 let t = click.n as f64 / rate;
                 let wave = (-t / tau).exp()
                     * (2.0 * std::f64::consts::PI * f64::from(click.freq_hz) * t).sin();
-                *sample += (CLICK_AMPLITUDE as f64 * wave) as f32;
+                *sample += (self.sound.volume as f64 * wave) as f32;
                 click.n += 1;
                 if click.n < click_len {
                     self.click = Some(click);
@@ -822,5 +870,125 @@ mod tests {
             assert_eq!(beat.accent, accent);
             assert_eq!(beat.audible, audible);
         }
+    }
+
+    #[test]
+    fn a_silent_click_sound_renders_silence() {
+        let rate = 48_000;
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetClick(ClickSound {
+            volume: 0.0,
+            ..Default::default()
+        }));
+        metronome.apply(MetronomeCommand::SetFree {
+            bpm: 120.0,
+            enabled: true,
+        });
+        let mut beats = Vec::new();
+        let output = render_span(&mut metronome, 0, 96_000, rate, &mut beats);
+        assert_eq!(beats.len(), 4);
+        assert!(
+            output.iter().all(|&sample| sample == 0.0),
+            "a zero volume renders silence"
+        );
+    }
+
+    #[test]
+    fn the_volume_scales_the_click_peak() {
+        let rate = 48_000;
+        let render = |volume: f32| {
+            let mut metronome = Metronome::new();
+            metronome.apply(MetronomeCommand::SetClick(ClickSound {
+                volume,
+                ..Default::default()
+            }));
+            metronome.apply(MetronomeCommand::SetFree {
+                bpm: 120.0,
+                enabled: true,
+            });
+            let mut beats = Vec::new();
+            render_span(&mut metronome, 0, 960, rate, &mut beats)
+        };
+        let peak = |output: &[f32]| {
+            output
+                .iter()
+                .fold(0.0_f32, |peak, &sample| peak.max(sample.abs()))
+        };
+        let default_peak = peak(&render(ClickSound::default().volume));
+        let quiet_peak = peak(&render(0.25));
+        assert!(default_peak > 0.0, "the default sound renders a click");
+        let relative = (quiet_peak - 0.5 * default_peak).abs() / default_peak;
+        assert!(
+            relative < 1e-4,
+            "the peak {quiet_peak} is not half of {default_peak} (relative {relative})"
+        );
+    }
+
+    #[test]
+    fn the_accent_frequency_sets_the_first_click_pitch() {
+        let rate = 48_000;
+        let render = |accent_hz: f32| {
+            let mut metronome = Metronome::new();
+            metronome.apply(MetronomeCommand::SetClick(ClickSound {
+                accent_hz,
+                ..Default::default()
+            }));
+            metronome.apply(MetronomeCommand::SetFree {
+                bpm: 120.0,
+                enabled: true,
+            });
+            let mut beats = Vec::new();
+            render_span(&mut metronome, 0, 960, rate, &mut beats)
+        };
+        // Sign changes of the click: samples whose sign differs from the
+        // previous non-zero sample, ignoring exact zeros.
+        let sign_changes = |output: &[f32]| {
+            let mut changes = 0;
+            let mut previous: Option<f32> = None;
+            for &sample in output {
+                if sample == 0.0 {
+                    continue;
+                }
+                if previous.is_some_and(|previous| sample.signum() != previous.signum()) {
+                    changes += 1;
+                }
+                previous = Some(sample);
+            }
+            changes
+        };
+        let at_3000_hz = sign_changes(&render(3000.0));
+        assert!(
+            (at_3000_hz as i64 - 120).abs() <= 4,
+            "about 120 sign changes at 3000 Hz, got {at_3000_hz}"
+        );
+        let at_default = sign_changes(&render(ACCENT_HZ));
+        assert!(
+            (at_default as i64 - 60).abs() <= 4,
+            "about 60 sign changes at {ACCENT_HZ} Hz, got {at_default}"
+        );
+    }
+
+    #[test]
+    fn invalid_click_values_are_ignored() {
+        let mut metronome = Metronome::new();
+        metronome.apply(MetronomeCommand::SetClick(ClickSound {
+            volume: 0.3,
+            accent_hz: 2000.0,
+            beat_hz: 800.0,
+        }));
+        metronome.apply(MetronomeCommand::SetClick(ClickSound {
+            volume: f32::NAN,
+            accent_hz: -1.0,
+            beat_hz: f32::INFINITY,
+        }));
+        assert_eq!(metronome.sound.volume, 0.3);
+        assert_eq!(metronome.sound.accent_hz, 2000.0);
+        assert_eq!(metronome.sound.beat_hz, 800.0);
+
+        metronome.apply(MetronomeCommand::SetClick(ClickSound {
+            volume: 2.0,
+            ..Default::default()
+        }));
+        assert_eq!(metronome.sound.volume, 1.0);
     }
 }
