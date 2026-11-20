@@ -21,7 +21,7 @@ pub enum RecordPhase {
     CountIn,
     /// The recording runs and collects pitch frames.
     Recording,
-    /// A stop is sent; the tab waits for the finished take.
+    /// A stop is sent; the tab waits for the engine's answer, the finished take or the abort.
     Stopping,
 }
 
