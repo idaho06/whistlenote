@@ -1,8 +1,9 @@
 //! Pitch tracking of band-passed input with the McLeod pitch method.
 //!
 //! [`PitchTracker`] band-passes the input, analyses windows of [`WINDOW`]
-//! samples every [`HOP`] samples, and stamps each [`PitchFrame`] with the
-//! engine-clock time of the window's centre sample (index `WINDOW / 2`).
+//! samples every [`HOP`] samples at sample rates below 72 kHz, scaled by 2
+//! or 4 at higher rates, and stamps each [`PitchFrame`] with the
+//! engine-clock time of the window's centre sample (index `window_len / 2`).
 
 use pitch_detection::detector::PitchDetector;
 use pitch_detection::detector::mcleod::McLeodDetector;
@@ -11,23 +12,34 @@ use super::filter::{BAND_HIGH_HZ, BandPass};
 use crate::audio::rms;
 use crate::music::segment::PitchFrame;
 
-/// Analysis window length in samples.
+/// Analysis window length in samples at sample rates below 72 kHz; the
+/// tracker multiplies it by its scale (2 below 144 kHz, 4 from 144 kHz).
 pub const WINDOW: usize = 2048;
-/// Distance in samples between the starts of consecutive windows.
+/// Distance in samples between the starts of consecutive windows at sample
+/// rates below 72 kHz; the tracker multiplies it by its scale (2 below
+/// 144 kHz, 4 from 144 kHz).
 pub const HOP: usize = 512;
 /// Lowest reported frequency in Hz.
 pub const MIN_FREQ_HZ: f32 = 400.0;
-/// Highest reported frequency in Hz; the top of the band-pass.
+/// Highest reported frequency in Hz; the top of the band-pass. The tracker
+/// also caps reported pitches at a quarter of the sample rate.
 pub const MAX_FREQ_HZ: f32 = BAND_HIGH_HZ;
 
-/// Zero padding of the detector's autocorrelation buffer in samples.
-const PADDING: usize = WINDOW / 2;
-/// Samples from the last sample of a full window back to its centre, the
-/// sample at index `WINDOW / 2`.
-const CENTRE_OFFSET: usize = WINDOW - 1 - WINDOW / 2;
 /// Clarity a peak of the normalized square difference function needs to be
 /// considered by the detector.
 const CLARITY_THRESHOLD: f32 = 0.5;
+
+/// Returns the factor by which a tracker at `sample_rate` Hz scales
+/// [`WINDOW`] and [`HOP`]: 1 below 72 kHz, 2 below 144 kHz, 4 from 144 kHz.
+fn scale_for(sample_rate: u32) -> usize {
+    if sample_rate < 72_000 {
+        1
+    } else if sample_rate < 144_000 {
+        2
+    } else {
+        4
+    }
+}
 
 /// Settings of a [`PitchTracker`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +61,15 @@ impl Default for PitchConfig {
 pub struct PitchTracker {
     config: PitchConfig,
     sample_rate: u32,
+    /// Length of one analysis window in samples, [`WINDOW`] times the
+    /// scale at `sample_rate`.
+    window_len: usize,
+    /// Distance in samples between the starts of consecutive windows,
+    /// [`HOP`] times the scale at `sample_rate`.
+    hop: usize,
+    /// Highest reported frequency in Hz, at most a quarter of the sample
+    /// rate.
+    max_freq_hz: f32,
     filter: BandPass,
     detector: McLeodDetector<f32>,
     window: Vec<f32>,
@@ -56,13 +77,22 @@ pub struct PitchTracker {
 
 impl PitchTracker {
     /// Creates a tracker for input at `sample_rate` Hz.
+    ///
+    /// Pitches above a quarter of the sample rate are not reported. At
+    /// sample rates below 16 kHz a tone between a quarter and half of the
+    /// sample rate can read one octave low.
     pub fn new(sample_rate: u32, config: PitchConfig) -> Self {
+        let scale = scale_for(sample_rate);
+        let window_len = WINDOW * scale;
         Self {
             config,
             sample_rate,
+            window_len,
+            hop: HOP * scale,
+            max_freq_hz: MAX_FREQ_HZ.min(sample_rate as f32 / 4.0),
             filter: BandPass::new(sample_rate),
-            detector: McLeodDetector::new(WINDOW, PADDING),
-            window: Vec::with_capacity(WINDOW),
+            detector: McLeodDetector::new(window_len, Self::padding(window_len)),
+            window: Vec::with_capacity(window_len),
         }
     }
 
@@ -73,7 +103,19 @@ impl PitchTracker {
 
     /// Returns the duration of one analysis window in seconds.
     pub fn window_s(&self) -> f64 {
-        WINDOW as f64 / f64::from(self.sample_rate)
+        self.window_len as f64 / f64::from(self.sample_rate)
+    }
+
+    /// Zero padding of the detector's autocorrelation buffer, in samples,
+    /// for a window of `window_len` samples.
+    fn padding(window_len: usize) -> usize {
+        window_len / 2
+    }
+
+    /// Samples from the last sample of a full window of `window_len` samples
+    /// back to its centre, the sample at index `window_len / 2`.
+    fn centre_offset(window_len: usize) -> usize {
+        window_len - 1 - window_len / 2
     }
 
     /// Analyses `block`, whose first sample has engine-clock time
@@ -85,13 +127,13 @@ impl PitchTracker {
         let rate = f64::from(self.sample_rate);
         for (index, &sample) in block.iter().enumerate() {
             self.window.push(self.filter.run(sample));
-            if self.window.len() == WINDOW {
+            if self.window.len() == self.window_len {
                 // The window ends at this sample; its centre sample lies
-                // CENTRE_OFFSET samples earlier.
+                // centre_offset samples earlier.
                 let end_time_s = start_time_s + index as f64 / rate;
-                let time_s = end_time_s - CENTRE_OFFSET as f64 / rate;
+                let time_s = end_time_s - Self::centre_offset(self.window_len) as f64 / rate;
                 out.push(self.analyse(time_s));
-                self.window.drain(..HOP);
+                self.window.drain(..self.hop);
             }
         }
     }
@@ -114,8 +156,9 @@ impl PitchTracker {
             return unvoiced(0.0);
         }
         // The detector compares this with the window's sum of squares, which
-        // is the silence level squared times WINDOW at exactly that RMS.
-        let power_threshold = silence * silence * WINDOW as f32;
+        // is the silence level squared times the window length at exactly
+        // that RMS.
+        let power_threshold = silence * silence * self.window_len as f32;
         match self.detector.get_pitch(
             &self.window,
             self.sample_rate as usize,
@@ -124,7 +167,7 @@ impl PitchTracker {
         ) {
             Some(pitch)
                 if pitch.frequency.is_finite()
-                    && (MIN_FREQ_HZ..=MAX_FREQ_HZ).contains(&pitch.frequency) =>
+                    && (MIN_FREQ_HZ..=self.max_freq_hz).contains(&pitch.frequency) =>
             {
                 PitchFrame {
                     time_s,
@@ -142,6 +185,7 @@ mod tests {
     use super::*;
     use crate::dsp::filter::tests::{Noise, sine};
     use crate::music::assert_close;
+    use crate::music::note::from_freq;
 
     /// Tracks `signal` in blocks of 300 samples starting at `start_time_s`.
     fn track(signal: &[f32], sample_rate: u32, start_time_s: f64) -> Vec<PitchFrame> {
@@ -261,5 +305,57 @@ mod tests {
         assert_close(frames[0].time_s, 1.0 + 1024.0 / f64::from(rate), 1e-9);
         assert_eq!(tracker.window_s(), 2048.0 / 48_000.0);
         assert_eq!(tracker.sample_rate(), rate);
+    }
+
+    #[test]
+    fn pitches_above_a_quarter_of_the_sample_rate_are_unvoiced() {
+        // 3500 Hz is above a quarter of 8000 Hz.
+        let rate = 8_000;
+        let frames = track(&sine(3500.0, 0.3, rate, rate as usize), rate, 0.0);
+        assert!(!frames.is_empty());
+        assert!(
+            frames.iter().all(|f| f.freq_hz.is_none()),
+            "3500 Hz at 8 kHz is reported"
+        );
+    }
+
+    #[test]
+    fn a_1600_hz_sine_at_8_khz_is_detected_within_ten_cents() {
+        let rate = 8_000;
+        let frames = track(&sine(1600.0, 0.3, rate, rate as usize), rate, 0.0);
+        assert!(!frames.is_empty());
+        for frame in &frames {
+            let detected = frame
+                .freq_hz
+                .unwrap_or_else(|| panic!("unvoiced {frame:?}"));
+            let cents = 1200.0 * (detected / 1600.0).log2();
+            assert!(
+                cents.abs() <= 10.0,
+                "{detected} Hz is {cents} cents from 1600 Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn a_450_hz_sine_at_192_khz_reads_a4() {
+        let rate = 192_000;
+        let frames = track(&sine(450.0, 0.3, rate, rate as usize), rate, 0.0);
+        let voiced: Vec<&PitchFrame> = frames.iter().filter(|f| f.freq_hz.is_some()).collect();
+        assert!(voiced.len() >= 10, "only {} voiced frames", voiced.len());
+        let a4 = voiced
+            .iter()
+            .filter(|frame| from_freq(frame.freq_hz.unwrap()).map(|note| note.midi) == Some(69))
+            .count();
+        assert!(
+            a4 * 100 >= voiced.len() * 95,
+            "{a4} of {} voiced frames read A4",
+            voiced.len()
+        );
+    }
+
+    #[test]
+    fn window_s_scales_the_window_with_the_sample_rate() {
+        let tracker = PitchTracker::new(96_000, PitchConfig::default());
+        assert_eq!(tracker.window_s(), 2048.0 * 2.0 / 96_000.0);
     }
 }
