@@ -147,20 +147,17 @@ impl RecordState {
 
     /// Enters the stopping phase and returns the command that ends the recording; returns `None` while idle or already stopping.
     pub fn stop(&mut self) -> Option<EngineCommand> {
-        match self.phase {
-            RecordPhase::CountIn | RecordPhase::Recording => {
-                self.phase = RecordPhase::Stopping;
-                Some(EngineCommand::StopRecording)
-            }
-            RecordPhase::Idle | RecordPhase::Stopping => None,
+        if !self.is_running() {
+            return None;
         }
+        self.phase = RecordPhase::Stopping;
+        Some(EngineCommand::StopRecording)
     }
 
     /// Returns to idle without a take when a count-in or recording runs, because the engine discards a recording without an event when listening stops or a device changes; the live frames and the preview are cleared and the finished take is kept. While stopping it does nothing, because the engine still answers the sent stop. While idle it does nothing.
     pub fn cancel(&mut self) {
-        if matches!(self.phase, RecordPhase::CountIn | RecordPhase::Recording) {
-            self.phase = RecordPhase::Idle;
-            self.clear_run();
+        if self.is_running() {
+            self.end_run();
         }
     }
 
@@ -176,20 +173,16 @@ impl RecordState {
             }
             EngineEvent::RecordingFinished { frames, origin_s } if !self.is_idle() => {
                 self.take = Some(Take::new(frames.clone(), *origin_s, self.bpm, self.grid));
-                self.phase = RecordPhase::Idle;
-                self.clear_run();
+                self.end_run();
             }
-            EngineEvent::RecordingAborted if !self.is_idle() => {
-                self.phase = RecordPhase::Idle;
-                self.clear_run();
-            }
+            EngineEvent::RecordingAborted if !self.is_idle() => self.end_run(),
             _ => {}
         }
     }
 
     /// Folds a live frame of the engine into the running recording: while a recording runs, the frame is collected as a pitch frame and every [`PREVIEW_EVERY_FRAMES`] collected frames the preview is rebuilt from all collected frames; while idle or stopping the frame is ignored, and no preview is built before the recording start arrived.
     pub fn push_live(&mut self, frame: &LiveFrame) {
-        if self.is_idle() || self.phase == RecordPhase::Stopping {
+        if !self.is_running() {
             return;
         }
         self.live_frames.push(PitchFrame {
@@ -228,6 +221,17 @@ impl RecordState {
                 Some((_, BeatPhase::Free)) | None => "Count-in".to_string(),
             },
         }
+    }
+
+    /// Returns whether the count-in or the recording runs.
+    fn is_running(&self) -> bool {
+        matches!(self.phase, RecordPhase::CountIn | RecordPhase::Recording)
+    }
+
+    /// Returns to idle and clears the per-recording fields; the finished take is kept.
+    fn end_run(&mut self) {
+        self.phase = RecordPhase::Idle;
+        self.clear_run();
     }
 
     /// Clears the per-recording fields: the latest beat, the origin, the live frames, the unprocessed count and the preview.

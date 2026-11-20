@@ -3,7 +3,7 @@
 use super::segment::{RawNote, SegmentConfig};
 
 /// Smallest length in beats that survives filtering.
-const MIN_LENGTH_B: f64 = 1e-9;
+pub(crate) const MIN_LENGTH_B: f64 = 1e-9;
 
 /// Resolution of the quantization grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,7 +31,7 @@ pub struct QuantNote {
 }
 
 /// Returns the grid step in beats, or `None` for [`Grid::Off`].
-fn step_beats(grid: Grid) -> Option<f64> {
+pub(crate) fn step_beats(grid: Grid) -> Option<f64> {
     match grid {
         Grid::Off => None,
         Grid::Quarter => Some(1.0),

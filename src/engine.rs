@@ -864,6 +864,12 @@ mod tests {
         seen
     }
 
+    /// Asserts that no event of `seen` matches `pred`; `what` names the
+    /// unwanted event in the failure message, which also lists `seen`.
+    fn assert_no_event(seen: &[EngineEvent], pred: impl Fn(&EngineEvent) -> bool, what: &str) {
+        assert!(!seen.iter().any(pred), "{what}: {seen:?}");
+    }
+
     /// Waits until the input stream of `handle` is open.
     fn wait_input_open(handle: &FakeHandle) {
         assert!(
@@ -1061,11 +1067,10 @@ mod tests {
         assert_eq!(closed, Some(EngineEvent::InputRate(None)));
 
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::InputRate(_))),
-            "an InputRate event arrived without a rate change: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::InputRate(_)),
+            "an InputRate event arrived without a rate change",
         );
     }
 
@@ -1142,11 +1147,10 @@ mod tests {
 
         handle.step_n(375); // 2 s more of silence
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::Beat { .. })),
-            "a beat event arrived while the metronome is disabled"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::Beat { .. }),
+            "a beat event arrived while the metronome is disabled",
         );
         assert_eq!(handle.output_device(), Some("Fake Speakers".to_string()));
     }
@@ -1335,10 +1339,7 @@ mod tests {
         // 0.5 s of silence.
         let mut signal = vec![0.0_f32; 57_600];
         signal.extend(sine(1046.5, 0.3, 48_000, 14_400));
-        let second: Vec<f32> = (14_400..14_400 + 28_800)
-            .map(|i| 0.3 * (std::f32::consts::TAU * 1174.66 * i as f32 / 48_000.0).sin())
-            .collect();
-        signal.extend(second);
+        signal.extend_from_slice(&sine(1174.66, 0.3, 48_000, 14_400 + 28_800)[14_400..]);
         signal.extend(vec![0.0_f32; 24_000]);
         let len = signal.len();
         handle.push_input(&signal);
@@ -1424,17 +1425,15 @@ mod tests {
         assert!(!started_seen, "no RecordingStarted before the abort");
         assert!(!finished_seen, "no RecordingFinished before the abort");
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
-            "a RecordingFinished arrived after the abort: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingFinished { .. }),
+            "a RecordingFinished arrived after the abort",
         );
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingAborted)),
-            "a second RecordingAborted arrived: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingAborted),
+            "a second RecordingAborted arrived",
         );
     }
 
@@ -1451,11 +1450,10 @@ mod tests {
 
         engine.send(EngineCommand::StopListening);
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
-            "a RecordingFinished arrived after StopListening"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingFinished { .. }),
+            "a RecordingFinished arrived after StopListening",
         );
         assert!(wait_until(Duration::from_secs(2), || {
             handle.input_device().is_none()
@@ -1611,17 +1609,15 @@ mod tests {
         let (engine, handle) = spawn_engine();
         engine.send(EngineCommand::StopRecording);
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
-            "a RecordingFinished arrived without a recording"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingFinished { .. }),
+            "a RecordingFinished arrived without a recording",
         );
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::Error(_))),
-            "an Error arrived without a recording"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::Error(_)),
+            "an Error arrived without a recording",
         );
         assert_eq!(handle.input_device(), None);
         assert_eq!(handle.output_device(), None);
@@ -1735,11 +1731,10 @@ mod tests {
         let message = wait_error(&engine);
         assert!(message.contains("busy"), "{message}");
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::Error(_))),
-            "no lost-stream error follows: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::Error(_)),
+            "no lost-stream error follows",
         );
         assert!(handle.input_device().is_some(), "the input stays open");
     }
@@ -1828,17 +1823,15 @@ mod tests {
         wait_aborted(&engine);
 
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingFinished { .. })),
-            "a RecordingFinished arrived after the abort: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingFinished { .. }),
+            "a RecordingFinished arrived after the abort",
         );
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingAborted)),
-            "a second RecordingAborted arrived: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingAborted),
+            "a second RecordingAborted arrived",
         );
         assert_eq!(handle.output_device(), None);
         wait_input_closed(&handle);
@@ -1860,11 +1853,10 @@ mod tests {
         assert_close(origin_s, 2.0, 1e-9);
         assert!(!frames.is_empty(), "the recording has frames");
         let seen = sync(&engine);
-        assert!(
-            !seen
-                .iter()
-                .any(|event| matches!(event, EngineEvent::RecordingAborted)),
-            "a RecordingAborted arrived after the RecordingFinished: {seen:?}"
+        assert_no_event(
+            &seen,
+            |event| matches!(event, EngineEvent::RecordingAborted),
+            "a RecordingAborted arrived after the RecordingFinished",
         );
     }
 }

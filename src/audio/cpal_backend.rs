@@ -89,31 +89,7 @@ impl CpalBackend {
         let direction = callback.direction();
         let device = find_device(direction, name)?;
         let supported = match direction {
-            Direction::Input => {
-                let default = device.default_input_config()?;
-                if default.sample_rate() < MIN_INPUT_RATE_HZ {
-                    match device.supported_input_configs() {
-                        Ok(ranges) => {
-                            let ranges: Vec<_> = ranges.collect();
-                            let chosen = choose_input_config(default, &ranges);
-                            if chosen != default {
-                                log::info!(
-                                    "input default {} Hz is low; using {} Hz",
-                                    default.sample_rate(),
-                                    chosen.sample_rate()
-                                );
-                            }
-                            chosen
-                        }
-                        Err(error) => {
-                            log::debug!("supported input configs unavailable: {error}");
-                            default
-                        }
-                    }
-                } else {
-                    default
-                }
-            }
+            Direction::Input => input_config(&device)?,
             Direction::Output => device.default_output_config()?,
         };
         let config = supported.config();
@@ -264,6 +240,32 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
     }
 }
 
+/// Returns the config to open the input of `device` with: its default
+/// config, or, when the default rate is below `MIN_INPUT_RATE_HZ`, the one
+/// [`choose_input_config`] picks from the supported configs.
+fn input_config(device: &Device) -> Result<SupportedStreamConfig, AudioError> {
+    let default = device.default_input_config()?;
+    if default.sample_rate() >= MIN_INPUT_RATE_HZ {
+        return Ok(default);
+    }
+    let ranges: Vec<_> = match device.supported_input_configs() {
+        Ok(ranges) => ranges.collect(),
+        Err(error) => {
+            log::debug!("supported input configs unavailable: {error}");
+            return Ok(default);
+        }
+    };
+    let chosen = choose_input_config(default, &ranges);
+    if chosen != default {
+        log::info!(
+            "input default {} Hz is low; using {} Hz",
+            default.sample_rate(),
+            chosen.sample_rate()
+        );
+    }
+    Ok(chosen)
+}
+
 /// Chooses the input config from the device's supported `ranges` when the
 /// `default` config's sample rate is below `MIN_INPUT_RATE_HZ`.
 ///
@@ -283,35 +285,37 @@ fn choose_input_config(
         return default;
     }
     let rank = |range: &SupportedStreamConfigRange| {
-        if range.sample_format() == default.sample_format() {
-            if range.channels() == default.channels() {
-                0
-            } else {
-                1
-            }
-        } else {
+        if range.sample_format() != default.sample_format() {
             2
+        } else if range.channels() != default.channels() {
+            1
+        } else {
+            0
         }
     };
-    for best in 0..3 {
-        for &rate in &PREFERRED_INPUT_RATES_HZ {
-            if let Some(range) = ranges
+    let preferred = (0..3).find_map(|best| {
+        PREFERRED_INPUT_RATES_HZ.iter().find_map(|&rate| {
+            ranges
                 .iter()
                 .filter(|range| rank(range) == best)
-                .find(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
-            {
-                return range.with_sample_rate(rate);
-            }
-        }
-    }
-    if let Some(range) = ranges
-        .iter()
-        .filter(|range| range.max_sample_rate() >= MIN_INPUT_RATE_HZ)
-        .min_by_key(|range| (range.min_sample_rate().max(MIN_INPUT_RATE_HZ), rank(range)))
-    {
-        return range.with_sample_rate(range.min_sample_rate().max(MIN_INPUT_RATE_HZ));
-    }
-    default
+                .find_map(|range| range.try_with_sample_rate(rate))
+        })
+    });
+    let lowest_above = || {
+        ranges
+            .iter()
+            .filter(|range| range.max_sample_rate() >= MIN_INPUT_RATE_HZ)
+            .map(|range| {
+                (
+                    range.min_sample_rate().max(MIN_INPUT_RATE_HZ),
+                    rank(range),
+                    range,
+                )
+            })
+            .min_by_key(|&(rate, rank, _)| (rate, rank))
+            .map(|(rate, _, range)| range.with_sample_rate(rate))
+    };
+    preferred.or_else(lowest_above).unwrap_or(default)
 }
 
 /// Returns whether a stream error is worth reporting; glitches, reroutes

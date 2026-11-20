@@ -2,20 +2,18 @@
 
 use crate::export::csv::to_csv;
 use crate::export::midi::to_midi_bytes;
-use crate::music::quantize::{Grid, QuantNote, quantize_indexed};
+use crate::music::quantize::{Grid, MIN_LENGTH_B, QuantNote, quantize_indexed, step_beats};
 use crate::music::segment::{PitchFrame, RawNote, SegmentConfig, segment};
 
-/// Tolerance in beats: the smallest length a shifted row keeps, and the step of [`Grid::Off`].
-const BEAT_EPS: f64 = 1e-9;
-
-/// Returns the step of `grid` in beats: 1.0 for [`Grid::Quarter`], 0.5 for [`Grid::Eighth`], 0.25 for [`Grid::Sixteenth`] and the beat tolerance for [`Grid::Off`].
-fn grid_step(grid: Grid) -> f64 {
-    match grid {
-        Grid::Off => BEAT_EPS,
-        Grid::Quarter => 1.0,
-        Grid::Eighth => 0.5,
-        Grid::Sixteenth => 0.25,
-    }
+/// Segments `frames` with the default config and `merge_note_s` as the short-note threshold.
+fn segment_with(frames: &[PitchFrame], merge_note_s: f64) -> Vec<RawNote> {
+    segment(
+        frames,
+        &SegmentConfig {
+            merge_note_s,
+            ..SegmentConfig::default()
+        },
+    )
 }
 
 /// A finished recording: its frames and the notes quantized from them, editable before export.
@@ -47,13 +45,7 @@ impl Take {
     /// Segments `frames` with the default config and quantizes the notes onto `grid`, building the take recorded at `bpm` with beat 0 at `origin_s`.
     pub fn new(frames: Vec<PitchFrame>, origin_s: f64, bpm: f64, grid: Grid) -> Self {
         let merge_note_s = SegmentConfig::default().merge_note_s;
-        let raw = segment(
-            &frames,
-            &SegmentConfig {
-                merge_note_s,
-                ..SegmentConfig::default()
-            },
-        );
+        let raw = segment_with(&frames, merge_note_s);
         let edited = raw.clone();
         let mut take = Self {
             frames,
@@ -82,7 +74,7 @@ impl Take {
                 note.start_beats = 0.0;
             }
         }
-        rows.retain(|(_, note)| note.length_beats > BEAT_EPS);
+        rows.retain(|(_, note)| note.length_beats > MIN_LENGTH_B);
         self.rows = rows;
         self.notes = self.rows.iter().map(|(_, note)| *note).collect();
     }
@@ -159,7 +151,8 @@ impl Take {
         };
         let start = first.start_beats;
         let reached_past_rounded = start + first.length_beats - start.round();
-        let shift = if reached_past_rounded >= grid_step(self.grid) - BEAT_EPS {
+        let step = step_beats(self.grid).unwrap_or(MIN_LENGTH_B);
+        let shift = if reached_past_rounded >= step - MIN_LENGTH_B {
             start.round()
         } else {
             start.floor()
@@ -179,13 +172,7 @@ impl Take {
             return;
         }
         self.merge_note_s = s;
-        self.raw = segment(
-            &self.frames,
-            &SegmentConfig {
-                merge_note_s: s,
-                ..SegmentConfig::default()
-            },
-        );
+        self.raw = segment_with(&self.frames, s);
         self.reset_edits();
     }
 

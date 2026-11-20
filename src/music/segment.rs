@@ -54,7 +54,9 @@ pub struct RawNote {
 /// Tolerance in seconds for comparing sums and differences of frame times.
 const TIME_EPS_S: f64 = 1e-9;
 
-/// Longest hole, in frame periods, that the note after it reaches back across; a hole that an audible click leaves spans about 4 to 7 periods at every sample rate.
+/// Longest hole, in frame periods, that the note after it reaches back
+/// across; a hole that an audible click leaves spans about 4 to 7 periods at
+/// every sample rate.
 const MAX_HOLE_PERIODS: f64 = 8.0;
 
 /// A frame that counts as voiced, with its MIDI note number.
@@ -135,9 +137,6 @@ fn voiced_midi(frame: &PitchFrame, cfg: &SegmentConfig) -> Option<i32> {
 /// notes do not overlap.
 pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
     let period = frame_period(frames);
-    // A hole lies between the input frames j - 1 and j when their times
-    // differ by more than one and a half periods.
-    let hole_before = |j: usize| j > 0 && frames[j].time_s - frames[j - 1].time_s > 1.5 * period;
     let voiced: Vec<VoicedFrame> = frames
         .iter()
         .enumerate()
@@ -169,17 +168,7 @@ pub fn segment(frames: &[PitchFrame], cfg: &SegmentConfig) -> Vec<RawNote> {
         };
         if !joins {
             let first = &voiced[group_start];
-            // A hole of at most MAX_HOLE_PERIODS directly before the first
-            // voiced frame of a note pulls the start back to one period
-            // after the input frame before the hole.
-            let start_s = if hole_before(first.index)
-                && frames[first.index].time_s - frames[first.index - 1].time_s
-                    <= MAX_HOLE_PERIODS * period + TIME_EPS_S
-            {
-                frames[first.index - 1].time_s + period
-            } else {
-                first.time_s
-            };
+            let start_s = hole_start(frames, first.index, period).unwrap_or(first.time_s);
             notes.push(RawNote {
                 start_s,
                 end_s: voiced[k - 1].time_s + period,
@@ -242,35 +231,45 @@ fn merge_short_notes(notes: &mut Vec<RawNote>, cfg: &SegmentConfig) {
     }
 }
 
+/// Returns the start of a note whose first voiced frame is `frames[index]`
+/// when a hole of at most [`MAX_HOLE_PERIODS`] lies directly before it: one
+/// `period` after the input frame before the hole. A hole lies between two
+/// consecutive input frames more than one and a half periods apart.
+fn hole_start(frames: &[PitchFrame], index: usize, period: f64) -> Option<f64> {
+    let before = frames.get(index.checked_sub(1)?)?;
+    let gap = frames[index].time_s - before.time_s;
+    (gap > 1.5 * period && gap <= MAX_HOLE_PERIODS * period + TIME_EPS_S)
+        .then_some(before.time_s + period)
+}
+
 /// Joins consecutive notes of equal MIDI that touch into one note.
 ///
-/// `notes` must be ordered by start time. Two consecutive notes touch when
-/// the gap between the end of the first and the start of the second is at
-/// most `cfg.max_gap_s`. A touching pair with equal MIDI numbers joins: the
-/// first note takes the end of the second and the second is removed. The
-/// scan repeats at the same position after a join, so a chain of touching
-/// equal notes becomes a single note.
+/// `notes` must be ordered by start time. A touching pair with equal MIDI
+/// numbers joins: the first note takes the end of the second and the second
+/// is removed, so a chain of touching equal notes becomes a single note.
 fn join_equal_neighbours(notes: &mut Vec<RawNote>, cfg: &SegmentConfig) {
-    let mut i = 1;
-    while i < notes.len() {
-        let gap = notes[i].start_s - notes[i - 1].end_s;
-        if notes[i].midi == notes[i - 1].midi && gap <= cfg.max_gap_s + TIME_EPS_S {
-            notes[i - 1].end_s = notes[i - 1].end_s.max(notes[i].end_s);
-            notes.remove(i);
-        } else {
-            i += 1;
+    notes.dedup_by(|next, prev| {
+        let join = next.midi == prev.midi && touch(prev, next, cfg);
+        if join {
+            prev.end_s = prev.end_s.max(next.end_s);
         }
-    }
+        join
+    });
+}
+
+/// Returns whether `next` starts at most `cfg.max_gap_s` after `prev` ends.
+fn touch(prev: &RawNote, next: &RawNote, cfg: &SegmentConfig) -> bool {
+    next.start_s - prev.end_s <= cfg.max_gap_s + TIME_EPS_S
 }
 
 /// Returns whether the note at index `i` touches the note before it.
 fn touches_prev(notes: &[RawNote], i: usize, cfg: &SegmentConfig) -> bool {
-    i > 0 && notes[i].start_s - notes[i - 1].end_s <= cfg.max_gap_s + TIME_EPS_S
+    i > 0 && touch(&notes[i - 1], &notes[i], cfg)
 }
 
 /// Returns whether the note at index `i` touches the note after it.
 fn touches_next(notes: &[RawNote], i: usize, cfg: &SegmentConfig) -> bool {
-    i + 1 < notes.len() && notes[i + 1].start_s - notes[i].end_s <= cfg.max_gap_s + TIME_EPS_S
+    i + 1 < notes.len() && touch(&notes[i], &notes[i + 1], cfg)
 }
 
 #[cfg(test)]
@@ -358,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_note_after_a_hole_starts_one_period_after_the_frame_before_the_hole() {
-        let mut frames: Vec<PitchFrame> = (0..30).map(|i| frame_at(i, None, 0.0)).collect();
+        let mut frames = run(0, 30, None);
         frames.extend(run(36, 50, Some(440.0))); // frames 30..36 are missing: a hole
         let notes = segment(&frames, &SegmentConfig::default());
         assert_eq!(notes.len(), 1);
@@ -382,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_note_after_a_long_gap_without_frames_starts_at_its_first_frame() {
-        let mut frames: Vec<PitchFrame> = (0..30).map(|i| frame_at(i, None, 0.0)).collect();
+        let mut frames = run(0, 30, None);
         frames.extend(run(50, 50, Some(440.0))); // frames 30..50 are missing: a 0.21 s gap
         let notes = segment(&frames, &SegmentConfig::default());
         assert_eq!(notes.len(), 1, "one note, got {notes:?}");

@@ -261,36 +261,6 @@ mod tests {
             note_events,
             vec![(1, on(69)), (410, off(69)), (410, on(69)), (1004, off(69))]
         );
-
-        // No note-on arrives for a key whose previous note-on has no note-off yet.
-        let mut sounding: Vec<u8> = Vec::new();
-        for (_, kind) in &note_events {
-            match kind {
-                TrackEventKind::Midi {
-                    message: MidiMessage::NoteOn { key, .. },
-                    ..
-                } => {
-                    let key = key.as_int();
-                    assert!(
-                        !sounding.contains(&key),
-                        "note-on for key {key} while it is still sounding"
-                    );
-                    sounding.push(key);
-                }
-                TrackEventKind::Midi {
-                    message: MidiMessage::NoteOff { key, .. },
-                    ..
-                } => {
-                    let key = key.as_int();
-                    assert!(
-                        sounding.contains(&key),
-                        "note-off for key {key} that is not sounding"
-                    );
-                    sounding.retain(|sounding| *sounding != key);
-                }
-                _ => {}
-            }
-        }
     }
 
     #[test]

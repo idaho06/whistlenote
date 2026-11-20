@@ -12,9 +12,6 @@ use crate::ui::record_mode::RecordState;
 /// The largest absolute latency offset in milliseconds.
 pub(crate) const MAX_LATENCY_MS: f64 = 200.0;
 
-/// Below this input rate in Hz, whistles above a quarter of the rate are not tracked and some read an octave low.
-pub const LOW_INPUT_RATE_HZ: u32 = 16_000;
-
 /// Returns the label of an input rate in Hz: whole kHz without decimals, otherwise one decimal rounded, for example "48 kHz" for 48_000 and "44.1 kHz" for 44_100.
 pub fn rate_label(rate_hz: u32) -> String {
     if rate_hz.is_multiple_of(1_000) {
@@ -584,18 +581,11 @@ mod tests {
         assert_eq!(state.live_note(), None);
     }
 
-    /// Feeds `state` three voiced `frame`s at 10 ms intervals, which shows A4 as the live note.
-    fn feed_three_frames(state: &mut AppState) {
-        for time_s in [0.0, 0.01, 0.02] {
-            state.apply_live(frame(time_s));
-        }
-    }
-
     #[test]
     fn the_live_readout_clears_when_frames_stop() {
         let mut state = AppState::default();
         state.set_listening(true);
-        feed_three_frames(&mut state);
+        feed_three_voiced_frames(&mut state);
         state.live_tick(10.0, true);
         assert!(state.live_note().is_some());
         assert!(state.latest_live().is_some());
@@ -608,7 +598,7 @@ mod tests {
     fn the_live_readout_stays_within_the_clear_time() {
         let mut state = AppState::default();
         state.set_listening(true);
-        feed_three_frames(&mut state);
+        feed_three_voiced_frames(&mut state);
         state.live_tick(10.0, true);
         assert!(state.live_note().is_some());
         assert!(state.latest_live().is_some());

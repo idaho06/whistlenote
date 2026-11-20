@@ -24,6 +24,11 @@ pub const MIN_FREQ_HZ: f32 = 400.0;
 /// Highest reported frequency in Hz; the top of the band-pass. The tracker
 /// also caps reported pitches at a quarter of the sample rate.
 pub const MAX_FREQ_HZ: f32 = BAND_HIGH_HZ;
+/// Lowest sample rate in Hz at which a quarter of the rate reaches
+/// [`MAX_FREQ_HZ`]; below it, pitches above a quarter of the rate are not
+/// reported and a tone between a quarter and half of the rate can read one
+/// octave low.
+pub const LOW_RATE_HZ: u32 = 16_000;
 
 /// Clarity a peak of the normalized square difference function needs to be
 /// considered by the detector.
@@ -79,8 +84,8 @@ impl PitchTracker {
     /// Creates a tracker for input at `sample_rate` Hz.
     ///
     /// Pitches above a quarter of the sample rate are not reported. At
-    /// sample rates below 16 kHz a tone between a quarter and half of the
-    /// sample rate can read one octave low.
+    /// sample rates below [`LOW_RATE_HZ`] a tone between a quarter and half
+    /// of the sample rate can read one octave low.
     pub fn new(sample_rate: u32, config: PitchConfig) -> Self {
         let scale = scale_for(sample_rate);
         let window_len = WINDOW * scale;
