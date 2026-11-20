@@ -33,9 +33,9 @@ fn fold_interval(interval_s: f64, reference_s: f64) -> f64 {
     folded
 }
 
-/// Rounds `bpm` to one decimal place and clamps it into `MIN_BPM..=MAX_BPM`.
-fn normalize_bpm(bpm: f64) -> f64 {
-    ((bpm * 10.0).round() / 10.0).clamp(MIN_BPM, MAX_BPM)
+/// Rounds `bpm` to one decimal place and clamps it into `min..=max`.
+fn normalize_bpm(bpm: f64, min: f64, max: f64) -> f64 {
+    ((bpm * 10.0).round() / 10.0).clamp(min, max)
 }
 
 /// Estimates a tempo in BPM from onset times in seconds.
@@ -48,6 +48,35 @@ fn normalize_bpm(bpm: f64) -> f64 {
 /// `MIN_BPM..=MAX_BPM`. Returns `None` when there are too few usable
 /// intervals. The result lies in 40.0..=220.0 and is rounded to one decimal.
 pub fn estimate_bpm(onsets_s: &[f64]) -> Option<f64> {
+    estimate_bpm_in(onsets_s, MIN_BPM, MAX_BPM)
+}
+
+/// Estimates a tempo in BPM from onset times in seconds, folded into
+/// `min_bpm..=max_bpm`.
+///
+/// Consecutive onsets give intervals; an interval that is not positive, not
+/// finite, or longer than 4 seconds is dropped. The kept intervals are
+/// sorted and the lower middle one is the reference; each interval is folded
+/// into `[reference / SQRT_2, reference * SQRT_2)` and the tempo is 60
+/// divided by the median folded interval, halved or doubled into
+/// `min_bpm..=max_bpm`. Returns `None` when there are too few usable
+/// intervals. The result lies in `min_bpm..=max_bpm` and is rounded to one
+/// decimal.
+///
+/// A range is valid when both bounds are finite, `min_bpm` is positive, and
+/// `max_bpm` is at least twice `min_bpm`; that condition guarantees an octave
+/// fits inside the range, so the folding always lands within it. An invalid
+/// range is replaced by `MIN_BPM..=MAX_BPM`.
+pub fn estimate_bpm_in(onsets_s: &[f64], min_bpm: f64, max_bpm: f64) -> Option<f64> {
+    let (min_bpm, max_bpm) = if min_bpm.is_finite()
+        && max_bpm.is_finite()
+        && min_bpm > 0.0
+        && max_bpm >= 2.0 * min_bpm
+    {
+        (min_bpm, max_bpm)
+    } else {
+        (MIN_BPM, MAX_BPM)
+    };
     if onsets_s.len() < 3 {
         return None;
     }
@@ -67,13 +96,13 @@ pub fn estimate_bpm(onsets_s: &[f64]) -> Option<f64> {
         .collect();
     let median_s = median(folded)?;
     let mut bpm = 60.0 / median_s;
-    while bpm > MAX_BPM {
+    while bpm > max_bpm {
         bpm /= 2.0;
     }
-    while bpm < MIN_BPM {
+    while bpm < min_bpm {
         bpm *= 2.0;
     }
-    Some(normalize_bpm(bpm))
+    Some(normalize_bpm(bpm, min_bpm, max_bpm))
 }
 
 /// Tap tempo estimator.
@@ -115,7 +144,7 @@ impl TapTempo {
         if !median_interval_s.is_finite() || median_interval_s <= 0.0 {
             return None;
         }
-        Some(normalize_bpm(60.0 / median_interval_s))
+        Some(normalize_bpm(60.0 / median_interval_s, MIN_BPM, MAX_BPM))
     }
 
     /// Forgets all taps.
@@ -205,6 +234,53 @@ mod tests {
     #[test]
     fn very_fast_onsets_fold_up_to_150_bpm() {
         assert_bpm(&[0.0, 0.1, 0.2, 0.3], 150.0, 1e-9);
+    }
+
+    /// Onsets every 0.5 s from 0.0 s to 3.0 s.
+    fn half_second_onsets() -> Vec<f64> {
+        (0..=6).map(|i| i as f64 * 0.5).collect()
+    }
+
+    #[test]
+    fn half_second_onsets_in_a_40_to_100_range_give_60_bpm() {
+        assert_eq!(
+            estimate_bpm_in(&half_second_onsets(), 40.0, 100.0),
+            Some(60.0)
+        );
+    }
+
+    #[test]
+    fn half_second_onsets_in_a_40_to_220_range_give_120_bpm() {
+        assert_eq!(
+            estimate_bpm_in(&half_second_onsets(), 40.0, 220.0),
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn two_second_onsets_in_a_60_to_140_range_give_60_bpm() {
+        assert_eq!(
+            estimate_bpm_in(&[0.0, 2.0, 4.0, 6.0], 60.0, 140.0),
+            Some(60.0)
+        );
+    }
+
+    #[test]
+    fn invalid_ranges_fall_back_to_the_full_range() {
+        let onsets = half_second_onsets();
+        for (min_bpm, max_bpm) in [
+            (100.0, 150.0),
+            (0.0, 220.0),
+            (f64::NAN, 220.0),
+            (40.0, f64::INFINITY),
+        ] {
+            assert_eq!(
+                estimate_bpm_in(&onsets, min_bpm, max_bpm),
+                estimate_bpm(&onsets),
+                "range {min_bpm}..={max_bpm}"
+            );
+            assert_eq!(estimate_bpm_in(&onsets, min_bpm, max_bpm), Some(120.0));
+        }
     }
 
     #[test]

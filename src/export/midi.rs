@@ -10,12 +10,30 @@ use midly::{
 const TICKS_PER_BEAT: u16 = 480;
 /// Tempo in beats per minute used when `bpm` is not finite or not positive.
 const DEFAULT_BPM: f64 = 120.0;
-/// Velocity of the exported note events.
+/// Velocity used by [`MidiOptions::default`].
 const VELOCITY: u8 = 100;
-/// Channel of the exported note events.
+/// Channel used by [`MidiOptions::default`].
 const CHANNEL: u8 = 0;
 /// Largest tempo in microseconds per quarter note that fits a `u24`.
 const MAX_TEMPO_US: f64 = 16_777_215.0;
+
+/// Velocity and channel of exported note events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MidiOptions {
+    /// Velocity of note events, 1..=127; other values are clamped.
+    pub velocity: u8,
+    /// Zero-based MIDI channel, 0..=15 (channel 1 is 0); other values are clamped.
+    pub channel: u8,
+}
+
+impl Default for MidiOptions {
+    fn default() -> Self {
+        Self {
+            velocity: VELOCITY,
+            channel: CHANNEL,
+        }
+    }
+}
 
 /// Rounds a beat count to MIDI ticks; negative and NaN values become 0.
 fn beats_to_ticks(beats: f64) -> u32 {
@@ -31,12 +49,12 @@ fn meta(kind: MetaMessage<'static>) -> TrackEvent<'static> {
     }
 }
 
-/// Builds a MIDI event on the export channel with the given delta time in ticks.
-fn midi_event(delta: u32, message: MidiMessage) -> TrackEvent<'static> {
+/// Builds a MIDI event on `channel` with the given delta time in ticks.
+fn midi_event(delta: u32, channel: u8, message: MidiMessage) -> TrackEvent<'static> {
     TrackEvent {
         delta: u28::from(delta),
         kind: TrackEventKind::Midi {
-            channel: u4::from(CHANNEL),
+            channel: u4::from(channel),
             message,
         },
     }
@@ -47,6 +65,20 @@ fn midi_event(delta: u32, message: MidiMessage) -> TrackEvent<'static> {
 /// Each note-off lies at the rounded end of its note, at least one tick after
 /// its note-on. A `bpm` that is not finite or not positive is treated as 120.
 pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
+    to_midi_bytes_with(notes, bpm, &MidiOptions::default())
+}
+
+/// Serializes notes to a format 0 Standard MIDI File and returns its bytes,
+/// with the note events on the channel and velocity of `options`.
+///
+/// Each note-off lies at the rounded end of its note, at least one tick after
+/// its note-on. A `bpm` that is not finite or not positive is treated as 120.
+/// Every MIDI event, including the program change, is on
+/// `options.channel.min(15)`, and note on and note off use the velocity
+/// `options.velocity.clamp(1, 127)`.
+pub fn to_midi_bytes_with(notes: &[QuantNote], bpm: f64, options: &MidiOptions) -> Vec<u8> {
+    let channel = options.channel.min(15);
+    let vel = u7::from(options.velocity.clamp(1, 127));
     let bpm = if bpm.is_finite() && bpm > 0.0 {
         bpm
     } else {
@@ -61,6 +93,7 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
     if !notes.is_empty() {
         track.push(midi_event(
             0,
+            channel,
             MidiMessage::ProgramChange {
                 program: u7::from(0),
             },
@@ -80,7 +113,6 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
     // A note off (false) sorts before a note on (true) at an equal tick.
     note_events.sort_by_key(|&(tick, is_on, _)| (tick, is_on));
 
-    let vel = u7::from(VELOCITY);
     let mut prev_tick = 0;
     for (tick, is_on, key) in note_events {
         let message = if is_on {
@@ -88,7 +120,7 @@ pub fn to_midi_bytes(notes: &[QuantNote], bpm: f64) -> Vec<u8> {
         } else {
             MidiMessage::NoteOff { key, vel }
         };
-        track.push(midi_event(tick - prev_tick, message));
+        track.push(midi_event(tick - prev_tick, channel, message));
         prev_tick = tick;
     }
     track.push(meta(MetaMessage::EndOfTrack));
@@ -291,6 +323,97 @@ mod tests {
         assert_eq!(
             events.last().map(|(_, kind)| *kind),
             Some(TrackEventKind::Meta(MetaMessage::EndOfTrack))
+        );
+    }
+
+    #[test]
+    fn default_options_are_velocity_100_on_channel_0() {
+        assert_eq!(
+            MidiOptions::default(),
+            MidiOptions {
+                velocity: 100,
+                channel: 0
+            }
+        );
+    }
+
+    #[test]
+    fn options_set_the_channel_and_velocity_of_every_midi_event() {
+        let notes = [note(0.0, 1.0, 60), note(1.0, 0.5, 69)];
+        let options = MidiOptions {
+            velocity: 64,
+            channel: 9,
+        };
+        let bytes = to_midi_bytes_with(&notes, 120.0, &options);
+        let smf = parse(&bytes);
+        let midi_events: Vec<(u8, MidiMessage)> = track_events(&smf)
+            .into_iter()
+            .filter_map(|(_, kind)| match kind {
+                TrackEventKind::Midi { channel, message } => Some((channel.as_int(), message)),
+                _ => None,
+            })
+            .collect();
+        // A program change plus two note-ons with their note-offs.
+        assert_eq!(midi_events.len(), 5);
+        for (channel, message) in midi_events {
+            assert_eq!(channel, 9);
+            match message {
+                MidiMessage::NoteOn { vel, .. } | MidiMessage::NoteOff { vel, .. } => {
+                    assert_eq!(vel.as_int(), 64);
+                }
+                MidiMessage::ProgramChange { .. } => {}
+                message => panic!("unexpected message {message:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_velocity_and_channel_are_clamped() {
+        let notes = [note(0.0, 1.0, 60)];
+        let bytes = to_midi_bytes_with(
+            &notes,
+            120.0,
+            &MidiOptions {
+                velocity: 0,
+                channel: 20,
+            },
+        );
+        let smf = parse(&bytes);
+        for (_, kind) in track_events(&smf) {
+            if let TrackEventKind::Midi { channel, message } = kind {
+                assert_eq!(channel.as_int(), 15);
+                if let MidiMessage::NoteOn { vel, .. } | MidiMessage::NoteOff { vel, .. } = message
+                {
+                    assert_eq!(vel.as_int(), 1);
+                }
+            }
+        }
+        let bytes = to_midi_bytes_with(
+            &notes,
+            120.0,
+            &MidiOptions {
+                velocity: 200,
+                channel: 0,
+            },
+        );
+        let smf = parse(&bytes);
+        for (_, kind) in track_events(&smf) {
+            if let TrackEventKind::Midi { channel, message } = kind {
+                assert_eq!(channel.as_int(), 0);
+                if let MidiMessage::NoteOn { vel, .. } | MidiMessage::NoteOff { vel, .. } = message
+                {
+                    assert_eq!(vel.as_int(), 127);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn to_midi_bytes_matches_to_midi_bytes_with_default_options() {
+        let notes = [note(0.0, 1.0, 60), note(1.0, 0.5, 69)];
+        assert_eq!(
+            to_midi_bytes(&notes, 120.0),
+            to_midi_bytes_with(&notes, 120.0, &MidiOptions::default())
         );
     }
 }
