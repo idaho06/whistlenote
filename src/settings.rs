@@ -8,7 +8,12 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::dsp::onset::OnsetConfig;
+use crate::dsp::pitch::PitchConfig;
+use crate::engine::{AnalysisConfig, ClickSound};
+use crate::export::midi::MidiOptions;
 use crate::music::quantize::Grid;
+use crate::music::segment::SegmentConfig;
 
 /// Version of the settings format.
 pub const VERSION: u32 = 1;
@@ -353,9 +358,11 @@ pub mod range {
     use std::ops::RangeInclusive;
 
     /// Latency offset in milliseconds.
-    pub const LATENCY_MS: RangeInclusive<f64> = -200.0..=200.0;
+    pub const LATENCY_MS: RangeInclusive<f64> =
+        -crate::engine::MAX_LATENCY_MS..=crate::engine::MAX_LATENCY_MS;
     /// Recording tempo in beats per minute.
-    pub const RECORD_BPM: RangeInclusive<f64> = 40.0..=220.0;
+    pub const RECORD_BPM: RangeInclusive<f64> =
+        crate::music::bpm::MIN_BPM..=crate::music::bpm::MAX_BPM;
 
     /// Reference pitch of A4 in Hz.
     pub const A4_HZ: RangeInclusive<f64> = 415.0..=466.0;
@@ -427,6 +434,11 @@ pub mod range {
     pub const VELOCITY: RangeInclusive<u32> = 1..=127;
     /// MIDI channel, 1-based.
     pub const CHANNEL: RangeInclusive<u32> = 1..=16;
+}
+
+/// Converts a level in dBFS to an RMS amplitude: `10^(dbfs / 20)`. For example, -40 dBFS is 0.01 and 0 dBFS is 1.0.
+pub fn dbfs_to_rms(dbfs: f64) -> f32 {
+    10.0_f64.powf(dbfs / 20.0) as f32
 }
 
 impl Settings {
@@ -527,6 +539,57 @@ impl Tuning {
             tempo: self.tempo.sanitized(),
             live: self.live.sanitized(),
             export: self.export.sanitized(),
+        }
+    }
+
+    /// Returns the engine's analysis settings for these tuning values: the pitch tracker and onset detector with dBFS levels converted to RMS amplitudes and milliseconds to seconds, and the recording pre-roll in seconds.
+    pub fn analysis(&self) -> AnalysisConfig {
+        AnalysisConfig {
+            pitch: PitchConfig {
+                silence_rms: dbfs_to_rms(self.pitch.silence_dbfs),
+                clarity: self.pitch.clarity as f32,
+                min_freq_hz: self.pitch.min_hz as f32,
+                max_freq_hz: self.pitch.max_hz as f32,
+                band_low_hz: self.pitch.band_low_hz as f32,
+                band_high_hz: self.pitch.band_high_hz as f32,
+            },
+            onset: OnsetConfig {
+                gate_rms: dbfs_to_rms(self.onsets.gate_dbfs),
+                threshold_offset: self.onsets.threshold,
+                refractory_s: self.onsets.refractory_ms / 1000.0,
+                high_pass_hz: self.onsets.high_pass_hz as f32,
+                flux_history_s: self.onsets.history_ms / 1000.0,
+            },
+            pre_roll_s: self.timing.pre_roll_ms / 1000.0,
+        }
+    }
+
+    /// Returns the metronome click sound for these tuning values, with the volume percent converted to a peak amplitude in 0..=1.
+    pub fn click_sound(&self) -> ClickSound {
+        ClickSound {
+            volume: (self.metronome.volume_percent / 100.0) as f32,
+            accent_hz: self.metronome.accent_hz as f32,
+            beat_hz: self.metronome.beat_hz as f32,
+        }
+    }
+
+    /// Returns the note segmentation settings for these tuning values, with the durations in seconds and the median window in voiced frames.
+    pub fn segment(&self) -> SegmentConfig {
+        SegmentConfig {
+            min_confidence: self.voicing.min_confidence as f32,
+            min_note_s: self.notes.min_note_ms / 1000.0,
+            median_window: self.notes.median_frames as usize,
+            max_gap_s: self.notes.max_gap_ms / 1000.0,
+            merge_note_s: self.notes.merge_note_ms / 1000.0,
+            a4_hz: self.voicing.a4_hz as f32,
+        }
+    }
+
+    /// Returns the MIDI export options for these tuning values: the velocity clamped to 1..=127 and the 1-based channel converted to the zero-based MIDI channel.
+    pub fn midi(&self) -> MidiOptions {
+        MidiOptions {
+            velocity: self.export.velocity.clamp(1, 127) as u8,
+            channel: (self.export.channel.clamp(1, 16) - 1) as u8,
         }
     }
 }
@@ -713,6 +776,96 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// Asserts that the f32 values `a` and `b` differ by at most 1e-5.
+    fn assert_close_f32(a: f32, b: f32) {
+        assert!(
+            (a - b).abs() <= 1e-5,
+            "{a} and {b} differ by more than 1e-5"
+        );
+    }
+
+    /// Asserts that the f64 values `a` and `b` differ by at most 1e-9.
+    fn assert_close_f64(a: f64, b: f64) {
+        assert!(
+            (a - b).abs() <= 1e-9,
+            "{a} and {b} differ by more than 1e-9"
+        );
+    }
+
+    #[test]
+    fn default_tuning_converts_to_the_library_defaults() {
+        let tuning = Tuning::default();
+
+        let analysis = tuning.analysis();
+        let expected = AnalysisConfig::default();
+        assert_close_f32(analysis.pitch.silence_rms, expected.pitch.silence_rms);
+        assert_close_f32(analysis.pitch.clarity, expected.pitch.clarity);
+        assert_close_f32(analysis.pitch.min_freq_hz, expected.pitch.min_freq_hz);
+        assert_close_f32(analysis.pitch.max_freq_hz, expected.pitch.max_freq_hz);
+        assert_close_f32(analysis.pitch.band_low_hz, expected.pitch.band_low_hz);
+        assert_close_f32(analysis.pitch.band_high_hz, expected.pitch.band_high_hz);
+        assert_close_f32(analysis.onset.gate_rms, expected.onset.gate_rms);
+        assert_close_f64(
+            analysis.onset.threshold_offset,
+            expected.onset.threshold_offset,
+        );
+        assert_close_f64(analysis.onset.refractory_s, expected.onset.refractory_s);
+        assert_close_f32(analysis.onset.high_pass_hz, expected.onset.high_pass_hz);
+        assert_close_f64(analysis.onset.flux_history_s, expected.onset.flux_history_s);
+        assert_close_f64(analysis.pre_roll_s, expected.pre_roll_s);
+
+        let click = tuning.click_sound();
+        let expected = ClickSound::default();
+        assert_close_f32(click.volume, expected.volume);
+        assert_close_f32(click.accent_hz, expected.accent_hz);
+        assert_close_f32(click.beat_hz, expected.beat_hz);
+
+        let segment = tuning.segment();
+        let expected = SegmentConfig::default();
+        assert_close_f32(segment.min_confidence, expected.min_confidence);
+        assert_close_f64(segment.min_note_s, expected.min_note_s);
+        assert_eq!(segment.median_window, expected.median_window);
+        assert_close_f64(segment.max_gap_s, expected.max_gap_s);
+        assert_close_f64(segment.merge_note_s, expected.merge_note_s);
+        assert_close_f32(segment.a4_hz, expected.a4_hz);
+
+        assert_eq!(tuning.midi(), MidiOptions::default());
+    }
+
+    #[test]
+    fn dbfs_converts_to_rms() {
+        assert!((dbfs_to_rms(-40.0) - 0.01).abs() <= 1e-6);
+        assert!((dbfs_to_rms(0.0) - 1.0).abs() <= 1e-6);
+        assert!((dbfs_to_rms(-20.0) - 0.1).abs() <= 1e-6);
+    }
+
+    #[test]
+    fn export_channel_1_is_midi_channel_0() {
+        for (export_channel, midi_channel) in [(10, 9), (1, 0), (16, 15)] {
+            let mut tuning = Tuning::default();
+            tuning.export.channel = export_channel;
+            assert_eq!(tuning.midi().channel, midi_channel);
+        }
+    }
+
+    #[test]
+    fn a_custom_tuning_converts_its_units() {
+        let mut tuning = Tuning::default();
+        tuning.timing.pre_roll_ms = 250.0;
+        tuning.onsets.refractory_ms = 50.0;
+        tuning.metronome.volume_percent = 25.0;
+        tuning.notes.merge_note_ms = 30.0;
+        tuning.voicing.a4_hz = 432.0;
+
+        let analysis = tuning.analysis();
+        assert_close_f64(analysis.pre_roll_s, 0.25);
+        assert_close_f64(analysis.onset.refractory_s, 0.05);
+        assert_close_f32(tuning.click_sound().volume, 0.25);
+        let segment = tuning.segment();
+        assert_close_f64(segment.merge_note_s, 0.03);
+        assert_eq!(segment.a4_hz, 432.0_f32);
     }
 
     #[test]
