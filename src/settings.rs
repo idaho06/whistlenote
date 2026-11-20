@@ -1,13 +1,27 @@
-//! The user's settings: the session restored at start and the tuning values of the preferences window, in the units the window shows (dBFS for levels, milliseconds for short times, Hz for frequencies). [`Settings::sanitized`] brings every value into its range.
+//! The user's settings: the session restored at start and the tuning values of the preferences window, in the units the window shows (dBFS for levels, milliseconds for short times, Hz for frequencies). [`Settings::sanitized`] brings every value into its range. The settings live in [`FILE_NAME`] in the user's configuration directory ([`default_path`]); [`Settings::load_from`] and [`Settings::save_to`] read and write them as TOML.
 
+use std::fs;
+use std::io;
 use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
 
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::music::quantize::Grid;
 
 /// Version of the settings format.
 pub const VERSION: u32 = 1;
+
+/// Name of the settings file in the user's configuration directory.
+pub const FILE_NAME: &str = "settings.toml";
+
+/// Returns the path of the settings file in the user's configuration directory, or `None` when there is no home directory.
+///
+/// The path is `$XDG_CONFIG_HOME/whistlenote/settings.toml` or `~/.config/whistlenote/settings.toml` on Linux, `%APPDATA%\whistlenote\config\settings.toml` on Windows, and `~/Library/Application Support/whistlenote/settings.toml` on macOS.
+pub fn default_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "whistlenote").map(|dirs| dirs.config_dir().join(FILE_NAME))
+}
 
 /// The user's settings: the session restored at start and the tuning values of the preferences window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,6 +430,65 @@ pub mod range {
 }
 
 impl Settings {
+    /// Reads the settings from the TOML file at `path` and returns them together with a warning for the user.
+    ///
+    /// A missing file gives the defaults and no warning; any other read error gives the defaults and a warning. A file whose text does not parse as `Settings` is renamed to a sibling file with ".invalid" appended and the defaults are used with a warning. A parsed file is returned [`sanitized`](Settings::sanitized) and gives no warning.
+    pub fn load_from(path: &Path) -> (Settings, Option<String>) {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return (Settings::default(), None);
+            }
+            Err(error) => {
+                return (
+                    Settings::default(),
+                    Some(format!(
+                        "Cannot read the settings file {}: {error}; using the defaults",
+                        path.display()
+                    )),
+                );
+            }
+        };
+        match toml::from_str::<Settings>(&text) {
+            Ok(settings) => (settings.sanitized(), None),
+            Err(error) => {
+                let message = error.to_string().replace('\n', " ");
+                let message = message.trim();
+                let invalid = invalid_path(path);
+                match fs::rename(path, &invalid) {
+                    Ok(()) => (
+                        Settings::default(),
+                        Some(format!(
+                            "The settings file {} is invalid ({message}); it is kept as {} and the defaults are used",
+                            path.display(),
+                            invalid.display()
+                        )),
+                    ),
+                    Err(rename_error) => (
+                        Settings::default(),
+                        Some(format!(
+                            "The settings file {} is invalid ({message}) and cannot be renamed ({rename_error}); the defaults are used",
+                            path.display()
+                        )),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Writes the settings as pretty TOML to the file at `path`, creating the parent directory when it is missing.
+    ///
+    /// The text is written to a temporary sibling file with ".tmp" appended and renamed onto `path`, so the file is replaced in one step.
+    pub fn save_to(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self).map_err(io::Error::other)?;
+        let tmp = tmp_path(path);
+        fs::write(&tmp, text)?;
+        fs::rename(&tmp, path)
+    }
+
     /// Returns the settings with every value in its range.
     ///
     /// A float that is not finite takes its field's default, then it is clamped into its range; an integer is clamped. `version` becomes [`VERSION`]. An input or output that is `Some` of an empty or whitespace-only string becomes `None`. After the per-field clamps, `band_low_hz` and `band_high_hz` both take their defaults when `band_low_hz >= band_high_hz`, `min_hz` is clamped up to `band_low_hz` and `max_hz` down to `band_high_hz`, and when `min_hz >= max_hz` all four take their defaults. `min_bpm` and `max_bpm` both take their defaults when `max_bpm < 2.0 * min_bpm`.
@@ -610,9 +683,37 @@ fn device_name(name: Option<String>) -> Option<String> {
     }
 }
 
+/// Returns the path an invalid settings file is kept as: the file name of `path` with ".invalid" appended (`settings.toml.invalid`).
+fn invalid_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map_or_else(|| FILE_NAME.into(), |name| name.to_string_lossy());
+    path.with_file_name(format!("{name}.invalid"))
+}
+
+/// Returns the path the settings are temporarily written to before the rename onto `path`: the file name of `path` with ".tmp" appended (`settings.toml.tmp`).
+fn tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map_or_else(|| FILE_NAME.into(), |name| name.to_string_lossy());
+    path.with_file_name(format!("{name}.tmp"))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
+
+    /// Returns a fresh scratch directory for the test `name` in the temporary directory.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "whistlenote-settings-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
 
     #[test]
     fn defaults_are_already_sanitized() {
@@ -749,5 +850,89 @@ mod tests {
             toml::Value::try_from(GridSetting::Sixteenth).unwrap(),
             toml::Value::String("sixteenth".to_string())
         );
+    }
+
+    #[test]
+    fn a_missing_file_gives_the_defaults_without_a_warning() {
+        let dir = scratch_dir("missing");
+        let (settings, warning) = Settings::load_from(&dir.join(FILE_NAME));
+        assert_eq!(settings, Settings::default());
+        assert_eq!(warning, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_settings_load_back() {
+        let dir = scratch_dir("load-back");
+        let mut settings = Settings::default();
+        settings.session.input = Some("USB Mic".to_string());
+        settings.tuning.voicing.a4_hz = 432.0;
+        settings.tuning.export.channel = 10;
+        let path = dir.join("sub").join(FILE_NAME);
+        settings.save_to(&path).unwrap();
+        assert!(dir.join("sub").is_dir());
+        let (loaded, warning) = Settings::load_from(&path);
+        assert_eq!(loaded, settings);
+        assert_eq!(warning, None);
+        assert!(!tmp_path(&path).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_replaces_an_existing_file() {
+        let dir = scratch_dir("replace");
+        let path = dir.join(FILE_NAME);
+        Settings::default().save_to(&path).unwrap();
+        let mut settings = Settings::default();
+        settings.tuning.voicing.a4_hz = 442.0;
+        settings.save_to(&path).unwrap();
+        let (loaded, warning) = Settings::load_from(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.tuning.voicing.a4_hz, 442.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_file_is_renamed_and_the_defaults_are_used() {
+        let dir = scratch_dir("invalid");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        fs::write(&path, "this is = = not toml").unwrap();
+        let (settings, warning) = Settings::load_from(&path);
+        assert_eq!(settings, Settings::default());
+        let warning = warning.expect("an invalid file gives a warning");
+        assert!(
+            warning.contains("settings.toml.invalid"),
+            "unexpected warning: {warning}"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("settings.toml.invalid")).unwrap(),
+            "this is = = not toml"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn out_of_range_values_in_the_file_are_sanitized() {
+        let dir = scratch_dir("out-of-range");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        fs::write(&path, "[tuning.voicing]\na4_hz = 1000.0\n").unwrap();
+        let (settings, warning) = Settings::load_from(&path);
+        assert_eq!(warning, None);
+        assert_eq!(settings.tuning.voicing.a4_hz, 466.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_default_path_ends_in_the_settings_file() {
+        if let Some(path) = default_path() {
+            assert_eq!(path.file_name(), Some(OsStr::new(FILE_NAME)));
+            assert!(
+                path.components()
+                    .any(|component| component.as_os_str() == "whistlenote")
+            );
+        }
     }
 }
