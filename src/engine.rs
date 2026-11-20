@@ -34,9 +34,35 @@ pub use crate::metronome::BeatPhase;
 /// Capacity of the live frame channel; frames are dropped when it is full.
 pub const LIVE_CAPACITY: usize = 256;
 
-/// How far before the recording origin the frames of a recording are kept,
-/// in seconds.
+/// Default of [`AnalysisConfig::pre_roll_s`]: how far before the recording
+/// origin the frames of a recording are kept, in seconds.
 pub const PRE_ROLL_S: f64 = 0.1;
+
+/// The largest absolute latency offset in milliseconds.
+pub const MAX_LATENCY_MS: f64 = 200.0;
+
+/// Settings of the analysis on the engine thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnalysisConfig {
+    /// Settings of the pitch tracker.
+    pub pitch: PitchConfig,
+    /// Settings of the onset detector.
+    pub onset: OnsetConfig,
+    /// How far before the recording origin the frames of a recording are kept, in seconds.
+    pub pre_roll_s: f64,
+}
+
+impl Default for AnalysisConfig {
+    /// The default pitch and onset settings, and a pre-roll of
+    /// [`PRE_ROLL_S`] seconds.
+    fn default() -> Self {
+        Self {
+            pitch: PitchConfig::default(),
+            onset: OnsetConfig::default(),
+            pre_roll_s: PRE_ROLL_S,
+        }
+    }
+}
 
 /// One live pitch frame with the level of the input block that produced it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,11 +170,18 @@ pub enum EngineCommand {
     /// a recording it sends nothing.
     StopRecording,
     /// Sets the latency offset in milliseconds that is added to the origin
-    /// of a recording, clamped to -200..=200; it applies to recordings
-    /// whose origin is not set yet.
+    /// of a recording, clamped to ±[`MAX_LATENCY_MS`]; it applies to
+    /// recordings whose origin is not set yet.
     SetLatencyMs(
         /// Latency offset in milliseconds.
         f64,
+    ),
+    /// Sets the analysis settings. An open input applies the pitch and
+    /// onset settings in place, without losing its partial analysis
+    /// windows; a running recording keeps the pre-roll it started with.
+    SetAnalysis(
+        /// The analysis settings.
+        AnalysisConfig,
     ),
     /// Reports the current device lists as an [`EngineEvent::Devices`]
     /// event; before the lists are emitted, a lost input is reopened while
@@ -184,6 +217,7 @@ impl Engine {
                     input_name: None,
                     listening: false,
                     input: None,
+                    analysis: AnalysisConfig::default(),
                     reported_input_rate: None,
                     output_name: None,
                     free_bpm: 120.0,
@@ -244,6 +278,8 @@ struct Worker {
     input_name: Option<String>,
     listening: bool,
     input: Option<Input>,
+    /// The analysis settings applied to the input and to new recordings.
+    analysis: AnalysisConfig,
     /// The input rate last sent as an event.
     reported_input_rate: Option<u32>,
     output_name: Option<String>,
@@ -283,6 +319,9 @@ struct Output {
 struct Recording {
     /// Duration of one pitch analysis window of the input, in seconds.
     window_s: f64,
+    /// How far before the origin the frames of this recording are kept, in
+    /// seconds; set when the recording starts.
+    pre_roll_s: f64,
     /// The CountIn beat with index 0 of this recording arrived.
     count_in_seen: bool,
     /// Engine-clock time of the recording origin, set when the Recording
@@ -294,17 +333,18 @@ struct Recording {
     frames: Vec<PitchFrame>,
 }
 
-/// Keeps the frames from [`PRE_ROLL_S`] before `origin_s` and leaves out
+/// Keeps the frames from `pre_roll_s` before `origin_s` and leaves out
 /// every kept frame whose analysis window overlaps a click of `clicks`.
 fn finish_frames(
     frames: Vec<PitchFrame>,
     origin_s: f64,
+    pre_roll_s: f64,
     clicks: &[f64],
     window_s: f64,
 ) -> Vec<PitchFrame> {
     frames
         .into_iter()
-        .filter(|frame| frame.time_s >= origin_s - PRE_ROLL_S)
+        .filter(|frame| frame.time_s >= origin_s - pre_roll_s)
         .filter(|frame| {
             !clicks.iter().any(|&click| {
                 click - window_s / 2.0 <= frame.time_s
@@ -348,11 +388,11 @@ fn new_drops(total: u64, reported: &mut u64) -> Option<u64> {
 }
 
 /// Returns the pitch tracker and the onset detector for input at
-/// `sample_rate` Hz.
-fn analysers(sample_rate: u32) -> (PitchTracker, OnsetDetector) {
+/// `sample_rate` Hz with the settings of `analysis`.
+fn analysers(sample_rate: u32, analysis: &AnalysisConfig) -> (PitchTracker, OnsetDetector) {
     (
-        PitchTracker::new(sample_rate, PitchConfig::default()),
-        OnsetDetector::new(sample_rate, OnsetConfig::default()),
+        PitchTracker::new(sample_rate, analysis.pitch),
+        OnsetDetector::new(sample_rate, analysis.onset),
     )
 }
 
@@ -441,7 +481,14 @@ impl Worker {
             EngineCommand::StopRecording => self.finish_recording(),
             EngineCommand::SetLatencyMs(ms) => {
                 if ms.is_finite() {
-                    self.latency_s = ms.clamp(-200.0, 200.0) / 1000.0;
+                    self.latency_s = ms.clamp(-MAX_LATENCY_MS, MAX_LATENCY_MS) / 1000.0;
+                }
+            }
+            EngineCommand::SetAnalysis(config) => {
+                self.analysis = config;
+                if let Some(input) = &mut self.input {
+                    input.pitch.set_config(config.pitch);
+                    input.onset.set_config(config.onset);
                 }
             }
             EngineCommand::RefreshDevices => {
@@ -517,7 +564,7 @@ impl Worker {
                     device_label(self.input_name.as_deref()),
                     stream.sample_rate()
                 );
-                let (pitch, onset) = analysers(stream.sample_rate());
+                let (pitch, onset) = analysers(stream.sample_rate(), &self.analysis);
                 self.input = Some(Input {
                     stream,
                     reader,
@@ -614,6 +661,7 @@ impl Worker {
             log::debug!("recording count-in: {bpm} bpm, clicks {clicks}");
             self.recording = Some(Recording {
                 window_s,
+                pre_roll_s: self.analysis.pre_roll_s,
                 count_in_seen: false,
                 origin_s: None,
                 clicks: Vec::new(),
@@ -640,6 +688,7 @@ impl Worker {
                 let frames = finish_frames(
                     recording.frames,
                     origin_s,
+                    recording.pre_roll_s,
                     &recording.clicks,
                     recording.window_s,
                 );
@@ -691,6 +740,7 @@ impl Worker {
     /// Reads every waiting input block, turns it into live frames and onset
     /// events, and reports dropped samples once per increase.
     fn drain_input(&mut self) {
+        let analysis = self.analysis;
         let Some(input) = &mut self.input else {
             return;
         };
@@ -700,7 +750,7 @@ impl Worker {
                 input.onset.reset();
             }
             if header.sample_rate != input.pitch.sample_rate() {
-                (input.pitch, input.onset) = analysers(header.sample_rate);
+                (input.pitch, input.onset) = analysers(header.sample_rate, &analysis);
             }
             let level = rms(&input.block);
             input
@@ -1501,7 +1551,7 @@ mod tests {
                 confidence: 0.9,
             })
             .collect();
-        let finished = finish_frames(frames, 2.0, &[2.0, 2.5], 0.04);
+        let finished = finish_frames(frames, 2.0, PRE_ROLL_S, &[2.0, 2.5], 0.04);
         assert_close(finished[0].time_s, 1.9, 1e-9);
         for t in [1.99, 2.0, 2.03, 2.5] {
             assert!(
@@ -1520,6 +1570,103 @@ mod tests {
             assert_eq!(frame.freq_hz, Some(1000.0), "the frame at {t} is voiced");
             assert_eq!(frame.confidence, 0.9);
         }
+    }
+
+    #[test]
+    fn finish_frames_keeps_the_given_pre_roll() {
+        // Frames at 1.80, 1.85, …, 2.20, in 0.05 s steps.
+        let frames: Vec<PitchFrame> = (0..=8)
+            .map(|i| PitchFrame {
+                time_s: 1.8 + i as f64 * 0.05,
+                freq_hz: Some(440.0),
+                confidence: 0.9,
+            })
+            .collect();
+
+        let without_pre_roll = finish_frames(frames.clone(), 2.0, 0.0, &[], 0.04);
+        let expected = frames
+            .iter()
+            .filter(|frame| frame.time_s >= 2.0 - 0.0)
+            .count();
+        assert_eq!(without_pre_roll.len(), expected);
+
+        let with_pre_roll = finish_frames(frames.clone(), 2.0, 0.12, &[], 0.04);
+        let expected = frames
+            .iter()
+            .filter(|frame| frame.time_s >= 2.0 - 0.12)
+            .count();
+        assert_eq!(with_pre_roll.len(), expected);
+        assert!(
+            with_pre_roll.len() > without_pre_roll.len(),
+            "the pre-roll keeps more frames: {} vs {}",
+            with_pre_roll.len(),
+            without_pre_roll.len()
+        );
+    }
+
+    #[test]
+    fn set_analysis_applies_a_silence_level_to_the_open_input() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::StartListening);
+        wait_input_open(&handle);
+
+        // A 0.05 sine has a window RMS of about 0.035, above the default
+        // silence level of 0.002.
+        handle.push_input(&sine(440.0, 0.05, 48_000, 24_000));
+        handle.step_n(94);
+        sync(&engine);
+        let voiced = engine
+            .live()
+            .try_iter()
+            .filter(|frame| frame.freq_hz.is_some())
+            .count();
+        assert!(voiced > 0, "a voiced live frame before the change");
+
+        engine.send(EngineCommand::SetAnalysis(AnalysisConfig {
+            pitch: PitchConfig {
+                silence_rms: 0.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        sync(&engine);
+        // Drain the live channel, so the frames collected next come from
+        // the second tone only.
+        let _drained: Vec<LiveFrame> = engine.live().try_iter().collect();
+
+        handle.push_input(&sine(440.0, 0.05, 48_000, 24_000));
+        handle.step_n(94);
+        sync(&engine);
+        let frames: Vec<LiveFrame> = engine.live().try_iter().collect();
+        assert!(!frames.is_empty(), "live frames after the change");
+        assert!(
+            frames.iter().all(|frame| frame.freq_hz.is_none()),
+            "every frame is unvoiced: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn set_analysis_before_listening_applies_when_the_input_opens() {
+        let (engine, handle) = spawn_engine();
+        engine.send(EngineCommand::SetAnalysis(AnalysisConfig {
+            pitch: PitchConfig {
+                silence_rms: 0.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        engine.send(EngineCommand::StartListening);
+        wait_input_open(&handle);
+
+        handle.push_input(&sine(440.0, 0.05, 48_000, 24_000));
+        handle.step_n(94);
+        sync(&engine);
+        let frames: Vec<LiveFrame> = engine.live().try_iter().collect();
+        assert!(!frames.is_empty(), "live frames");
+        assert!(
+            frames.iter().all(|frame| frame.freq_hz.is_none()),
+            "every frame is unvoiced: {frames:?}"
+        );
     }
 
     #[test]

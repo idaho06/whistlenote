@@ -9,8 +9,7 @@ use crate::ui::bpm_mode::BpmState;
 use crate::ui::live::{CLEAR_S, NoteSmoother, ShownNote};
 use crate::ui::record_mode::RecordState;
 
-/// The largest absolute latency offset in milliseconds.
-pub(crate) const MAX_LATENCY_MS: f64 = 200.0;
+pub(crate) use crate::engine::MAX_LATENCY_MS;
 
 /// Returns the label of an input rate in Hz: whole kHz without decimals, otherwise one decimal rounded, for example "48 kHz" for 48_000 and "44.1 kHz" for 44_100.
 pub fn rate_label(rate_hz: u32) -> String {
