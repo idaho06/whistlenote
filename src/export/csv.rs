@@ -1,6 +1,6 @@
 //! CSV export.
 
-use crate::music::note::{midi_to_freq, midi_to_name};
+use crate::music::note::{A4_HZ, midi_to_freq_at, midi_to_name};
 use crate::music::quantize::QuantNote;
 use std::fmt::Write;
 
@@ -9,6 +9,13 @@ const HEADER: &str = "start_beat,length_beats,note,midi,freq_hz\n";
 
 /// Formats notes as CSV text with a header line and one row per note.
 pub fn to_csv(notes: &[QuantNote]) -> String {
+    to_csv_at(notes, A4_HZ)
+}
+
+/// Formats notes as CSV text with a header line and one row per note.
+///
+/// The `freq_hz` column follows `a4_hz`: MIDI note 69 (A4) is `a4_hz`.
+pub fn to_csv_at(notes: &[QuantNote], a4_hz: f32) -> String {
     let mut csv = String::from(HEADER);
     for note in notes {
         writeln!(
@@ -18,7 +25,7 @@ pub fn to_csv(notes: &[QuantNote]) -> String {
             note.length_beats,
             midi_to_name(i32::from(note.midi)),
             note.midi,
-            midi_to_freq(f32::from(note.midi)),
+            midi_to_freq_at(f32::from(note.midi), a4_hz),
         )
         .expect("writing to a String is infallible");
     }
@@ -59,6 +66,14 @@ mod tests {
         assert_eq!(
             to_csv(&[note(0.0, 1.0, 61)]),
             "start_beat,length_beats,note,midi,freq_hz\n0.0000,1.0000,C#4,61,277.18\n"
+        );
+    }
+
+    #[test]
+    fn to_csv_at_writes_the_freq_column_for_the_given_a4() {
+        assert_eq!(
+            to_csv_at(&[note(0.0, 1.0, 69)], 432.0),
+            "start_beat,length_beats,note,midi,freq_hz\n0.0000,1.0000,A4,69,432.00\n"
         );
     }
 }

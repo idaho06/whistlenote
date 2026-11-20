@@ -26,6 +26,8 @@ pub struct SegmentConfig {
     pub max_gap_s: f64,
     /// Duration in seconds below which a note that touches a neighbouring note merges into it.
     pub merge_note_s: f64,
+    /// Frequency in Hz of A4, the reference pitch of the MIDI note numbers.
+    pub a4_hz: f32,
 }
 
 impl Default for SegmentConfig {
@@ -36,6 +38,7 @@ impl Default for SegmentConfig {
             median_window: 5,
             max_gap_s: 0.04,
             merge_note_s: 0.1,
+            a4_hz: crate::music::note::A4_HZ,
         }
     }
 }
@@ -116,7 +119,7 @@ fn voiced_midi(frame: &PitchFrame, cfg: &SegmentConfig) -> Option<i32> {
         return None;
     }
     let hz = frame.freq_hz?;
-    crate::music::note::from_freq(hz).map(|reading| reading.midi)
+    crate::music::note::from_freq_at(hz, cfg.a4_hz).map(|reading| reading.midi)
 }
 
 /// Groups pitch frames into notes.
@@ -522,6 +525,46 @@ mod tests {
         assert_eq!(notes[0].midi, 69);
         assert_close(notes[0].start_s, 0.0, 1e-9);
         assert_close(notes[0].end_s, 1.08, 1e-9);
+    }
+
+    #[test]
+    fn a_432_hz_reference_reads_a_432_hz_tone_as_a4() {
+        let tone = |freq_hz| {
+            (0..20)
+                .map(|i| PitchFrame {
+                    time_s: i as f64 * 0.01,
+                    freq_hz: Some(freq_hz),
+                    confidence: 0.95,
+                })
+                .collect::<Vec<_>>()
+        };
+        let at_432 = SegmentConfig {
+            a4_hz: 432.0,
+            ..SegmentConfig::default()
+        };
+
+        let notes = segment(&tone(432.0), &at_432);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+
+        // At 440 Hz a 432 Hz tone is only 31.8 cents flat, which still rounds to 69.
+        let notes = segment(&tone(432.0), &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
+
+        // At 440 Hz a 415.3 Hz tone reads G#4, but it is A4 at a 415.3 Hz reference.
+        let notes = segment(&tone(415.3), &SegmentConfig::default());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 68);
+        let notes = segment(
+            &tone(415.3),
+            &SegmentConfig {
+                a4_hz: 415.3,
+                ..SegmentConfig::default()
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].midi, 69);
     }
 
     #[test]

@@ -11,31 +11,56 @@ pub struct NoteReading {
 
 /// MIDI note number of A4, the reference pitch.
 const A4_MIDI: f32 = 69.0;
-/// Frequency in Hz of A4, the reference pitch.
-const A4_HZ: f32 = 440.0;
+/// Default frequency in Hz of A4, the reference pitch.
+pub const A4_HZ: f32 = 440.0;
 
 /// Returns the frequency in Hz of a (possibly fractional) MIDI note number.
 ///
 /// MIDI note 69 (A4) is 440.0 Hz.
 pub fn midi_to_freq(midi: f32) -> f32 {
-    A4_HZ * 2.0_f32.powf((midi - A4_MIDI) / 12.0)
+    midi_to_freq_at(midi, A4_HZ)
+}
+
+/// Returns the frequency in Hz of a (possibly fractional) MIDI note number
+/// when A4 is `a4_hz` Hz.
+///
+/// MIDI note 69 (A4) is `a4_hz`.
+pub fn midi_to_freq_at(midi: f32, a4_hz: f32) -> f32 {
+    a4_hz * 2.0_f32.powf((midi - A4_MIDI) / 12.0)
 }
 
 /// Returns the fractional MIDI note number of a frequency in Hz.
 ///
-/// This is the inverse of [`midi_to_freq`].
+/// This is the inverse of [`midi_to_freq`]. MIDI note 69 (A4) is 440.0 Hz.
 pub fn freq_to_midi_float(hz: f32) -> f32 {
-    A4_MIDI + 12.0 * (hz / A4_HZ).log2()
+    freq_to_midi_float_at(hz, A4_HZ)
+}
+
+/// Returns the fractional MIDI note number of a frequency in Hz when A4 is
+/// `a4_hz` Hz.
+///
+/// This is the inverse of [`midi_to_freq_at`]. MIDI note 69 (A4) is `a4_hz`.
+pub fn freq_to_midi_float_at(hz: f32, a4_hz: f32) -> f32 {
+    A4_MIDI + 12.0 * (hz / a4_hz).log2()
 }
 
 /// Returns the nearest note of a frequency in Hz.
 ///
 /// Returns `None` when `hz` is not finite or is below 1 Hz.
+/// MIDI note 69 (A4) is 440.0 Hz.
 pub fn from_freq(hz: f32) -> Option<NoteReading> {
-    if !hz.is_finite() || hz < 1.0 {
+    from_freq_at(hz, A4_HZ)
+}
+
+/// Returns the nearest note of a frequency in Hz when A4 is `a4_hz` Hz.
+///
+/// Returns `None` when `hz` is not finite or is below 1 Hz, or when `a4_hz`
+/// is not finite or not positive. MIDI note 69 (A4) is `a4_hz`.
+pub fn from_freq_at(hz: f32, a4_hz: f32) -> Option<NoteReading> {
+    if !hz.is_finite() || hz < 1.0 || !a4_hz.is_finite() || a4_hz <= 0.0 {
         return None;
     }
-    let float = freq_to_midi_float(hz);
+    let float = freq_to_midi_float_at(hz, a4_hz);
     let midi = float.round() as i32;
     let cents = ((float - midi as f32) * 100.0).clamp(-50.0, 50.0);
     Some(NoteReading { midi, cents })
@@ -105,6 +130,39 @@ mod tests {
     #[test]
     fn midi_to_freq_uses_440_hz_at_a4() {
         assert!((midi_to_freq(69.0) - 440.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn midi_to_freq_at_uses_the_given_a4() {
+        assert_eq!(midi_to_freq_at(69.0, 432.0), 432.0);
+        assert!((midi_to_freq_at(81.0, 432.0) - 864.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn freq_to_midi_float_at_uses_the_given_a4() {
+        assert!((freq_to_midi_float_at(432.0, 432.0) - 69.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn from_freq_at_reads_440_hz_as_about_32_cents_above_a_432() {
+        let reading = from_freq_at(440.0, 432.0).expect("440 Hz is a valid frequency");
+        assert_eq!(reading.midi, 69);
+        // 1200 * log2(440 / 432) = 31.77 cents.
+        assert!(
+            (reading.cents - 31.8).abs() < 0.1,
+            "cents: {}",
+            reading.cents
+        );
+    }
+
+    #[test]
+    fn from_freq_at_rejects_non_positive_and_non_finite_a4() {
+        for a4_hz in [0.0, -440.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                from_freq_at(440.0, a4_hz).is_none(),
+                "from_freq_at(440.0, {a4_hz}) returns None"
+            );
+        }
     }
 
     #[test]
