@@ -1,8 +1,10 @@
 //! The audio backend for real devices, built on `cpal`.
 //!
-//! Streams use each device's default configuration. Input is averaged to mono
-//! and output is copied to every channel; any sample format is converted to
-//! and from `f32`. The callbacks neither allocate nor lock.
+//! Streams use each device's default configuration, except that input asks
+//! for a supported configuration at 44.1 kHz or higher when the default
+//! input rate is lower. Input is averaged to mono and output is copied to
+//! every channel; any sample format is converted to and from `f32`. The
+//! callbacks neither allocate nor lock.
 //!
 //! Stream timestamps map onto the engine clock through a per-stream anchor:
 //! during the first callbacks of a stream, the pair of host callback instant
@@ -17,7 +19,8 @@ use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    Device, ErrorKind, FromSample, I24, Sample, SampleFormat, SizedSample, StreamConfig, U24,
+    Device, ErrorKind, FromSample, I24, Sample, SampleFormat, SizedSample, StreamConfig,
+    SupportedStreamConfig, SupportedStreamConfigRange, U24,
 };
 
 use super::AudioError;
@@ -34,6 +37,12 @@ const ANCHOR_CALLBACKS: u32 = 8;
 
 /// Name used for a device whose description is not available.
 const UNNAMED_DEVICE: &str = "Unnamed device";
+
+/// Lowest input sample rate the backend asks for when the device's default is lower.
+const MIN_INPUT_RATE_HZ: u32 = 44_100;
+
+/// Input sample rates the backend prefers, in order.
+const PREFERRED_INPUT_RATES_HZ: [u32; 2] = [48_000, 44_100];
 
 impl From<cpal::Error> for AudioError {
     fn from(error: cpal::Error) -> Self {
@@ -67,6 +76,10 @@ impl CpalBackend {
 
     /// Opens and starts a stream on the device `name`, with the data
     /// callback `callback`, whose kind sets the stream's direction.
+    ///
+    /// Output uses the device's default configuration. Input uses the
+    /// default too, unless its sample rate is below 44.1 kHz; then a
+    /// supported input configuration at 44.1 kHz or higher is chosen.
     fn open(
         &self,
         name: Option<&str>,
@@ -76,7 +89,31 @@ impl CpalBackend {
         let direction = callback.direction();
         let device = find_device(direction, name)?;
         let supported = match direction {
-            Direction::Input => device.default_input_config()?,
+            Direction::Input => {
+                let default = device.default_input_config()?;
+                if default.sample_rate() < MIN_INPUT_RATE_HZ {
+                    match device.supported_input_configs() {
+                        Ok(ranges) => {
+                            let ranges: Vec<_> = ranges.collect();
+                            let chosen = choose_input_config(default, &ranges);
+                            if chosen != default {
+                                log::info!(
+                                    "input default {} Hz is low; using {} Hz",
+                                    default.sample_rate(),
+                                    chosen.sample_rate()
+                                );
+                            }
+                            chosen
+                        }
+                        Err(error) => {
+                            log::debug!("supported input configs unavailable: {error}");
+                            default
+                        }
+                    }
+                } else {
+                    default
+                }
+            }
             Direction::Output => device.default_output_config()?,
         };
         let config = supported.config();
@@ -225,6 +262,56 @@ fn find_device(direction: Direction, name: Option<&str>) -> Result<Device, Audio
             .map(|(_, device)| device)
             .ok_or_else(|| AudioError::UnknownDevice(name.to_string())),
     }
+}
+
+/// Chooses the input config from the device's supported `ranges` when the
+/// `default` config's sample rate is below `MIN_INPUT_RATE_HZ`.
+///
+/// Ranges with the default's sample format and channel count rank first,
+/// then ranges with the same sample format, then any range. Within the best
+/// rank that covers one of the preferred rates, the first preferred rate a
+/// range covers wins. When no range covers a preferred rate, the range
+/// whose lowest rate at or above `MIN_INPUT_RATE_HZ` is the lowest wins,
+/// with ties going to the better rank. A default at or above
+/// `MIN_INPUT_RATE_HZ`, or a device with no range at or above it, keeps the
+/// default.
+fn choose_input_config(
+    default: SupportedStreamConfig,
+    ranges: &[SupportedStreamConfigRange],
+) -> SupportedStreamConfig {
+    if default.sample_rate() >= MIN_INPUT_RATE_HZ {
+        return default;
+    }
+    let rank = |range: &SupportedStreamConfigRange| {
+        if range.sample_format() == default.sample_format() {
+            if range.channels() == default.channels() {
+                0
+            } else {
+                1
+            }
+        } else {
+            2
+        }
+    };
+    for best in 0..3 {
+        for &rate in &PREFERRED_INPUT_RATES_HZ {
+            if let Some(range) = ranges
+                .iter()
+                .filter(|range| rank(range) == best)
+                .find(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
+            {
+                return range.with_sample_rate(rate);
+            }
+        }
+    }
+    if let Some(range) = ranges
+        .iter()
+        .filter(|range| range.max_sample_rate() >= MIN_INPUT_RATE_HZ)
+        .min_by_key(|range| (range.min_sample_rate().max(MIN_INPUT_RATE_HZ), rank(range)))
+    {
+        return range.with_sample_rate(range.min_sample_rate().max(MIN_INPUT_RATE_HZ));
+    }
+    default
 }
 
 /// Returns whether a stream error is worth reporting; glitches, reroutes
@@ -699,5 +786,95 @@ mod tests {
         output.engine_time_s(5, 5, 1_000_000_000, 0.01);
         let t = output.engine_time_s(5, 5, 2_000_000_000, 0.01);
         assert_close(t, 2.01, 1e-9);
+    }
+
+    fn range(
+        channels: u16,
+        min_sample_rate: u32,
+        max_sample_rate: u32,
+        sample_format: SampleFormat,
+    ) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            channels,
+            min_sample_rate,
+            max_sample_rate,
+            cpal::SupportedBufferSize::Unknown,
+            sample_format,
+        )
+    }
+
+    fn config(
+        channels: u16,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+    ) -> SupportedStreamConfig {
+        SupportedStreamConfig::new(
+            channels,
+            sample_rate,
+            cpal::SupportedBufferSize::Unknown,
+            sample_format,
+        )
+    }
+
+    #[test]
+    fn a_default_at_or_above_44_1_khz_is_kept() {
+        let ranges = [range(2, 8_000, 192_000, SampleFormat::F32)];
+        let default = config(2, 48_000, SampleFormat::F32);
+        assert_eq!(choose_input_config(default, &ranges), default);
+        let default = config(2, 44_100, SampleFormat::F32);
+        assert_eq!(choose_input_config(default, &ranges), default);
+    }
+
+    #[test]
+    fn a_low_default_moves_to_48_khz_when_a_range_covers_it() {
+        let default = config(1, 8_000, SampleFormat::I16);
+        let ranges = [
+            range(1, 8_000, 8_000, SampleFormat::I16),
+            range(1, 8_000, 96_000, SampleFormat::I16),
+        ];
+        let chosen = choose_input_config(default, &ranges);
+        assert_eq!(chosen.sample_rate(), 48_000);
+        assert_eq!(chosen.sample_format(), SampleFormat::I16);
+        assert_eq!(chosen.channels(), 1);
+    }
+
+    #[test]
+    fn a_low_default_takes_44_1_khz_when_48_is_missing() {
+        let default = config(1, 8_000, SampleFormat::I16);
+        let ranges = [
+            range(1, 44_100, 44_100, SampleFormat::I16),
+            range(1, 8_000, 16_000, SampleFormat::I16),
+        ];
+        assert_eq!(choose_input_config(default, &ranges).sample_rate(), 44_100);
+    }
+
+    #[test]
+    fn a_low_default_prefers_its_own_format_and_channels() {
+        let default = config(1, 16_000, SampleFormat::I16);
+        let ranges = [
+            range(2, 8_000, 192_000, SampleFormat::F32),
+            range(1, 8_000, 48_000, SampleFormat::I16),
+        ];
+        let chosen = choose_input_config(default, &ranges);
+        assert_eq!(chosen.sample_rate(), 48_000);
+        assert_eq!(chosen.sample_format(), SampleFormat::I16);
+        assert_eq!(chosen.channels(), 1);
+    }
+
+    #[test]
+    fn a_low_default_takes_the_lowest_rate_above_44_1_khz_without_a_preferred_rate() {
+        let default = config(1, 8_000, SampleFormat::I16);
+        let ranges = [
+            range(1, 88_200, 96_000, SampleFormat::I16),
+            range(1, 64_000, 64_000, SampleFormat::I16),
+        ];
+        assert_eq!(choose_input_config(default, &ranges).sample_rate(), 64_000);
+    }
+
+    #[test]
+    fn a_low_default_without_higher_rates_is_kept() {
+        let default = config(1, 8_000, SampleFormat::I16);
+        let ranges = [range(1, 8_000, 16_000, SampleFormat::I16)];
+        assert_eq!(choose_input_config(default, &ranges), default);
     }
 }
